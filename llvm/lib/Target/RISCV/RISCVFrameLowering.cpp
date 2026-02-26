@@ -706,51 +706,49 @@ static void appendScalableVectorExpression(const TargetRegisterInfo &TRI,
 
 static MCCFIInstruction createDefCFAExpression(const TargetRegisterInfo &TRI,
                                                Register Reg,
-                                               StackOffset Offset) {
-  assert(Offset.getScalable() != 0 && "Did not need to adjust CFA for RVV");
-  SmallString<64> Expr;
+                                               int64_t FixedOffset,
+                                               int64_t ScalableOffset) {
+  // TODO: here we pass FixedOffset as uint64_t but we use it as int64_t. Is
+  // this correct?
+  assert(ScalableOffset != 0 && "Did not need to adjust CFA for RVV");
+
   std::string CommentBuffer;
   llvm::raw_string_ostream Comment(CommentBuffer);
   // Build up the expression (Reg + FixedOffset + ScalableOffset * VLENB).
-  unsigned DwarfReg = TRI.getDwarfRegNum(Reg, true);
-  Expr.push_back((uint8_t)(dwarf::DW_OP_breg0 + DwarfReg));
-  Expr.push_back(0);
   if (Reg == SPReg)
     Comment << "sp";
   else
     Comment << printReg(Reg, &TRI);
+  if (FixedOffset)
+    Comment << (FixedOffset < 0 ? " - " : " + ") << std::abs(FixedOffset);
+  if (ScalableOffset)
+    Comment << (ScalableOffset < 0 ? " - " : " + ") << std::abs(ScalableOffset)
+            << " * vlenb";
 
-  appendScalableVectorExpression(TRI, Expr, Offset, Comment);
-
-  SmallString<64> DefCfaExpr;
-  DefCfaExpr.push_back(dwarf::DW_CFA_def_cfa_expression);
-  appendLEB128<LEB128Sign::Unsigned>(DefCfaExpr, Expr.size());
-  DefCfaExpr.append(Expr.str());
-
-  return MCCFIInstruction::createEscape(nullptr, DefCfaExpr.str(), SMLoc(),
-                                        Comment.str());
+  unsigned DwarfReg = TRI.getDwarfRegNum(Reg, true);
+  return MCCFIInstruction::createLLVMDefCfaRegScalableOffset(
+      nullptr, DwarfReg, ScalableOffset, FixedOffset, SMLoc(), Comment.str());
 }
 
 static MCCFIInstruction createDefCFAOffset(const TargetRegisterInfo &TRI,
-                                           Register Reg, StackOffset Offset) {
-  assert(Offset.getScalable() != 0 && "Did not need to adjust CFA for RVV");
-  SmallString<64> Expr;
+                                           Register Reg, int64_t FixedOffset,
+                                           int64_t ScalableOffset) {
+  assert(ScalableOffset != 0 && "Did not need to adjust CFA for RVV");
+
   std::string CommentBuffer;
   llvm::raw_string_ostream Comment(CommentBuffer);
   Comment << printReg(Reg, &TRI) << "  @ cfa";
+  if (FixedOffset)
+    Comment << (FixedOffset < 0 ? " - " : " + ") << std::abs(FixedOffset);
 
-  // Build up the expression (FixedOffset + ScalableOffset * VLENB).
-  appendScalableVectorExpression(TRI, Expr, Offset, Comment);
+  if (ScalableOffset)
+    Comment << (ScalableOffset < 0 ? " - " : " + ") << std::abs(ScalableOffset)
+            << " * vlenb";
 
-  SmallString<64> DefCfaExpr;
   unsigned DwarfReg = TRI.getDwarfRegNum(Reg, true);
-  DefCfaExpr.push_back(dwarf::DW_CFA_expression);
-  appendLEB128<LEB128Sign::Unsigned>(DefCfaExpr, DwarfReg);
-  appendLEB128<LEB128Sign::Unsigned>(DefCfaExpr, Expr.size());
-  DefCfaExpr.append(Expr.str());
+  return MCCFIInstruction::createLLVMRegAtScalableOffsetFromCfa(
+      nullptr, DwarfReg, ScalableOffset, FixedOffset, SMLoc(), Comment.str());
 
-  return MCCFIInstruction::createEscape(nullptr, DefCfaExpr.str(), SMLoc(),
-                                        Comment.str());
 }
 
 // Allocate stack space and probe it if necessary.
@@ -1136,7 +1134,7 @@ void RISCVFrameLowering::emitPrologue(MachineFunction &MF,
       // Emit .cfi_def_cfa_expression "sp + StackSize + RVVStackSize * vlenb".
       CFIBuilder.insertCFIInst(createDefCFAExpression(
           *RI, SPReg,
-          StackOffset::get(getStackSizeWithRVVPadding(MF), RVVStackSize / 8)));
+          getStackSizeWithRVVPadding(MF), RVVStackSize / 8));
     }
 
     std::advance(MBBI, getRVVCalleeSavedInfo(MF, CSI).size());
@@ -2240,7 +2238,7 @@ void RISCVFrameLowering::emitCalleeSavedRVVPrologCFI(
     for (unsigned i = 0; i < NumRegs; ++i) {
       CFIBuilder.insertCFIInst(createDefCFAOffset(
           TRI, BaseReg + i,
-          StackOffset::get(-FixedSize, MFI.getObjectOffset(FI) / 8 + i)));
+          -FixedSize, MFI.getObjectOffset(FI) / 8 + i));
     }
   }
 }
