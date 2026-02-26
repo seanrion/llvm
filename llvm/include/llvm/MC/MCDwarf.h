@@ -15,6 +15,7 @@
 #define LLVM_MC_MCDWARF_H
 
 #include "llvm/ADT/MapVector.h"
+#include "llvm/ADT/SmallString.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringMap.h"
 #include "llvm/ADT/StringRef.h"
@@ -515,6 +516,9 @@ public:
     OpRestoreState,
     OpOffset,
     OpLLVMDefAspaceCfa,
+    OpLLVMDefCfaRegScalableOffset,
+    OpLLVMRegAtScalableOffsetFromCfa,
+    OpLLVMRegAtScalableOffsetFromReg,
     OpDefCfaRegister,
     OpDefCfaOffset,
     OpDefCfa,
@@ -538,15 +542,19 @@ public:
     int64_t Offset;
     unsigned Register2;
     unsigned AddressSpace;
+    int64_t ScalableOffset;
+    int64_t FixedOffset;
+    std::string Comment;
     // FIXME: Workaround for GCC7 bug with nested class used as std::variant
     // alternative where the compiler really wants a user-defined default
     // constructor. Once we no longer support GCC7 these constructors can be
     // replaced with default member initializers and aggregate initialization.
     CommonFields(unsigned Reg, int64_t Off = 0,
                  unsigned Reg2 = std::numeric_limits<unsigned>::max(),
-                 unsigned AddrSpace = 0)
-        : Register(Reg), Offset(Off), Register2(Reg2), AddressSpace(AddrSpace) {
-    }
+                 unsigned AddrSpace = 0, int64_t ScalableOff = 0,
+                 int64_t FixedOff = 0, StringRef C = "")
+        : Register(Reg), Offset(Off), Register2(Reg2), AddressSpace(AddrSpace),
+          ScalableOffset(ScalableOff), FixedOffset(FixedOff), Comment(C.str()) {}
     CommonFields() : CommonFields(std::numeric_limits<unsigned>::max()) {}
   };
   // Held in ExtraFields when OpEscape.
@@ -569,6 +577,27 @@ private:
   MCCFIInstruction(OpType Op, MCSymbol *L, FieldsType &&EF, SMLoc Loc)
       : Label(L), ExtraFields(std::forward<FieldsType>(EF)), Operation(Op),
         Loc(Loc) {}
+
+  MCCFIInstruction(OpType Op, MCSymbol *L, unsigned R, int64_t ScalableOffset,
+                   int64_t FixedOffset, SMLoc Loc, StringRef Comment = "")
+      : Label(L),
+        ExtraFields(CommonFields(R, FixedOffset,
+                                std::numeric_limits<unsigned>::max(), 0,
+                                ScalableOffset, FixedOffset, Comment)),
+        Operation(Op), Loc(Loc) {
+    assert(Operation == OpLLVMDefCfaRegScalableOffset ||
+           Operation == OpLLVMRegAtScalableOffsetFromCfa);
+  }
+
+  MCCFIInstruction(OpType Op, MCSymbol *L, unsigned R, unsigned R2,
+                   int64_t ScalableOffset, int64_t FixedOffset, SMLoc Loc,
+                   StringRef Comment = "")
+      : Label(L),
+        ExtraFields(CommonFields(R, FixedOffset, R2, 0, ScalableOffset,
+                                FixedOffset, Comment)),
+        Operation(Op), Loc(Loc) {
+    assert(Op == OpLLVMRegAtScalableOffsetFromReg);
+  }
 
 public:
   /// .cfi_def_cfa defines a rule for computing CFA as: take address from
@@ -634,6 +663,41 @@ public:
                                          unsigned Register2, SMLoc Loc = {}) {
     return {OpRegister, L, CommonFields{Register1, 0, Register2}, Loc};
   }
+
+  /// Create the new rule for calculating cfa: deref(Reg + ScalableOffset * x +
+  /// FixedOffset) where x is the runtime constant. This is a "pseudo" CFI
+  /// instruction - each target has to lower it into standard cfi directives.
+  static MCCFIInstruction
+  createLLVMDefCfaRegScalableOffset(MCSymbol *L, unsigned Reg,
+                                    int64_t ScalableOffset, int64_t FixedOffset,
+                                    SMLoc Loc = {}, StringRef Comment = "") {
+    return MCCFIInstruction(OpLLVMDefCfaRegScalableOffset, L, Reg,
+                            ScalableOffset, FixedOffset, Loc, Comment);
+  }
+
+  /// Create the new rule for calculating the previous value (before the call)
+  /// of callee-saved register Reg: deref(cfa + ScalableOffset * x +
+  /// FixedOffset) where x is the runtime constant. This is a "pseudo" CFI
+  /// instruction - each target has to lower it into standard cfi directives.
+  static MCCFIInstruction createLLVMRegAtScalableOffsetFromCfa(
+      MCSymbol *L, unsigned Reg, int64_t ScalableOffset, int64_t FixedOffset,
+      SMLoc Loc = {}, StringRef Comment = "") {
+    return MCCFIInstruction(OpLLVMRegAtScalableOffsetFromCfa, L, Reg,
+                            ScalableOffset, FixedOffset, Loc, Comment);
+  }
+
+  static MCCFIInstruction createLLVMRegAtScalableOffsetFromReg(
+      MCSymbol *L, unsigned Reg, unsigned Reg2, int64_t ScalableOffset,
+      int64_t FixedOffset, SMLoc Loc = {}, StringRef Comment = "") {
+    return MCCFIInstruction(OpLLVMRegAtScalableOffsetFromReg, L, Reg, Reg2,
+                            ScalableOffset, FixedOffset, Loc, Comment);
+  }
+
+  /// Create the expression (FrameRegister + Offset) and write it to CFAExpr
+  static void createRegOffsetExpression(unsigned Reg, unsigned FrameReg,
+                                        int64_t ScalableOffset,
+                                        int64_t FixedOffset,
+                                        SmallString<64> &CFAExpr);
 
   /// .cfi_window_save SPARC register window is saved.
   static MCCFIInstruction createWindowSave(MCSymbol *L, SMLoc Loc = {}) {
@@ -719,12 +783,18 @@ public:
            Operation == OpRestore || Operation == OpUndefined ||
            Operation == OpSameValue || Operation == OpDefCfaRegister ||
            Operation == OpRelOffset || Operation == OpValOffset ||
-           Operation == OpRegister || Operation == OpLLVMDefAspaceCfa);
+           Operation == OpRegister || Operation == OpLLVMDefAspaceCfa ||
+           Operation == OpLLVMDefCfaRegScalableOffset ||
+           Operation == OpLLVMRegAtScalableOffsetFromCfa ||
+           Operation == OpLLVMRegAtScalableOffsetFromReg);
     return std::get<CommonFields>(ExtraFields).Register;
   }
 
   unsigned getRegister2() const {
-    assert(Operation == OpRegister);
+    if (Operation == OpLLVMDefCfaRegScalableOffset)
+      return std::get<CommonFields>(ExtraFields).Register;
+    assert(Operation == OpRegister ||
+           Operation == OpLLVMRegAtScalableOffsetFromReg);
     return std::get<CommonFields>(ExtraFields).Register2;
   }
 
@@ -741,6 +811,20 @@ public:
     return std::get<CommonFields>(ExtraFields).Offset;
   }
 
+  int64_t getScalableOffset() const {
+    assert(Operation == OpLLVMDefCfaRegScalableOffset ||
+           Operation == OpLLVMRegAtScalableOffsetFromCfa ||
+           Operation == OpLLVMRegAtScalableOffsetFromReg);
+    return std::get<CommonFields>(ExtraFields).ScalableOffset;
+  }
+
+  int64_t getFixedOffset() const {
+    assert(Operation == OpLLVMDefCfaRegScalableOffset ||
+           Operation == OpLLVMRegAtScalableOffsetFromCfa ||
+           Operation == OpLLVMRegAtScalableOffsetFromReg);
+    return std::get<CommonFields>(ExtraFields).FixedOffset;
+  }
+
   MCSymbol *getCfiLabel() const {
     assert(Operation == OpLabel);
     return std::get<LabelFields>(ExtraFields).CfiLabel;
@@ -753,8 +837,13 @@ public:
   }
 
   StringRef getComment() const {
-    assert(Operation == OpEscape);
-    return std::get<EscapeFields>(ExtraFields).Comment;
+    if (Operation == OpEscape)
+      return std::get<EscapeFields>(ExtraFields).Comment;
+    if (Operation == OpLLVMDefCfaRegScalableOffset ||
+        Operation == OpLLVMRegAtScalableOffsetFromCfa ||
+        Operation == OpLLVMRegAtScalableOffsetFromReg)
+      return std::get<CommonFields>(ExtraFields).Comment;
+    return StringRef();
   }
   SMLoc getLoc() const { return Loc; }
 };
