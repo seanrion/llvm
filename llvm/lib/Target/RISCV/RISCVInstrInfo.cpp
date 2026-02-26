@@ -17,6 +17,7 @@
 #include "RISCVMachineFunctionInfo.h"
 #include "RISCVSubtarget.h"
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/SmallSet.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/Statistic.h"
 #include "llvm/Analysis/MemoryLocation.h"
@@ -54,6 +55,10 @@ STATISTIC(NumVRegReloaded,
 static cl::opt<bool> PreferWholeRegisterMove(
     "riscv-prefer-whole-register-move", cl::init(false), cl::Hidden,
     cl::desc("Prefer whole register move for vector registers."));
+
+static cl::opt<bool> EnableRISCJumpTableRecognition(
+    "riscv-enable-jump-table-recognition", cl::init(true), cl::Hidden,
+    cl::desc("Enable RISC-V jump table recognition and optimization."));
 
 static cl::opt<MachineTraceStrategy> ForceMachineCombinerStrategy(
     "riscv-force-machine-combiner-strategy", cl::Hidden,
@@ -482,11 +487,11 @@ void RISCVInstrInfo::copyPhysRegVector(
       MIB = MIB.addReg(ActualSrcReg, getKillRegState(KillSrc));
     if (UseVMV) {
       const MCInstrDesc &Desc = DefMBBI->getDesc();
-      MIB.add(DefMBBI->getOperand(RISCVII::getVLOpNum(Desc)));  // AVL
+      MIB.add(DefMBBI->getOperand(RISCVII::getVLOpNum(Desc))); // AVL
       unsigned Log2SEW =
           DefMBBI->getOperand(RISCVII::getSEWOpNum(Desc)).getImm();
-      MIB.addImm(Log2SEW ? Log2SEW : 3);                        // SEW
-      MIB.addImm(0);                                            // tu, mu
+      MIB.addImm(Log2SEW ? Log2SEW : 3); // SEW
+      MIB.addImm(0);                     // tu, mu
       MIB.addReg(RISCV::VL, RegState::Implicit);
       MIB.addReg(RISCV::VTYPE, RegState::Implicit);
     }
@@ -1356,6 +1361,157 @@ bool RISCVInstrInfo::analyzeBranch(MachineBasicBlock &MBB,
 
   // Otherwise, we can't handle this.
   return true;
+}
+
+int RISCVInstrInfo::getJumpTableIndex(const MachineInstr &MI) const {
+  // Early return if jump table recognition is disabled
+  if (!EnableRISCJumpTableRecognition)
+    return -1;
+
+  unsigned Opcode = MI.getOpcode();
+
+  // Check if this is an indirect branch instruction (PseudoBRIND or JALR)
+  if (Opcode != RISCV::PseudoBRIND && Opcode != RISCV::PseudoBRINDNonX7 &&
+      Opcode != RISCV::PseudoBRINDX7 && Opcode != RISCV::JALR)
+    return -1;
+
+  // For indirect branches, we need to trace back to find the jump table index.
+  // The jump table index is typically in the address calculation instructions
+  // (LUI/AUIPC) that compute the jump table base address.
+
+  // Get the register used for the indirect jump
+  if (MI.getNumOperands() == 0)
+    return -1;
+
+  const MachineOperand &JumpRegOp = MI.getOperand(0);
+  if (!JumpRegOp.isReg() || !JumpRegOp.getReg().isVirtual())
+    return -1;
+
+  Register JumpReg = JumpRegOp.getReg();
+  const MachineFunction &MF = *MI.getParent()->getParent();
+  const MachineRegisterInfo &MRI = MF.getRegInfo();
+
+  // Trace back through the def-use chain to find jump table index
+  // Look for LUI/AUIPC instructions that have jump table operands
+  SmallVector<Register, 4> Worklist;
+  SmallSet<Register, 4> Visited;
+  Worklist.push_back(JumpReg);
+
+  while (!Worklist.empty()) {
+    Register Reg = Worklist.pop_back_val();
+    if (!Visited.insert(Reg).second)
+      continue;
+
+    MachineInstr *DefMI = MRI.getUniqueVRegDef(Reg);
+    if (!DefMI)
+      continue;
+
+    unsigned DefOpc = DefMI->getOpcode();
+
+    // Check if this instruction has a jump table operand
+    // This will catch LUI/AUIPC instructions with jump table operands
+    for (const MachineOperand &MO : DefMI->operands()) {
+      if (MO.isJTI())
+        return MO.getIndex();
+    }
+
+    // For load instructions (LW/LD/LWU), check the base register
+    if (DefOpc == RISCV::LW || DefOpc == RISCV::LD || DefOpc == RISCV::LWU) {
+      if (DefMI->getNumOperands() >= 2) {
+        const MachineOperand &BaseOp = DefMI->getOperand(1);
+        if (BaseOp.isReg() && BaseOp.getReg().isVirtual())
+          Worklist.push_back(BaseOp.getReg());
+      }
+      continue;
+    }
+
+    // For address calculation (ADDI), check the source register
+    if (DefOpc == RISCV::ADDI) {
+      if (DefMI->getNumOperands() >= 2) {
+        const MachineOperand &SrcOp = DefMI->getOperand(1);
+        if (SrcOp.isReg() && SrcOp.getReg().isVirtual())
+          Worklist.push_back(SrcOp.getReg());
+      }
+      continue;
+    }
+
+    // For ADD instruction, check both source registers
+    // ADD rd, rs1, rs2: rd = rs1 + rs2
+    // In jump table context: ADD base, base, offset or ADD base, offset, base
+    if (DefOpc == RISCV::ADD) {
+      if (DefMI->getNumOperands() >= 3) {
+        const MachineOperand &Src1Op = DefMI->getOperand(1);
+        const MachineOperand &Src2Op = DefMI->getOperand(2);
+        if (Src1Op.isReg() && Src1Op.getReg().isVirtual())
+          Worklist.push_back(Src1Op.getReg());
+        if (Src2Op.isReg() && Src2Op.getReg().isVirtual())
+          Worklist.push_back(Src2Op.getReg());
+      }
+      continue;
+    }
+
+    // For shift instructions (SLLI/SRLI/SRAI), check the source register
+    // These are used for index calculation: SLLI index, index, 2 (for
+    // EntrySize=4)
+    if (DefOpc == RISCV::SLLI || DefOpc == RISCV::SRLI ||
+        DefOpc == RISCV::SRAI) {
+      if (DefMI->getNumOperands() >= 2) {
+        const MachineOperand &SrcOp = DefMI->getOperand(1);
+        if (SrcOp.isReg() && SrcOp.getReg().isVirtual())
+          Worklist.push_back(SrcOp.getReg());
+      }
+      continue;
+    }
+
+    // For MUL instruction, check both source registers
+    // MUL is used when EntrySize is not a power of 2
+    if (DefOpc == RISCV::MUL) {
+      if (DefMI->getNumOperands() >= 3) {
+        const MachineOperand &Src1Op = DefMI->getOperand(1);
+        const MachineOperand &Src2Op = DefMI->getOperand(2);
+        if (Src1Op.isReg() && Src1Op.getReg().isVirtual())
+          Worklist.push_back(Src1Op.getReg());
+        if (Src2Op.isReg() && Src2Op.getReg().isVirtual())
+          Worklist.push_back(Src2Op.getReg());
+      }
+      continue;
+    }
+
+    // For SHXADD instructions (Zba extension), check both source registers
+    // SH1ADD rd, rs1, rs2: rd = (rs1 << 1) + rs2
+    // SH2ADD rd, rs1, rs2: rd = (rs1 << 2) + rs2
+    // SH3ADD rd, rs1, rs2: rd = (rs1 << 3) + rs2
+    // In jump table context: SH2ADD base, index, base (for EntrySize=4)
+    if (DefOpc == RISCV::SH1ADD || DefOpc == RISCV::SH2ADD ||
+        DefOpc == RISCV::SH3ADD || DefOpc == RISCV::SH1ADD_UW ||
+        DefOpc == RISCV::SH2ADD_UW || DefOpc == RISCV::SH3ADD_UW) {
+      if (DefMI->getNumOperands() >= 3) {
+        // SHXADD rd, rs1, rs2: rd = (rs1 << N) + rs2
+        // In jump table: rs1 is usually the index, rs2 is the base address
+        // But we check both to be safe
+        const MachineOperand &Src1Op = DefMI->getOperand(1);
+        const MachineOperand &Src2Op = DefMI->getOperand(2);
+        if (Src1Op.isReg() && Src1Op.getReg().isVirtual())
+          Worklist.push_back(Src1Op.getReg());
+        if (Src2Op.isReg() && Src2Op.getReg().isVirtual())
+          Worklist.push_back(Src2Op.getReg());
+      }
+      continue;
+    }
+
+    // For LUI/AUIPC, we've already checked for JTI operands above
+    // If we reach here and it's LUI/AUIPC without JTI, there's nothing more to
+    // do
+    if (DefOpc == RISCV::LUI || DefOpc == RISCV::AUIPC) {
+      continue;
+    }
+
+    // For other instructions, we don't know how to trace back, so stop
+    // This includes physical registers, constants, and unknown instruction
+    // types
+  }
+
+  return -1;
 }
 
 unsigned RISCVInstrInfo::removeBranch(MachineBasicBlock &MBB,
@@ -3204,7 +3360,7 @@ bool RISCVInstrInfo::verifyInstruction(const MachineInstr &MI,
   const uint64_t TSFlags = Desc.TSFlags;
   if (RISCVII::hasVLOp(TSFlags)) {
     const MachineOperand &Op = MI.getOperand(RISCVII::getVLOpNum(Desc));
-    if (!Op.isImm() && !Op.isReg())  {
+    if (!Op.isImm() && !Op.isReg()) {
       ErrInfo = "Invalid operand type for VL operand";
       return false;
     }
@@ -3793,9 +3949,9 @@ void RISCVInstrInfo::buildOutlinedFrame(
 
   // Add in a return instruction to the end of the outlined frame.
   MBB.insert(MBB.end(), BuildMI(MF, DebugLoc(), get(RISCV::JALR))
-      .addReg(RISCV::X0, RegState::Define)
-      .addReg(RISCV::X5)
-      .addImm(0));
+                            .addReg(RISCV::X0, RegState::Define)
+                            .addReg(RISCV::X5)
+                            .addImm(0));
 }
 
 MachineBasicBlock::iterator RISCVInstrInfo::insertOutlinedCall(
@@ -4289,8 +4445,8 @@ MachineInstr *RISCVInstrInfo::commuteInstructionImpl(MachineInstr &MI,
     assert((OpIdx1 == 3 || OpIdx2 == 3) && "Unexpected opcode index");
     unsigned Opc;
     switch (MI.getOpcode()) {
-      default:
-        llvm_unreachable("Unexpected opcode");
+    default:
+      llvm_unreachable("Unexpected opcode");
       CASE_VFMA_CHANGE_OPCODE_SPLATS(FMACC, FMADD)
       CASE_VFMA_CHANGE_OPCODE_SPLATS(FMADD, FMACC)
       CASE_VFMA_CHANGE_OPCODE_SPLATS(FMSAC, FMSUB)
@@ -4328,8 +4484,8 @@ MachineInstr *RISCVInstrInfo::commuteInstructionImpl(MachineInstr &MI,
     if (OpIdx1 == 3 || OpIdx2 == 3) {
       unsigned Opc;
       switch (MI.getOpcode()) {
-        default:
-          llvm_unreachable("Unexpected opcode");
+      default:
+        llvm_unreachable("Unexpected opcode");
         CASE_VFMA_CHANGE_OPCODE_VV(FMADD, FMACC)
         CASE_VFMA_CHANGE_OPCODE_VV(FMSUB, FMSAC)
         CASE_VFMA_CHANGE_OPCODE_VV(FNMADD, FNMACC)
