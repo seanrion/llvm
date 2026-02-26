@@ -5468,3 +5468,10 @@ bool RISCVInstrInfo::isVRegCopy(const MachineInstr *MI, unsigned LMul) const {
       RISCVVType::decodeVLMUL(RISCVRI::getLMul(RC->TSFlags));
   return (!RCFractional && LMul == RCLMul) || (RCFractional && LMul == 1);
 }
+bool RISCVInstrInfo::expandPostRAPseudo(MachineInstr &MI) const {
+  if (MI.getOpcode() == RISCV::UnreachableRET) {
+    MI.eraseFromParent();
+    return true;
+  }
+  return false;
+}
