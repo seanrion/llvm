@@ -594,6 +594,12 @@ void RISCVPassConfig::addPreEmitPass2() {
 
   if (EnableCFIInstrInserter)
     addPass(createCFIInstrInserter());
+
+  // Unpack all remaining bundles before code emission. This is necessary
+  // because emitCFIsEarly (in PrologEpilogInserter) may create bundles that
+  // are not unpacked by the KCFI-specific UnpackMachineBundles pass above.
+  addPass(createUnpackMachineBundles(
+      [](const MachineFunction &) { return true; }));
 }
 
 void RISCVPassConfig::addMachineSSAOptimization() {

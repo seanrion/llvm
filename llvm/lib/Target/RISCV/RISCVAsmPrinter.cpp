@@ -308,6 +308,22 @@ void RISCVAsmPrinter::emitNTLHint(const MachineInstr *MI) {
 void RISCVAsmPrinter::emitInstruction(const MachineInstr *MI) {
   RISCV_MC::verifyInstructionPredicates(MI->getOpcode(), STI->getFeatureBits());
 
+  // BUNDLE instructions should be unpacked before reaching AsmPrinter.
+  // If we encounter one, it means it wasn't unpacked earlier, so we need to
+  // handle it here by emitting all instructions in the bundle.
+  if (MI->isBundle()) {
+    MachineBasicBlock::const_instr_iterator I = MI->getIterator();
+    MachineBasicBlock::const_instr_iterator E = MI->getParent()->instr_end();
+    // Skip the BUNDLE header itself.
+    ++I;
+    // Emit all instructions inside the bundle.
+    while (I != E && I->isInsideBundle()) {
+      emitInstruction(&*I);
+      ++I;
+    }
+    return;
+  }
+
   emitNTLHint(MI);
 
   // Do any auto-generated pseudo lowerings.
