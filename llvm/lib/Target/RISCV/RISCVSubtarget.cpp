@@ -75,6 +75,10 @@ static cl::opt<bool> EnablePExtSIMDCodeGen(
              "where only partial codegen is currently supported)"),
     cl::init(false), cl::Hidden);
 
+static cl::opt<bool> SaveCSREarly("riscv-save-csrs-early",
+                                  cl::desc("Save CSRs early"),
+                                  cl::init(false), cl::Hidden);
+
 void RISCVSubtarget::anchor() {}
 
 RISCVSubtarget &
@@ -265,4 +269,8 @@ bool RISCVSubtarget::useMIPSLoadStorePairs() const {
 
 bool RISCVSubtarget::useMIPSCCMovInsn() const {
   return UseMIPSCCMovInsn && HasVendorXMIPSCMov;
+}
+
+bool RISCVSubtarget::savesCSRsEarly() const {
+  return SaveCSREarly;
 }
