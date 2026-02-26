@@ -20,6 +20,7 @@
 #include "llvm/ADT/DepthFirstIterator.h"
 #include "llvm/ADT/MapVector.h"
 #include "llvm/ADT/PointerIntPair.h"
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SetVector.h"
 #include "llvm/ADT/SmallSet.h"
 #include "llvm/ADT/SmallVector.h"
@@ -75,6 +76,13 @@ static cl::opt<bool>
                cl::desc("Split critical edges during machine sinking"),
                cl::init(true), cl::Hidden);
 
+static cl::opt<bool> AggressivelySinkInJumptable(
+    "machine-sink-aggressively-in-jumptable",
+    cl::desc("Enable sinking instructions to multiple new blocks "
+             "created for PHI targets in jumptable when normal edge "
+             "splitting is not legal or profitable"),
+    cl::init(true), cl::Hidden);
+
 static cl::opt<bool> UseBlockFreqInfo(
     "machine-sink-bfi",
     cl::desc("Use block frequency info to find successors to sink"),
@@ -118,6 +126,7 @@ STATISTIC(NumCycleSunk, "Number of machine instructions sunk into a cycle");
 STATISTIC(NumSplit, "Number of critical edges split");
 STATISTIC(NumCoalesces, "Number of copies coalesced");
 STATISTIC(NumPostRACopySink, "Number of copies sunk after RA");
+STATISTIC(NumSinkBlocks, "Number of individual blocks created for PHI targets");
 
 using RegSubRegPair = TargetInstrInfo::RegSubRegPair;
 
@@ -158,6 +167,24 @@ class MachineSinking {
   // This is different from CEBCandidates since those edges
   // will be split.
   SetVector<std::pair<MachineBasicBlock *, MachineBasicBlock *>> ToSplit;
+
+  // Individual block information for PHI target blocks.
+  // Key: PHITarget -> list of predecessors that need sinking and instructions
+  // to sink Each predecessor will get its own new block (similar to
+  // SplitCriticalEdge). Note: Key only contains PHITarget (not Register) to
+  // avoid splitting the same edge multiple times when multiple registers need
+  // to be sunk to the same PHITarget.
+  struct SinkBlockInfo {
+    // Use SmallSet for efficient storage. Deterministic iteration order is
+    // ensured by sorting before processing.
+    SmallSet<MachineBasicBlock *, 4>
+        SinkPreds; // Predecessors that need sinking
+    // Multiple instructions may need to be sunk to the same PHITarget
+    SmallVector<std::pair<MachineInstr *, MachineBasicBlock *>, 4> DefMIs;
+  };
+  // Use DenseMap for efficient lookups. Deterministic iteration order is
+  // ensured by sorting entries by PHITarget number before processing.
+  DenseMap<MachineBasicBlock *, SinkBlockInfo> SinkBlocksMap;
 
   DenseSet<Register> RegsToClearKillFlags;
 
@@ -242,6 +269,17 @@ private:
   /// False can be returned if, for instance, this is not profitable.
   bool PostponeSplitCriticalEdge(MachineInstr &MI, MachineBasicBlock *From,
                                  MachineBasicBlock *To, bool BreakPHIEdge);
+  /// Try to detect predecessors that need individual blocks for PHI target
+  /// blocks when normal edge splitting is not legal or profitable.
+  /// Each predecessor will get its own new block (similar to
+  /// SplitCriticalEdge).
+  bool TryDetectSinkPredecessors(MachineInstr &MI, MachineBasicBlock *FromBB);
+  /// Sink an instruction to multiple new blocks created for PHI targets.
+  /// Each new block gets a copy of the instruction with a new virtual register
+  /// if needed, and PHI nodes are updated accordingly.
+  void SinkInstructionToNewBlocks(
+      MachineInstr &MI, MachineBasicBlock *DefMBB, MachineBasicBlock *PHITarget,
+      ArrayRef<std::pair<MachineBasicBlock *, MachineBasicBlock *>> NewBlocks);
   bool SinkInstruction(MachineInstr &MI, bool &SawStore,
                        AllSuccsCache &AllSuccessors);
 
@@ -847,10 +885,95 @@ bool MachineSinking::run(MachineFunction &MF) {
     for (auto &MBB : MF)
       MadeChange |= ProcessBlock(MBB);
 
-    // If we have anything we marked as toSplit, split it now.
+    // Create individual blocks for detected sink predecessors
+    // Each predecessor gets its own new block (similar to SplitCriticalEdge)
+    // Process this before ToSplit to avoid needing to find intermediate blocks.
     MachineDomTreeUpdater MDTU(DT, PDT,
                                MachineDomTreeUpdater::UpdateStrategy::Lazy);
+    if (!SinkBlocksMap.empty()) {
+      // Sort entries by PHITarget number to ensure deterministic
+      // iteration order across runs.
+      SmallVector<std::pair<MachineBasicBlock *, SinkBlockInfo *>, 4>
+          SortedEntries;
+      for (auto &Entry : SinkBlocksMap) {
+        SortedEntries.push_back({Entry.first, &Entry.second});
+      }
+      llvm::sort(SortedEntries, [](const auto &LHS, const auto &RHS) {
+        return LHS.first->getNumber() < RHS.first->getNumber();
+      });
+
+      for (auto &[PHITarget, Info] : SortedEntries) {
+        SinkBlockInfo &InfoRef = *Info;
+
+        // SinkPreds.size() >= 2 is guaranteed by TryDetectSinkPredecessors
+        LLVM_DEBUG(dbgs() << " *** Creating individual blocks for "
+                          << printMBBReference(*PHITarget) << " with "
+                          << InfoRef.SinkPreds.size() << " preds\n");
+
+        // Collect successfully created new blocks and their corresponding
+        // predecessors
+        // Sort predecessors by block number to ensure deterministic block
+        // numbering across runs.
+        SmallVector<MachineBasicBlock *, 4> SortedPreds(
+            InfoRef.SinkPreds.begin(), InfoRef.SinkPreds.end());
+        llvm::sort(SortedPreds,
+                   [](MachineBasicBlock *LHS, MachineBasicBlock *RHS) {
+                     return LHS->getNumber() < RHS->getNumber();
+                   });
+
+        SmallVector<std::pair<MachineBasicBlock *, MachineBasicBlock *>, 4>
+            NewBlocks;
+        for (MachineBasicBlock *Pred : SortedPreds) {
+          MachineBasicBlock *NewBB = Pred->SplitCriticalEdge(
+              PHITarget, {LIS, SI, LV, MLI}, nullptr, &MDTU);
+          if (NewBB != nullptr) {
+            // Update block frequency if available
+            if (MBFI)
+              MBFI->onEdgeSplit(*Pred, *NewBB, *MBPI);
+
+            // Update cycle info if available
+            CI->splitCriticalEdge(Pred, PHITarget, NewBB);
+
+            NewBlocks.push_back({NewBB, Pred});
+            MadeChange = true;
+            ++NumSinkBlocks;
+            LLVM_DEBUG(dbgs() << " *** Created individual block "
+                              << printMBBReference(*NewBB) << " for pred "
+                              << printMBBReference(*Pred) << "\n");
+          } else {
+            LLVM_DEBUG(dbgs() << " *** Failed to create block for pred "
+                              << printMBBReference(*Pred) << "\n");
+          }
+        }
+
+        // If we successfully created blocks, sink all instructions to all of
+        // them
+        if (!NewBlocks.empty()) {
+          for (auto &[DefMI, DefMBB] : InfoRef.DefMIs) {
+            // Only sink if the instruction is still in the original block
+            if (DefMI->getParent() == DefMBB) {
+              SinkInstructionToNewBlocks(*DefMI, DefMBB, PHITarget, NewBlocks);
+            }
+          }
+        }
+      }
+
+      // Clear SinkBlocksMap after processing
+      SinkBlocksMap.clear();
+    }
+
+    // If we have anything we marked as toSplit, split it now.
+    // Check if edges still exist before splitting, as they may have been
+    // split during SinkBlocksMap processing.
     for (const auto &Pair : ToSplit) {
+      // Check if the edge still exists before attempting to split.
+      if (!Pair.second->isPredecessor(Pair.first)) {
+        LLVM_DEBUG(dbgs() << " *** Edge already split, skipping: "
+                          << printMBBReference(*Pair.first) << " -- "
+                          << printMBBReference(*Pair.second) << "\n");
+        continue;
+      }
+
       auto NewSucc = Pair.first->SplitCriticalEdge(
           Pair.second, {LIS, SI, LV, MLI}, nullptr, &MDTU);
       if (NewSucc != nullptr) {
@@ -867,6 +990,7 @@ bool MachineSinking::run(MachineFunction &MF) {
       } else
         LLVM_DEBUG(dbgs() << " *** Not legal to break critical edge\n");
     }
+
     // If this iteration over the code changed anything, keep iterating.
     if (!MadeChange)
       break;
@@ -1186,6 +1310,253 @@ bool MachineSinking::PostponeSplitCriticalEdge(MachineInstr &MI,
   return Status;
 }
 
+bool MachineSinking::TryDetectSinkPredecessors(MachineInstr &MI,
+                                               MachineBasicBlock *FromBB) {
+  // Check if this optimization is enabled
+  if (!AggressivelySinkInJumptable)
+    return false;
+
+  // Only optimize if FromBB has a jump table (switch statement).
+  // This optimization is primarily beneficial for switch statements where
+  // multiple case blocks share the same PHI target.
+  MachineBasicBlock::const_iterator TerminatorI = FromBB->getFirstTerminator();
+  if (TerminatorI == FromBB->end())
+    return false;
+  const MachineInstr &Terminator = *TerminatorI;
+  const TargetInstrInfo *TII =
+      FromBB->getParent()->getSubtarget().getInstrInfo();
+  int JTI = TII->getJumpTableIndex(Terminator);
+  if (JTI < 0)
+    return false; // No jump table, skip optimization
+
+  // Find the actual PHI target blocks that use DefReg by traversing all uses.
+
+  // Find the register defined by MI
+  Register DefReg = 0;
+  for (const MachineOperand &MO : MI.all_defs()) {
+    if (MO.isReg() && MO.getReg().isVirtual()) {
+      DefReg = MO.getReg();
+      break;
+    }
+  }
+
+  if (!DefReg)
+    return false;
+
+  // Find all PHI target blocks that use DefReg and collect their predecessors
+  // that use DefReg from FromBB
+  DenseMap<MachineBasicBlock *, SmallSet<MachineBasicBlock *, 4>> PHITargets;
+  for (MachineOperand &MO : MRI->use_nodbg_operands(DefReg)) {
+    MachineInstr *UseInst = MO.getParent();
+    if (!UseInst->isPHI())
+      return false; // All uses must be in PHI nodes
+
+    unsigned OpNo = MO.getOperandNo();
+    MachineBasicBlock *PHIBlock = UseInst->getParent();
+    MachineBasicBlock *PredBlock = UseInst->getOperand(OpNo + 1).getMBB();
+
+    // Only consider uses from FromBB
+    if (PredBlock == FromBB) {
+      PHITargets[PHIBlock].insert(PredBlock);
+    }
+  }
+
+  if (PHITargets.empty())
+    return false;
+
+  // Process each PHI target separately. Each PHI target will get its own
+  // entry in SinkBlocksMap, and we'll create individual blocks for each one.
+  // IMPORTANT: If ANY PHI target has ANY illegal predecessor, we must skip
+  // optimization for ALL PHI targets of this MI to maintain consistency.
+  // First pass: check if all PHI targets are legal and profitable
+  // Use SetVector for LegalPreds to ensure deterministic iteration order
+  SmallVector<std::pair<MachineBasicBlock *, SetVector<MachineBasicBlock *>>, 4>
+      ValidPHITargets;
+  for (auto &[PHIBlock, PredSet] : PHITargets) {
+    // Use isWorthBreakingCriticalEdge as a preliminary profitability check.
+    // This reuses the existing heuristics for edge splitting profitability.
+    // If not worth breaking, shared block optimization is also not worthwhile.
+    // The same heuristics that make edge splitting not profitable apply here.
+    MachineBasicBlock *DummyDeferredFromBB = nullptr;
+    if (!isWorthBreakingCriticalEdge(MI, FromBB, PHIBlock, DummyDeferredFromBB))
+      return false; // If any PHI target is not profitable, skip all
+
+    // Collect all predecessors that use DefReg in PHI nodes for this PHI target
+    // Use SetVector to ensure deterministic iteration order
+    SetVector<MachineBasicBlock *> PHIPreds;
+    for (MachineInstr &PHI : PHIBlock->phis()) {
+      for (unsigned i = 1, e = PHI.getNumOperands(); i < e; i += 2) {
+        if (PHI.getOperand(i).getReg() == DefReg) {
+          MachineBasicBlock *PredBlock = PHI.getOperand(i + 1).getMBB();
+          PHIPreds.insert(PredBlock);
+        }
+      }
+    }
+
+    // Check if it's legal to create individual blocks for each predecessor.
+    // For each predecessor, check if it's legal to break the edge to PHIBlock.
+    // We'll create a separate new block for each predecessor (similar to
+    // SplitCriticalEdge), so we need to check legality for each one.
+    // IMPORTANT: If ANY predecessor is not legal, we cannot optimize this MI
+    // for ANY PHI target, because we need consistency across all paths.
+    // Use SetVector instead of SmallSet to ensure deterministic iteration order
+    SetVector<MachineBasicBlock *> LegalPreds;
+    for (MachineBasicBlock *Pred : PHIPreds) {
+      // Check if Pred -> newbb -> PHIBlock would be a backedge
+      MachineCycle *PredCycle = CI->getCycle(Pred);
+      MachineCycle *PHICycle = CI->getCycle(PHIBlock);
+      if (PredCycle == PHICycle && PHICycle &&
+          (!PHICycle->isReducible() || PHICycle->getHeader() == PHIBlock)) {
+        // This would create a backedge, not legal for this predecessor
+        // If any predecessor is not legal, we cannot optimize ANY PHI target
+        return false;
+      }
+      LegalPreds.insert(Pred);
+    }
+
+    // Need at least 1 legal predecessor to proceed
+    if (LegalPreds.empty())
+      return false;
+
+    // Check if we already have information for this PHI target
+    // If it already exists, we just need to add this MI and merge predecessors
+    if (SinkBlocksMap.count(PHIBlock)) {
+      // This PHI target already has entries, add this MI to it
+      SinkBlockInfo &ExistingInfo = SinkBlocksMap[PHIBlock];
+      // Merge predecessors: add any new predecessors from this MI
+      for (MachineBasicBlock *Pred : LegalPreds) {
+        ExistingInfo.SinkPreds.insert(Pred);
+      }
+      // Add this MI to the list of instructions to sink
+      ExistingInfo.DefMIs.push_back({&MI, FromBB});
+      LLVM_DEBUG(
+          dbgs() << " *** Added additional MI to existing sink entry for "
+                 << printMBBReference(*PHIBlock) << " reg " << DefReg << "\n");
+      continue;
+    }
+
+    // This PHI target is valid, record it for processing
+    ValidPHITargets.push_back({PHIBlock, LegalPreds});
+  }
+
+  // Second pass: if all PHI targets passed validation, record them in
+  // SinkBlocksMap. Since we've already checked that none of them exist in
+  // the first pass, we can directly record them here.
+  for (auto &[PHIBlock, LegalPreds] : ValidPHITargets) {
+    // Record predecessor information for individual block creation
+    SinkBlockInfo Info;
+    Info.SinkPreds.insert(LegalPreds.begin(), LegalPreds.end());
+    Info.DefMIs.push_back({&MI, FromBB});
+    SinkBlocksMap[PHIBlock] = Info;
+
+    LLVM_DEBUG(dbgs() << " *** Detected sink predecessors for "
+                      << printMBBReference(*PHIBlock) << " reg " << DefReg
+                      << ": " << LegalPreds.size() << " preds\n");
+  }
+
+  return true;
+}
+
+void MachineSinking::SinkInstructionToNewBlocks(
+    MachineInstr &MI, MachineBasicBlock *DefMBB, MachineBasicBlock *PHITarget,
+    ArrayRef<std::pair<MachineBasicBlock *, MachineBasicBlock *>> NewBlocks) {
+  LLVM_DEBUG(dbgs() << " *** Sinking instruction to " << NewBlocks.size()
+                    << " new blocks\n");
+
+  // Find the register defined by MI
+  Register OriginalDefReg = 0;
+  unsigned DefOpIdx = 0;
+  for (unsigned i = 0, e = MI.getNumOperands(); i < e; ++i) {
+    MachineOperand &MO = MI.getOperand(i);
+    if (MO.isReg() && MO.isDef() && MO.getReg().isVirtual()) {
+      OriginalDefReg = MO.getReg();
+      DefOpIdx = i;
+      break;
+    }
+  }
+
+  // Sink a copy of the instruction to each new block
+  for (auto &[NewBB, Pred] : NewBlocks) {
+    // Clone the instruction
+    MachineInstr *NewMI = MI.getMF()->CloneMachineInstr(&MI);
+
+    // If the instruction defines a virtual register, create a new one
+    // for this copy
+    if (OriginalDefReg) {
+      const TargetRegisterClass *TRC = MRI->getRegClass(OriginalDefReg);
+      Register NewReg = MRI->createVirtualRegister(TRC);
+      NewMI->getOperand(DefOpIdx).setReg(NewReg);
+
+      // Update PHI nodes in PHITarget to use the new register from
+      // this predecessor. Note: SplitCriticalEdge has already updated
+      // PHI nodes to use NewBB instead of Pred, so we check for NewBB.
+      for (MachineInstr &PHI : PHITarget->phis()) {
+        for (unsigned i = 1, e = PHI.getNumOperands(); i < e; i += 2) {
+          if (PHI.getOperand(i).getReg() == OriginalDefReg &&
+              PHI.getOperand(i + 1).getMBB() == NewBB) {
+            // Update this PHI operand to use the new register from
+            // NewBB
+            PHI.getOperand(i).setReg(NewReg);
+            break;
+          }
+        }
+      }
+    }
+
+    // Insert the instruction at the beginning of the new block
+    MachineBasicBlock::iterator InsertPos =
+        NewBB->SkipPHIsAndLabels(NewBB->begin());
+    NewBB->insert(InsertPos, NewMI);
+
+    // Clear kill flags on uses
+    for (MachineOperand &MO : NewMI->all_uses()) {
+      if (MO.isReg())
+        RegsToClearKillFlags.insert(MO.getReg());
+    }
+
+    // Clear debug location
+    NewMI->setDebugLoc(DebugLoc());
+
+    LLVM_DEBUG(dbgs() << " *** Sunk instruction to "
+                      << printMBBReference(*NewBB) << "\n");
+  }
+
+  // Check if all uses from the predecessors we processed have been
+  // replaced. If so, and if there are no other uses, delete the
+  // original instruction.
+  if (OriginalDefReg) {
+    // Collect all predecessors we processed
+    SmallSet<MachineBasicBlock *, 4> ProcessedPreds;
+    for (auto &[NewBB, Pred] : NewBlocks)
+      ProcessedPreds.insert(Pred);
+
+    // Check if all PHI uses from processed predecessors have been
+    // updated
+    bool AllProcessedUsesReplaced = true;
+    for (MachineOperand &MO : MRI->use_nodbg_operands(OriginalDefReg)) {
+      MachineInstr *UseInst = MO.getParent();
+      if (UseInst->isPHI() && UseInst->getParent() == PHITarget) {
+        unsigned OpNo = MO.getOperandNo();
+        MachineBasicBlock *PredBlock = UseInst->getOperand(OpNo + 1).getMBB();
+        // If this PHI operand uses OriginalDefReg from a processed
+        // predecessor, it should have been updated
+        if (ProcessedPreds.count(PredBlock) &&
+            UseInst->getOperand(OpNo).getReg() == OriginalDefReg) {
+          AllProcessedUsesReplaced = false;
+          break;
+        }
+      }
+    }
+
+    // If all uses from processed predecessors have been replaced and
+    // the instruction is dead, remove it
+    if (AllProcessedUsesReplaced && MI.isDead(*MRI)) {
+      LLVM_DEBUG(dbgs() << " *** Removing original instruction\n");
+      MI.eraseFromParent();
+    }
+  }
+}
+
 std::vector<unsigned> &
 MachineSinking::getBBRegisterPressure(const MachineBasicBlock &MBB,
                                       bool UseCache) {
@@ -1384,15 +1755,14 @@ MachineSinking::GetAllSortedSuccessors(MachineInstr &MI, MachineBasicBlock *MBB,
   }
 
   // Sort Successors according to their cycle depth or block frequency info.
-  llvm::stable_sort(
-      AllSuccs, [&](const MachineBasicBlock *L, const MachineBasicBlock *R) {
-        uint64_t LHSFreq = MBFI ? MBFI->getBlockFreq(L).getFrequency() : 0;
-        uint64_t RHSFreq = MBFI ? MBFI->getBlockFreq(R).getFrequency() : 0;
-        if (llvm::shouldOptimizeForSize(MBB, PSI, MBFI) ||
-            (!LHSFreq && !RHSFreq))
-          return CI->getCycleDepth(L) < CI->getCycleDepth(R);
-        return LHSFreq < RHSFreq;
-      });
+  llvm::stable_sort(AllSuccs, [&](const MachineBasicBlock *L,
+                                  const MachineBasicBlock *R) {
+    uint64_t LHSFreq = MBFI ? MBFI->getBlockFreq(L).getFrequency() : 0;
+    uint64_t RHSFreq = MBFI ? MBFI->getBlockFreq(R).getFrequency() : 0;
+    if (llvm::shouldOptimizeForSize(MBB, PSI, MBFI) || (!LHSFreq && !RHSFreq))
+      return CI->getCycleDepth(L) < CI->getCycleDepth(R);
+    return LHSFreq < RHSFreq;
+  });
 
   auto it = AllSuccessors.insert(std::make_pair(MBB, AllSuccs));
 
@@ -1866,8 +2236,17 @@ bool MachineSinking::SinkInstruction(MachineInstr &MI, bool &SawStore,
       FindSuccToSinkTo(MI, ParentBlock, BreakPHIEdge, AllSuccessors);
 
   // If there are no outputs, it must have side-effects.
-  if (!SuccToSinkTo)
+  // However, even if we can't find a normal sink target, we should still
+  // check if this is a switch statement case where our aggressive sinking
+  // optimization might be applicable.
+  if (!SuccToSinkTo) {
+    // Try aggressive sinking optimization for jumptable cases
+    if (TryDetectSinkPredecessors(MI, ParentBlock)) {
+      LLVM_DEBUG(dbgs() << " *** Will try aggressive sinking optimization "
+                           "for jumptable (no normal sink target found)\n");
+    }
     return false;
+  }
 
   // If the instruction to move defines a dead physical register which is live
   // when leaving the basic block, don't move it because it could turn into a
@@ -1919,9 +2298,16 @@ bool MachineSinking::SinkInstruction(MachineInstr &MI, bool &SawStore,
       // will sink MI in the newly created block.
       bool Status = PostponeSplitCriticalEdge(MI, ParentBlock, SuccToSinkTo,
                                               BreakPHIEdge);
-      if (!Status)
-        LLVM_DEBUG(dbgs() << " *** PUNTING: Not legal or profitable to "
-                             "break critical edge\n");
+      if (!Status) {
+        // Normal edge splitting is not legal or profitable.
+        // Try shared block optimization as an alternative.
+        if (TryDetectSinkPredecessors(MI, ParentBlock)) {
+          LLVM_DEBUG(dbgs() << " *** Will try shared block optimization\n");
+        } else {
+          LLVM_DEBUG(dbgs() << " *** PUNTING: Not legal or profitable to "
+                               "break critical edge\n");
+        }
+      }
       // The instruction will not be sunk this time.
       return false;
     }
@@ -1933,9 +2319,16 @@ bool MachineSinking::SinkInstruction(MachineInstr &MI, bool &SawStore,
     // break the critical edge first.
     bool Status =
         PostponeSplitCriticalEdge(MI, ParentBlock, SuccToSinkTo, BreakPHIEdge);
-    if (!Status)
-      LLVM_DEBUG(dbgs() << " *** PUNTING: Not legal or profitable to "
-                           "break critical edge\n");
+    if (!Status) {
+      // Normal edge splitting is not legal or profitable.
+      // Try individual block optimization as an alternative.
+      if (TryDetectSinkPredecessors(MI, ParentBlock)) {
+        LLVM_DEBUG(dbgs() << " *** Will try individual block optimization\n");
+      } else {
+        LLVM_DEBUG(dbgs() << " *** PUNTING: Not legal or profitable to "
+                             "break critical edge\n");
+      }
+    }
     // The instruction will not be sunk this time.
     return false;
   }
