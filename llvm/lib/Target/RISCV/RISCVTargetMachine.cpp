@@ -94,6 +94,28 @@ static cl::opt<bool>
                            cl::desc("Enable the loop data prefetch pass"),
                            cl::init(true));
 
+static cl::opt<bool> EnableMISchedLoadStoreClustering(
+    "riscv-misched-load-store-clustering", cl::Hidden,
+    cl::desc("Enable load and store clustering in the machine scheduler"),
+    cl::init(true));
+
+static cl::opt<bool> EnablePostMISchedLoadStoreClustering(
+    "riscv-postmisched-load-store-clustering", cl::Hidden,
+    cl::desc("Enable PostRA load and store clustering in the machine scheduler"),
+    cl::init(true));
+
+static cl::opt<bool>
+    EnableVLOptimizer("riscv-enable-vl-optimizer",
+                      cl::desc("Enable the RISC-V VL Optimizer pass"),
+                      cl::init(true), cl::Hidden);
+
+static cl::opt<bool> EnableCFIInstrInserter(
+    "riscv-enable-cfi-instr-inserter",
+    cl::desc("Enable CFI Instruction Inserter for RISC-V"), cl::init(false),
+    cl::Hidden);
+
+extern cl::opt<bool> RISCVSaveCSRsEarly;
+
 static cl::opt<bool> DisableVectorMaskMutation(
     "riscv-disable-vector-mask-mutation",
     cl::desc("Disable the vector mask scheduling mutation"), cl::init(false),
@@ -104,10 +126,6 @@ static cl::opt<bool>
                            cl::desc("Enable Machine Pipeliner for RISC-V"),
                            cl::init(false), cl::Hidden);
 
-static cl::opt<bool> EnableCFIInstrInserter(
-    "riscv-enable-cfi-instr-inserter",
-    cl::desc("Enable CFI Instruction Inserter for RISC-V"), cl::init(false),
-    cl::Hidden);
 
 extern "C" LLVM_ABI LLVM_EXTERNAL_VISIBILITY void LLVMInitializeRISCVTarget() {
   RegisterTargetMachine<RISCVTargetMachine> X(getTheRISCV32Target());
@@ -592,14 +610,20 @@ void RISCVPassConfig::addPreEmitPass2() {
     return MF.getFunction().getParent()->getModuleFlag("kcfi");
   }));
 
+  if (RISCVSaveCSRsEarly) {
+    // Unpack all remaining bundles before CFIInstrInserter. This is necessary
+    // because emitCFIsEarly (in PrologEpilogInserter) may create bundles that
+    // are not unpacked by the KCFI-specific UnpackMachineBundles pass above.
+    // CFIInstrInserter needs to see all CFI instructions, including those
+    // inside bundles, so we must unpack bundles before running it.
+    addPass(createUnpackMachineBundles(
+        [](const MachineFunction &) { return true; }));
+
+    addPass(&ExpandPostRAPseudosID);
+  }
+
   if (EnableCFIInstrInserter)
     addPass(createCFIInstrInserter());
-
-  // Unpack all remaining bundles before code emission. This is necessary
-  // because emitCFIsEarly (in PrologEpilogInserter) may create bundles that
-  // are not unpacked by the KCFI-specific UnpackMachineBundles pass above.
-  addPass(createUnpackMachineBundles(
-      [](const MachineFunction &) { return true; }));
 }
 
 void RISCVPassConfig::addMachineSSAOptimization() {
