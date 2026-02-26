@@ -2477,10 +2477,27 @@ void EarlyCFIEmitter::trackRegisterAndEmitCFIs(
       Comment << printReg(FrameReg, &TRI) << " + ";
       Comment << "vlenb * " << ScalableOffset << " + ";
       Comment << FixedOffset;
-      unsigned CFIIndex = MF.addFrameInst(
-          MCCFIInstruction::createLLVMRegAtScalableOffsetFromReg(
-              nullptr, DwarfEHRegNum, DwarfEHFrameReg, ScalableOffset,
-              FixedOffset, SMLoc(), Comment.str()));
+      
+      const RISCVSubtarget &ST = MF.getSubtarget<RISCVSubtarget>();
+      unsigned CFIIndex;
+      // Only use scalable offset CFI if we have vector extension support and
+      // ScalableOffset is non-zero. Otherwise, use fixed offset CFI.
+      if (ScalableOffset != 0 && ST.hasVInstructions()) {
+        CFIIndex = MF.addFrameInst(
+            MCCFIInstruction::createLLVMRegAtScalableOffsetFromReg(
+                nullptr, DwarfEHRegNum, DwarfEHFrameReg, ScalableOffset,
+                FixedOffset, SMLoc(), Comment.str()));
+      } else {
+        // Use fixed offset CFI when ScalableOffset is 0 or vector extension
+        // is not available. Use createOffset to specify the register location
+        // relative to CFA. getObjectOffset returns the offset relative to the
+        // function entry SP (which is the CFA), which is what CFI instructions need.
+        const MachineFrameInfo &MFI = MF.getFrameInfo();
+        int64_t CFIOffset = MFI.getObjectOffset(FrameIndex) +
+                            MFI.getOffsetAdjustment();
+        CFIIndex = MF.addFrameInst(MCCFIInstruction::createOffset(
+            nullptr, DwarfEHRegNum, CFIOffset, SMLoc()));
+      }
 
       CFIBuildInfos.push_back({&MBB, Def, DL, CFIIndex});
       trackRegisterAndEmitCFIs(StoredReg, DwarfEHRegNum, *Def, CFIBuildInfos,
