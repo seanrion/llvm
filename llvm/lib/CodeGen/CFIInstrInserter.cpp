@@ -18,6 +18,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "llvm/ADT/DepthFirstIterator.h"
+#include "llvm/ADT/SmallVector.h"
 #include "llvm/CodeGen/MachineFunctionPass.h"
 #include "llvm/CodeGen/MachineInstrBuilder.h"
 #include "llvm/CodeGen/Passes.h"
@@ -27,6 +28,7 @@
 #include "llvm/InitializePasses.h"
 #include "llvm/MC/MCContext.h"
 #include "llvm/MC/MCDwarf.h"
+#include "llvm/Support/raw_ostream.h"
 using namespace llvm;
 
 static cl::opt<bool> VerifyCFI("verify-cfiinstrs",
@@ -66,34 +68,13 @@ class CFIInstrInserter : public MachineFunctionPass {
   }
 
  private:
-  struct MBBCFAInfo {
-    MachineBasicBlock *MBB;
-    /// Value of cfa offset valid at basic block entry.
-    int64_t IncomingCFAOffset = -1;
-    /// Value of cfa offset valid at basic block exit.
-    int64_t OutgoingCFAOffset = -1;
-    /// Value of cfa register valid at basic block entry.
-    unsigned IncomingCFARegister = 0;
-    /// Value of cfa register valid at basic block exit.
-    unsigned OutgoingCFARegister = 0;
-    /// Set of callee saved registers saved at basic block entry.
-    BitVector IncomingCSRSaved;
-    /// Set of callee saved registers saved at basic block exit.
-    BitVector OutgoingCSRSaved;
-    /// If in/out cfa offset and register values for this block have already
-    /// been set or not.
-    bool Processed = false;
-  };
-
 #define INVALID_REG UINT_MAX
 #define INVALID_OFFSET INT_MAX
-  /// contains the location where CSR register is saved.
+  /// Contains the location where CSR register is saved.
   class CSRSavedLocation {
   public:
     enum Kind { Invalid, Register, CFAOffset };
     Kind K = Invalid;
-
-  private:
     union {
       // Dwarf register number
       unsigned Reg;
@@ -131,36 +112,68 @@ class CFIInstrInserter : public MachineFunctionPass {
     }
 
     bool operator==(const CSRSavedLocation &RHS) const {
+      if (K == Kind::Invalid)
+        return !RHS.isValid();
       if (K != RHS.K)
         return false;
       switch (K) {
-      case Kind::Invalid:
-        return true;
       case Kind::Register:
-        return getRegister() == RHS.getRegister();
+        return Reg == RHS.Reg;
       case Kind::CFAOffset:
-        return getOffset() == RHS.getOffset();
+        return Offset == RHS.Offset;
+      default:
+        llvm_unreachable("Unknown CSRSavedLocation Kind!");
       }
-      llvm_unreachable("Unknown CSRSavedLocation Kind!");
     }
     bool operator!=(const CSRSavedLocation &RHS) const {
       return !(*this == RHS);
     }
+
+    void dump(raw_ostream &OS) const {
+      switch (K) {
+      case Kind::Invalid:
+        OS << "INVALID";
+        break;
+      case Kind::Register:
+        OS << "In Dwarf register: " << Reg;
+        break;
+      case Kind::CFAOffset:
+        OS << "At CFA offset: " << Offset;
+        break;
+      }
+    }
   };
 
+  struct MBBCFAInfo {
+    MachineBasicBlock *MBB;
+    /// Value of cfa offset valid at basic block entry.
+    int64_t IncomingCFAOffset = -1;
+    /// Value of cfa offset valid at basic block exit.
+    int64_t OutgoingCFAOffset = -1;
+    /// Value of cfa register valid at basic block entry.
+    unsigned IncomingCFARegister = 0;
+    /// Value of cfa register valid at basic block exit.
+    unsigned OutgoingCFARegister = 0;
+    /// Set of locations where the callee saved registers are at basic block
+    /// entry.
+    SmallVector<CSRSavedLocation> IncomingCSRLocations;
+    /// Set of locations where the callee saved registers are at basic block
+    /// exit.
+    SmallVector<CSRSavedLocation> OutgoingCSRLocations;
+    /// If in/out cfa offset and register values for this block have already
+    /// been set or not.
+    bool Processed = false;
+  };
   /// Contains cfa offset and register values valid at entry and exit of basic
   /// blocks.
   std::vector<MBBCFAInfo> MBBVector;
-
-  /// Map the callee save registers to the locations where they are saved.
-  SmallDenseMap<unsigned, CSRSavedLocation, 16> CSRLocMap;
 
   /// Calculate cfa offset and register values valid at entry and exit for all
   /// basic blocks in a function.
   void calculateCFAInfo(MachineFunction &MF);
   /// Calculate cfa offset and register values valid at basic block exit by
-  /// checking the block for CFI instructions. Block's incoming CFA info remains
-  /// the same.
+  /// checking the block for CFI instructions. Block's incoming CFA info
+  /// remains the same.
   void calculateOutgoingCFAInfo(MBBCFAInfo &MBBInfo);
   /// Update in/out cfa offset and register values for successors of the basic
   /// block.
@@ -172,8 +185,8 @@ class CFIInstrInserter : public MachineFunctionPass {
   /// that block.
   bool insertCFIInstrs(MachineFunction &MF);
   /// Return the cfa offset value that should be set at the beginning of a MBB
-  /// if needed. The negated value is needed when creating CFI instructions that
-  /// set absolute offset.
+  /// if needed. The negated value is needed when creating CFI instructions
+  /// that set absolute offset.
   int64_t getCorrectCFAOffset(MachineBasicBlock *MBB) {
     return MBBVector[MBB->getNumber()].IncomingCFAOffset;
   }
@@ -215,10 +228,18 @@ void CFIInstrInserter::calculateCFAInfo(MachineFunction &MF) {
     MBBInfo.OutgoingCFAOffset = InitialOffset;
     MBBInfo.IncomingCFARegister = DwarfInitialRegister;
     MBBInfo.OutgoingCFARegister = DwarfInitialRegister;
-    MBBInfo.IncomingCSRSaved.resize(NumRegs);
-    MBBInfo.OutgoingCSRSaved.resize(NumRegs);
+    MBBInfo.IncomingCSRLocations.resize(NumRegs);
+    MBBInfo.OutgoingCSRLocations.resize(NumRegs);
   }
-  CSRLocMap.clear();
+
+  // Record the initial location of all registers.
+  MBBCFAInfo &EntryMBBInfo = MBBVector[MF.front().getNumber()];
+  const MCPhysReg *CSRegs = MF.getRegInfo().getCalleeSavedRegs();
+  for (int i = 0; CSRegs[i]; ++i) {
+    unsigned Reg = TRI.getDwarfRegNum(CSRegs[i], true);
+    CSRSavedLocation &CSRLoc = EntryMBBInfo.IncomingCSRLocations[Reg];
+    CSRLoc.Reg = Reg;
+  }
 
   // Set in/out cfa info for all blocks in the function. This traversal is based
   // on the assumption that the first block in the function is the entry block
@@ -229,14 +250,17 @@ void CFIInstrInserter::calculateCFAInfo(MachineFunction &MF) {
 
 void CFIInstrInserter::calculateOutgoingCFAInfo(MBBCFAInfo &MBBInfo) {
   // Outgoing cfa offset set by the block.
-  int64_t SetOffset = MBBInfo.IncomingCFAOffset;
+  int64_t &OutgoingCFAOffset = MBBInfo.OutgoingCFAOffset;
+  OutgoingCFAOffset = MBBInfo.IncomingCFAOffset;
   // Outgoing cfa register set by the block.
-  unsigned SetRegister = MBBInfo.IncomingCFARegister;
+  unsigned &OutgoingCFARegister = MBBInfo.OutgoingCFARegister;
+  OutgoingCFARegister = MBBInfo.IncomingCFARegister;
+  // Outgoing locations for each callee-saved register set by the block.
+  SmallVector<CSRSavedLocation> &OutgoingCSRLocations =
+      MBBInfo.OutgoingCSRLocations;
+  OutgoingCSRLocations = MBBInfo.IncomingCSRLocations;
   MachineFunction *MF = MBBInfo.MBB->getParent();
   const std::vector<MCCFIInstruction> &Instrs = MF->getFrameInstructions();
-  const TargetRegisterInfo &TRI = *MF->getSubtarget().getRegisterInfo();
-  unsigned NumRegs = TRI.getNumSupportedRegs(*MF);
-  BitVector CSRSaved(NumRegs), CSRRestored(NumRegs);
 
 #ifndef NDEBUG
   int RememberState = 0;
@@ -245,36 +269,51 @@ void CFIInstrInserter::calculateOutgoingCFAInfo(MBBCFAInfo &MBBInfo) {
   // Determine cfa offset and register set by the block.
   for (MachineInstr &MI : *MBBInfo.MBB) {
     if (MI.isCFIInstruction()) {
-      std::optional<unsigned> CSRReg;
-      std::optional<int64_t> CSROffset;
       unsigned CFIIndex = MI.getOperand(0).getCFIIndex();
       const MCCFIInstruction &CFI = Instrs[CFIIndex];
       switch (CFI.getOperation()) {
-      case MCCFIInstruction::OpDefCfaRegister:
-        SetRegister = CFI.getRegister();
+      case MCCFIInstruction::OpDefCfaRegister: {
+        OutgoingCFARegister = CFI.getRegister();
         break;
-      case MCCFIInstruction::OpDefCfaOffset:
-        SetOffset = CFI.getOffset();
+      }
+      case MCCFIInstruction::OpDefCfaOffset: {
+        OutgoingCFAOffset = CFI.getOffset();
         break;
-      case MCCFIInstruction::OpAdjustCfaOffset:
-        SetOffset += CFI.getOffset();
+      }
+      case MCCFIInstruction::OpAdjustCfaOffset: {
+        OutgoingCFAOffset += CFI.getOffset();
         break;
-      case MCCFIInstruction::OpDefCfa:
-        SetRegister = CFI.getRegister();
-        SetOffset = CFI.getOffset();
+      }
+      case MCCFIInstruction::OpDefCfa: {
+        OutgoingCFARegister = CFI.getRegister();
+        OutgoingCFAOffset = CFI.getOffset();
         break;
-      case MCCFIInstruction::OpOffset:
-        CSROffset = CFI.getOffset();
+      }
+      case MCCFIInstruction::OpOffset: {
+        CSRSavedLocation &CSRLocation = OutgoingCSRLocations[CFI.getRegister()];
+        CSRLocation.K = CSRSavedLocation::Kind::CFAOffset;
+        CSRLocation.Offset = CFI.getOffset();
         break;
-      case MCCFIInstruction::OpRegister:
-        CSRReg = CFI.getRegister2();
+      }
+      case MCCFIInstruction::OpRegister: {
+        CSRSavedLocation &CSRLocation = OutgoingCSRLocations[CFI.getRegister()];
+        CSRLocation.K = CSRSavedLocation::Kind::Register;
+        CSRLocation.Reg = CFI.getRegister2();
         break;
-      case MCCFIInstruction::OpRelOffset:
-        CSROffset = CFI.getOffset() - SetOffset;
+      }
+      case MCCFIInstruction::OpRelOffset: {
+        CSRSavedLocation &CSRLocation = OutgoingCSRLocations[CFI.getRegister()];
+        CSRLocation.K = CSRSavedLocation::Kind::CFAOffset;
+        CSRLocation.Offset = CFI.getOffset() - OutgoingCFAOffset;
         break;
-      case MCCFIInstruction::OpRestore:
-        CSRRestored.set(CFI.getRegister());
+      }
+      case MCCFIInstruction::OpRestore: {
+        unsigned Reg = CFI.getRegister();
+        CSRSavedLocation &CSRLocation = OutgoingCSRLocations[Reg];
+        CSRLocation.K = CSRSavedLocation::Kind::Register;
+        CSRLocation.Reg = Reg;
         break;
+      }
       case MCCFIInstruction::OpLLVMDefAspaceCfa:
         // TODO: Add support for handling cfi_def_aspace_cfa.
 #ifndef NDEBUG
@@ -319,21 +358,6 @@ void CFIInstrInserter::calculateOutgoingCFAInfo(MBBCFAInfo &MBBInfo) {
       case MCCFIInstruction::OpValOffset:
         break;
       }
-      assert((!CSRReg.has_value() || !CSROffset.has_value()) &&
-             "A register can only be at an offset from CFA or in another "
-             "register, but not both!");
-      CSRSavedLocation CSRLoc;
-      if (CSRReg)
-        CSRLoc = CSRSavedLocation::createRegister(*CSRReg);
-      else if (CSROffset)
-        CSRLoc = CSRSavedLocation::createCFAOffset(*CSROffset);
-      if (CSRLoc.isValid()) {
-        auto [It, Inserted] = CSRLocMap.insert({CFI.getRegister(), CSRLoc});
-        if (!Inserted && It->second != CSRLoc)
-          reportFatalInternalError(
-              "Different saved locations for the same CSR");
-        CSRSaved.set(CFI.getRegister());
-      }
     }
   }
 
@@ -346,15 +370,6 @@ void CFIInstrInserter::calculateOutgoingCFAInfo(MBBCFAInfo &MBBInfo) {
 #endif
 
   MBBInfo.Processed = true;
-
-  // Update outgoing CFA info.
-  MBBInfo.OutgoingCFAOffset = SetOffset;
-  MBBInfo.OutgoingCFARegister = SetRegister;
-
-  // Update outgoing CSR info.
-  BitVector::apply([](auto x, auto y, auto z) { return (x | y) & ~z; },
-                   MBBInfo.OutgoingCSRSaved, MBBInfo.IncomingCSRSaved, CSRSaved,
-                   CSRRestored);
 }
 
 void CFIInstrInserter::updateSuccCFAInfo(MBBCFAInfo &MBBInfo) {
@@ -370,7 +385,7 @@ void CFIInstrInserter::updateSuccCFAInfo(MBBCFAInfo &MBBInfo) {
       if (!SuccInfo.Processed) {
         SuccInfo.IncomingCFAOffset = CurrentInfo.OutgoingCFAOffset;
         SuccInfo.IncomingCFARegister = CurrentInfo.OutgoingCFARegister;
-        SuccInfo.IncomingCSRSaved = CurrentInfo.OutgoingCSRSaved;
+        SuccInfo.IncomingCSRLocations = CurrentInfo.OutgoingCSRLocations;
         Stack.push_back(Succ);
       }
     }
@@ -382,7 +397,6 @@ bool CFIInstrInserter::insertCFIInstrs(MachineFunction &MF) {
   const TargetInstrInfo *TII = MF.getSubtarget().getInstrInfo();
   bool InsertedCFIInstr = false;
 
-  BitVector SetDifference;
   for (MachineBasicBlock &MBB : MF) {
     // Skip the first MBB in a function
     if (MBB.getNumber() == MF.front().getNumber()) continue;
@@ -434,37 +448,34 @@ bool CFIInstrInserter::insertCFIInstrs(MachineFunction &MF) {
       continue;
     }
 
-    BitVector::apply([](auto x, auto y) { return x & ~y; }, SetDifference,
-                     PrevMBBInfo->OutgoingCSRSaved, MBBInfo.IncomingCSRSaved);
-    for (int Reg : SetDifference.set_bits()) {
-      unsigned CFIIndex =
-          MF.addFrameInst(MCCFIInstruction::createRestore(nullptr, Reg));
-      BuildMI(*MBBInfo.MBB, MBBI, DL, TII->get(TargetOpcode::CFI_INSTRUCTION))
-          .addCFIIndex(CFIIndex);
-      InsertedCFIInstr = true;
-    }
+    for (unsigned i = 0; i < PrevMBBInfo->OutgoingCSRLocations.size(); ++i) {
+      const CSRSavedLocation &PrevOutgoingCSRLoc =
+          PrevMBBInfo->OutgoingCSRLocations[i];
+      const CSRSavedLocation &HasToBeCSRLoc = MBBInfo.IncomingCSRLocations[i];
+      // Ignore non-callee-saved registers, they remain uninitialized (invalid).
+      if (!HasToBeCSRLoc.isValid())
+        continue;
+      if (HasToBeCSRLoc == PrevOutgoingCSRLoc)
+        continue;
 
-    BitVector::apply([](auto x, auto y) { return x & ~y; }, SetDifference,
-                     MBBInfo.IncomingCSRSaved, PrevMBBInfo->OutgoingCSRSaved);
-    for (int Reg : SetDifference.set_bits()) {
-      auto it = CSRLocMap.find(Reg);
-      assert(it != CSRLocMap.end() && "Reg should have an entry in CSRLocMap");
-      unsigned CFIIndex;
-      CSRSavedLocation RO = it->second;
-      switch (RO.K) {
-      case CSRSavedLocation::CFAOffset: {
+      unsigned CFIIndex = (unsigned)(-1);
+      if (HasToBeCSRLoc.K == CSRSavedLocation::Kind::CFAOffset &&
+          HasToBeCSRLoc.Offset != PrevOutgoingCSRLoc.Offset) {
         CFIIndex = MF.addFrameInst(
-            MCCFIInstruction::createOffset(nullptr, Reg, RO.getOffset()));
-        break;
-      }
-      case CSRSavedLocation::Register: {
-        CFIIndex = MF.addFrameInst(
-            MCCFIInstruction::createRegister(nullptr, Reg, RO.getRegister()));
-        break;
-      }
-      default:
-        llvm_unreachable("Invalid CSRSavedLocation!");
-      }
+            MCCFIInstruction::createOffset(nullptr, i, HasToBeCSRLoc.Offset));
+      } else if (HasToBeCSRLoc.K == CSRSavedLocation::Kind::Register &&
+                 (HasToBeCSRLoc.Reg != PrevOutgoingCSRLoc.Reg)) {
+        unsigned NewReg = HasToBeCSRLoc.Reg;
+        unsigned DwarfEHReg = i;
+        if (NewReg == DwarfEHReg) {
+          CFIIndex = MF.addFrameInst(
+              MCCFIInstruction::createRestore(nullptr, DwarfEHReg));
+        } else {
+          CFIIndex = MF.addFrameInst(
+              MCCFIInstruction::createRegister(nullptr, i, HasToBeCSRLoc.Reg));
+        }
+      } else
+        llvm_unreachable("Unexpected CSR location.");
       BuildMI(*MBBInfo.MBB, MBBI, DL, TII->get(TargetOpcode::CFI_INSTRUCTION))
           .addCFIIndex(CFIIndex);
       InsertedCFIInstr = true;
@@ -497,13 +508,23 @@ void CFIInstrInserter::reportCSRError(const MBBCFAInfo &Pred,
          << Pred.MBB->getParent()->getName() << " ***\n";
   errs() << "Pred: " << Pred.MBB->getName() << " #" << Pred.MBB->getNumber()
          << " outgoing CSR Saved: ";
-  for (int Reg : Pred.OutgoingCSRSaved.set_bits())
-    errs() << Reg << " ";
+  for (const CSRSavedLocation &OutgoingCSRLocation :
+       Pred.OutgoingCSRLocations) {
+    if (OutgoingCSRLocation.isValid()) {
+      OutgoingCSRLocation.dump(errs());
+      errs() << " ";
+    }
+  }
   errs() << "\n";
   errs() << "Succ: " << Succ.MBB->getName() << " #" << Succ.MBB->getNumber()
          << " incoming CSR Saved: ";
-  for (int Reg : Succ.IncomingCSRSaved.set_bits())
-    errs() << Reg << " ";
+  for (const CSRSavedLocation &IncomingCSRLocation :
+       Succ.IncomingCSRLocations) {
+    if (IncomingCSRLocation.isValid()) {
+      IncomingCSRLocation.dump(errs());
+      errs() << " ";
+    }
+  }
   errs() << "\n";
 }
 
@@ -526,9 +547,12 @@ unsigned CFIInstrInserter::verify(MachineFunction &MF) {
       }
       // Check that IncomingCSRSaved of every successor matches the
       // OutgoingCSRSaved of CurrMBB
-      if (SuccMBBInfo.IncomingCSRSaved != CurrMBBInfo.OutgoingCSRSaved) {
-        reportCSRError(CurrMBBInfo, SuccMBBInfo);
-        ErrorNum++;
+      for (unsigned i = 0; i < CurrMBBInfo.OutgoingCSRLocations.size(); ++i) {
+        if (!(CurrMBBInfo.OutgoingCSRLocations[i] ==
+              SuccMBBInfo.IncomingCSRLocations[i])) {
+          reportCSRError(CurrMBBInfo, SuccMBBInfo);
+          ErrorNum++;
+        }
       }
     }
   }
