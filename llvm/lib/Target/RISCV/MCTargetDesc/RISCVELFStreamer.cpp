@@ -167,6 +167,8 @@ void RISCVELFStreamer::changeSection(MCSection *Section, uint32_t Subsection) {
 
 void RISCVELFStreamer::emitInstruction(const MCInst &Inst,
                                        const MCSubtargetInfo &STI) {
+  auto &Backend = static_cast<RISCVAsmBackend &> (this->getAssemblerPtr()->getBackend());
+  Backend.emitInstructionBegin(*this, Inst, STI);
   emitInstructionsMappingSymbol();
   MCELFStreamer::emitInstruction(Inst, STI);
 }

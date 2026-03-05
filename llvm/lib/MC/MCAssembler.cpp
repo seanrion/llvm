@@ -225,6 +225,9 @@ uint64_t MCAssembler::computeFragmentSize(const MCFragment &F) const {
   case MCFragment::FT_BoundaryAlign:
     return cast<MCBoundaryAlignFragment>(F).getSize();
 
+  case MCFragment::FT_BranchSpacing:
+    return cast<MCBranchSpacingFragment>(F).getSize();
+
   case MCFragment::FT_SymbolId:
     return 4;
 
@@ -531,6 +534,14 @@ static void writeFragment(raw_ostream &OS, const MCAssembler &Asm,
     if (!Asm.getBackend().writeNopData(OS, FragmentSize, BF.getSubtargetInfo()))
       report_fatal_error("unable to write nop sequence of " +
                          Twine(FragmentSize) + " bytes");
+    break;
+  }
+
+  case MCFragment::FT_BranchSpacing: {
+    const MCBranchSpacingFragment &BF = cast<MCBranchSpacingFragment>(F);
+    if(!Asm.getBackend().writeNopData(OS, FragmentSize, BF.getSubtargetinfo()))
+    report_fatal_error("unable to write nop sequence of "+
+    Twine(FragmentSize) + " bytes");
     break;
   }
 
@@ -935,6 +946,29 @@ void MCAssembler::relaxSFrameFragment(MCFragment &F) {
   F.clearVarFixups();
 }
 
+bool MCAssembler::relaxBranchSpacing(MCBranchSpacingFragment &BF) {
+  // By judging the spacing from the previous MCBranchSpacin"gFragment, it is determined"
+  // whether to relax the current MCBranchSpacingFragment, andalso how large the size
+  //of the relaxation should be.
+  if (!BF.getLastBA())
+    return false;
+  const MCBranchSpacingFragment &LastBA = *BF.getLastBA();
+  uint64_t LastBAOffset = getFragmentOffset(LastBA);
+  uint64_t LastBASize = LastBA.getSize();
+  uint64_t CurrentBAOffset = getFragmentOffset(BF);
+  // When calculating the current Spacing, it is necessany to take into account both the
+  // offset and size of the previous MCBranchSpacingFragment 
+  uint64_t Spacing = CurrentBAOffset - LastBAOffset -LastBASize;
+
+  uint64_t NewSize = Spacing < BF.getSpacing() ? BF.getSpacing() - Spacing : 0U;
+  if (NewSize == BF.getSize())
+    return false;
+  BF.setSize (NewSize);
+  return true;
+}
+
+
+
 bool MCAssembler::relaxFragment(MCFragment &F) {
   auto Size = computeFragmentSize(F);
   switch (F.getKind()) {
@@ -970,6 +1004,8 @@ bool MCAssembler::relaxFragment(MCFragment &F) {
   case MCFragment::FT_Fill:
   case MCFragment::FT_Org:
     return F.getNext()->Offset - F.Offset != Size;
+  case MCFragment::FT_BranchSpacing:
+    return relaxBranchSpacing(cast<MCBranchSpacingFragment>(F));
   }
   return computeFragmentSize(F) != Size;
 }
