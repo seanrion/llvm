@@ -29,6 +29,7 @@
 namespace llvm {
 
 class MCBoundaryAlignFragment;
+class MCBranchSpacingFragment;
 class MCCVDefRangeFragment;
 class MCCVInlineLineTableFragment;
 class MCFragment;
@@ -121,6 +122,7 @@ private:
   void relaxDwarfLineAddr(MCFragment &F);
   void relaxDwarfCallFrameFragment(MCFragment &F);
   void relaxSFrameFragment(MCFragment &DF);
+  bool relaxBranchSpacing(MCBranchSpacingFragment &BF);
 
 public:
   /// Construct a new assembler instance.
