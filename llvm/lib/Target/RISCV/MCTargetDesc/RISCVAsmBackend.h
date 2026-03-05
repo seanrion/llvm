@@ -15,6 +15,8 @@
 #include "llvm/ADT/StringMap.h"
 #include "llvm/MC/MCAsmBackend.h"
 #include "llvm/MC/MCSubtargetInfo.h"
+#include "llvm/MC/MCStreamer.h"
+#include "llvm/MC/MCObjectStreamer.h"
 
 namespace llvm {
 class MCAssembler;
@@ -27,6 +29,10 @@ protected:
   uint8_t OSABI;
   bool Is64Bit;
   const MCTargetOptions &TargetOptions;
+
+  unsigned BranchSpacingValue = 0;
+  MCBranchSpacingFragment *LastBA = nullptr;
+  MCBranchSpacingFragment *PendingBA = nullptr;
   // Temporary symbol used to check whether a PC-relative fixup is resolved.
   MCSymbol *PCRelTemp = nullptr;
 
@@ -75,6 +81,11 @@ public:
                     const MCSubtargetInfo *STI) const override;
 
   const MCTargetOptions &getTargetOptions() const { return TargetOptions; }
+
+  bool needBranchSpacing(const MCInst &Inst)const;
+  void BranchSpacing();
+  void emitInstructionBegin(MCObjectStreamer &S, const MCInst &Inst,
+                            const MCSubtargetInfo &STI);
 };
 }
 
