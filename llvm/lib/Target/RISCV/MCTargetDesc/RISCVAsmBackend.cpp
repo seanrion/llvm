@@ -38,6 +38,14 @@ static cl::opt<bool>
              cl::desc("When generating R_RISCV_ALIGN, insert $alignment-2 "
                       "bytes of NOPs even in norvc code"));
 
+// Define a option to control the spacing betweenRISC-V branch instructions.
+static cl::opt<unsigned> RISCVBranchSpacing(
+  "riscv-branch-spacing", cl::init(0),
+  cl::desc(
+    "Control the min spacing between two branch instruction"
+  )
+);
+
 RISCVAsmBackend::RISCVAsmBackend(const MCSubtargetInfo &STI, uint8_t OSABI,
                                  bool Is64Bit, bool IsLittleEndian,
                                  const MCTargetOptions &Options)
@@ -45,6 +53,7 @@ RISCVAsmBackend::RISCVAsmBackend(const MCSubtargetInfo &STI, uint8_t OSABI,
                                   : llvm::endianness::big),
       STI(STI), OSABI(OSABI), Is64Bit(Is64Bit), TargetOptions(Options) {
   RISCVFeatures::validate(STI.getTargetTriple(), STI.getFeatureBits());
+  BranchSpacing();
 }
 
 std::optional<MCFixupKind> RISCVAsmBackend::getFixupKind(StringRef Name) const {
@@ -989,4 +998,39 @@ MCAsmBackend *llvm::createRISCVAsmBackend(const Target &T,
                                      TT.isLittleEndian(), Options);
   return new RISCVAsmBackend(STI, OSABI, TT.isArch64Bit(), TT.isLittleEndian(),
                              Options);
+}
+
+void RISCVAsmBackend::BranchSpacing() {
+  if(RISCVBranchSpacing.getNumOccurrences()) {
+    BranchSpacingValue = RISCVBranchSpacing;
+  }
+  return;
+}
+
+bool RISCVAsmBackend::needBranchSpacing(const MCInst &Inst) const {
+  unsigned Opcode = Inst.getOpcode();
+  switch (Opcode) {
+    case RISCV::BEQ:
+    case RISCV::BNE:
+    case RISCV::BLT:
+    case RISCV::BGE:
+    case RISCV::BLTU:
+    case RISCV::BGEU:
+    case RISCV::C_BEQZ:
+    case RISCV::C_BNEZ:
+      return true;
+    default:
+      return false;
+  }
+}
+
+void RISCVAsmBackend::emitInstructionBegin(MCObjectStreamer &S,
+    const MCInst &Inst, const MCSubtargetInfo &STI) {
+  if (BranchSpacingValue != 0 && needBranchSpacing(Inst)) {
+    PendingBA = S.newSpecialFragment<MCBranchSpacingFragment>(STI);
+    PendingBA->setSpacing(BranchSpacingValue);
+    if (LastBA)
+      PendingBA->setLastBA(LastBA);
+    LastBA = PendingBA;
+  }
 }

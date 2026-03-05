@@ -64,6 +64,7 @@ public:
     FT_SymbolId,
     FT_CVInlineLines,
     FT_CVDefRange,
+    FT_BranchSpacing,
   };
 
 private:
@@ -701,6 +702,40 @@ inline MCSection::iterator &MCSection::iterator::operator++() {
   return *this;
 }
 
+class MCBranchSpacingFragment : public MCFragment {
+  /// The previous MCBranchSpacingFragment in the setof fragments.
+  const MCBranchSpacingFragment *LastBA = nullptr;
+  /// The size of the fragment. The size is lazily set duriing relaxation, and
+  /// is not meaningful before that.
+  uint64_t Size = 0;
+  /// The variable Spacing determines the minimum spacing between tthe current
+  /// MCBranchSpacingFragment and the previous MCBranchSpacingFragment. It is
+  /// defined by the option "--riscv-branch-spacing." If this option is not
+  /// specified, it is initialized to 0. If the option is provided, it will be
+  /// set during the initialization of the RISCVAsmBackend.
+  uint64_t Spacing = 0;
+  /// When emitting Nops some subtargets have specific nop encodings
+  const MCSubtargetInfo &STI;
+
+public:
+  MCBranchSpacingFragment(const MCSubtargetInfo &STI)
+      : MCFragment(FT_BranchSpacing, false), STI(STI) {}
+
+  uint64_t getSize() const { return Size; }
+  void setSize(uint64_t Value) { Size = Value; }
+
+  const MCBranchSpacingFragment *getLastBA() const { return LastBA; }
+  void setLastBA(const MCBranchSpacingFragment *F) { LastBA = F; }
+
+  uint64_t getSpacing() const { return Spacing; }
+  void setSpacing(const uint64_t Value) { Spacing = Value; }
+
+  const MCSubtargetInfo *getSubtargetinfo() const { return &STI; }
+
+  static bool classof(const MCFragment *F) {
+    return F->getKind() == MCFragment::FT_BranchSpacing;
+  }
+};
 } // end namespace llvm
 
 #endif // LLVM_MC_MCSECTION_H
