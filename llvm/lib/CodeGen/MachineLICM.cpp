@@ -83,13 +83,6 @@ IgnoreLoopExternalDefs("machinelicm-ignore-loop-external-defs",
                                  "estimating register pressure"),
                         cl::init(true), cl::Hidden);
 
-static cl::opt<bool>
-IgnoreLoopExternalDefs("machinelicm-ignore-loop-external-defs",
-                        cl::desc("MachineLICM should ignore register definitions "
-                                 "that are only used outside the loop when "
-                                 "estimating register pressure"),
-                        cl::init(true), cl::Hidden);
-
 // The default threshold of 100 (i.e. if target block is 100 times hotter)
 // is based on empirical data on a single target and is subject to tuning.
 static cl::opt<unsigned>
@@ -972,7 +965,7 @@ bool MachineLICMImpl::allDefsAreOnlyUsedOutsideOfTheLoop(
 void MachineLICMImpl::UpdateRegPressure(const MachineInstr *MI,
                                         bool ConsiderUnseenAsDeff,
                                         bool IgnoreDefs) {
-  auto Cost = calcRegisterCost(MI, /*ConsiderSeen=*/true, ConsiderUnseenAsDef,
+  auto Cost = calcRegisterCost(MI, /*ConsiderSeen=*/true, ConsiderUnseenAsDeff,
     IgnoreDefs);
   for (const auto &[Class, Weight] : Cost) {
     if (static_cast<int>(RegPressure[Class]) < -Weight)
