@@ -59,6 +59,8 @@ STATISTIC(EmittedAlignFragments,
 STATISTIC(EmittedFillFragments,
           "Number of emitted assembler fragments - fill");
 STATISTIC(EmittedNopsFragments, "Number of emitted assembler fragments - nops");
+STATISTIC(EmittedNopsAfterBranchFragments,
+          "Number of emitted assembler fragments - nops after branch");
 STATISTIC(EmittedOrgFragments, "Number of emitted assembler fragments - org");
 STATISTIC(Fixups, "Number of fixups");
 STATISTIC(FixupEvalForRelax, "Number of fixup evaluations for relaxation");
@@ -227,6 +229,9 @@ uint64_t MCAssembler::computeFragmentSize(const MCFragment &F) const {
 
   case MCFragment::FT_BranchSpacing:
     return cast<MCBranchSpacingFragment>(F).getSize();
+
+  case MCFragment::FT_NopsAfterBranch:
+    return cast<MCNopsAfterBranchFragment>(F).getNumBytes();
 
   case MCFragment::FT_SymbolId:
     return 4;
@@ -539,9 +544,19 @@ static void writeFragment(raw_ostream &OS, const MCAssembler &Asm,
 
   case MCFragment::FT_BranchSpacing: {
     const MCBranchSpacingFragment &BF = cast<MCBranchSpacingFragment>(F);
-    if(!Asm.getBackend().writeNopData(OS, FragmentSize, BF.getSubtargetinfo()))
-    report_fatal_error("unable to write nop sequence of "+
-    Twine(FragmentSize) + " bytes");
+    if (!Asm.getBackend().writeNopData(OS, FragmentSize, BF.getSubtargetInfo()))
+      report_fatal_error("unable to write nop sequence of " +
+                         Twine(FragmentSize) + " bytes");
+    break;
+  }
+
+  case MCFragment::FT_NopsAfterBranch: {
+    ++stats::EmittedNopsAfterBranchFragments;
+    const MCNopsAfterBranchFragment &NF = cast<MCNopsAfterBranchFragment>(F);
+    if (!Asm.getBackend().writeNopData(OS, FragmentSize,
+                                       NF.getSubtargetInfo()))
+      report_fatal_error("unable to write nop sequence of " +
+                         Twine(FragmentSize) + " bytes");
     break;
   }
 
@@ -674,6 +689,15 @@ void MCAssembler::layout() {
     for (MCSection &Sec : *this)
       layoutSection(Sec);
 
+  // Target-specific shrink (e.g. NOP cleanup). Iterate until no changes.
+  for (MCSection &Sec : *this) {
+    if (!Sec.isText())
+      continue;
+    uint64_t RestartWinBase = 0;
+    while (getBackend().shrinkSection(*this, Sec, RestartWinBase))
+      layoutSection(Sec);
+  }
+
   flushPendingErrors();
 
   DEBUG_WITH_TYPE("mc-dump", {
@@ -687,6 +711,8 @@ void MCAssembler::layout() {
   // Fragment sizes are finalized. For RISC-V linker relaxation, this flag
   // helps check whether a PC-relative fixup is fully resolved.
   this->HasFinalLayout = true;
+
+  getBackend().performPostLayout(*this);
 
   // Resolve .reloc offsets and add fixups.
   for (auto &PF : relocDirectives) {
@@ -947,23 +973,26 @@ void MCAssembler::relaxSFrameFragment(MCFragment &F) {
 }
 
 bool MCAssembler::relaxBranchSpacing(MCBranchSpacingFragment &BF) {
-  // By judging the spacing from the previous MCBranchSpacin"gFragment, it is determined"
-  // whether to relax the current MCBranchSpacingFragment, andalso how large the size
-  //of the relaxation should be.
+  // By judging the spacing from the previous MCBranchSpacingFragment, it is determined
+  // whether to relax the current MCBranchSpacingFragment, and also how large the size
+  // of the relaxation should be.
   if (!BF.getLastBA())
     return false;
+
   const MCBranchSpacingFragment &LastBA = *BF.getLastBA();
   uint64_t LastBAOffset = getFragmentOffset(LastBA);
   uint64_t LastBASize = LastBA.getSize();
   uint64_t CurrentBAOffset = getFragmentOffset(BF);
-  // When calculating the current Spacing, it is necessany to take into account both the
-  // offset and size of the previous MCBranchSpacingFragment 
-  uint64_t Spacing = CurrentBAOffset - LastBAOffset -LastBASize;
+
+  // When calculating the current Spacing, it is necessary to take into account both the
+  // offset and size of the previous MCBranchSpacingFragment.
+  uint64_t Spacing = CurrentBAOffset - LastBAOffset - LastBASize;
 
   uint64_t NewSize = Spacing < BF.getSpacing() ? BF.getSpacing() - Spacing : 0U;
+
   if (NewSize == BF.getSize())
     return false;
-  BF.setSize (NewSize);
+  BF.setSize(NewSize);
   return true;
 }
 

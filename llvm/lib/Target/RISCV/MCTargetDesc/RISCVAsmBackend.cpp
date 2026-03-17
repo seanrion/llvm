@@ -8,23 +8,32 @@
 
 #include "RISCVAsmBackend.h"
 #include "RISCVFixupKinds.h"
+#include "llvm/Target/RISCV/RISCVBTBFetchLineBranchRelaxation.h"
 #include "llvm/ADT/APInt.h"
+#include "llvm/ADT/SmallVector.h"
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/MC/MCAsmInfo.h"
 #include "llvm/MC/MCAssembler.h"
 #include "llvm/MC/MCContext.h"
 #include "llvm/MC/MCELFObjectWriter.h"
 #include "llvm/MC/MCExpr.h"
 #include "llvm/MC/MCMachObjectWriter.h"
+#include "llvm/MC/MCFixup.h"
 #include "llvm/MC/MCObjectWriter.h"
+#include "llvm/MC/MCSection.h"
 #include "llvm/MC/MCSymbol.h"
 #include "llvm/MC/MCValue.h"
 #include "llvm/Support/CommandLine.h"
+#include "llvm/Support/Debug.h"
 #include "llvm/Support/EndianStream.h"
 #include "llvm/Support/ErrorHandling.h"
+#include "llvm/Support/Format.h"
 #include "llvm/Support/LEB128.h"
 #include "llvm/Support/raw_ostream.h"
 
 using namespace llvm;
+
+#define DEBUG_TYPE "riscv-asmbackend"
 
 // Temporary workaround for old linkers that do not support ULEB128 relocations,
 // which are abused by DWARF v5 DW_LLE_offset_pair/DW_RLE_offset_pair
@@ -38,7 +47,7 @@ static cl::opt<bool>
              cl::desc("When generating R_RISCV_ALIGN, insert $alignment-2 "
                       "bytes of NOPs even in norvc code"));
 
-// Define a option to control the spacing betweenRISC-V branch instructions.
+// Define a option to control the spacing between RISC-V branch instructions.
 static cl::opt<unsigned> RISCVBranchSpacing(
   "riscv-branch-spacing", cl::init(0),
   cl::desc(
@@ -995,7 +1004,7 @@ MCAsmBackend *llvm::createRISCVAsmBackend(const Target &T,
 }
 
 void RISCVAsmBackend::BranchSpacing() {
-  if(RISCVBranchSpacing.getNumOccurrences()) {
+  if (RISCVBranchSpacing.getNumOccurrences()) {
     BranchSpacingValue = RISCVBranchSpacing;
   }
   return;
@@ -1018,13 +1027,536 @@ bool RISCVAsmBackend::needBranchSpacing(const MCInst &Inst) const {
   }
 }
 
-void RISCVAsmBackend::emitInstructionBegin(MCObjectStreamer &S,
+bool RISCVAsmBackend::isNop(const MCInst &Inst) {
+  unsigned Opcode = Inst.getOpcode();
+  if (Opcode == RISCV::C_NOP)
+    return true;
+  if (Opcode == RISCV::ADDI && Inst.getNumOperands() >= 3 &&
+      Inst.getOperand(0).isReg() && Inst.getOperand(0).getReg() == RISCV::X0 &&
+      Inst.getOperand(1).isReg() && Inst.getOperand(1).getReg() == RISCV::X0 &&
+      Inst.getOperand(2).isImm() && Inst.getOperand(2).getImm() == 0)
+    return true;
+  return false;
+}
+
+/// Return true if this is a branch that never returns to the next instruction
+/// (j/ret/jr rd=x0). NOPs after such instructions are off the execution path.
+static bool isNoReturnJump(const MCInst &Inst) {
+  unsigned Opcode = Inst.getOpcode();
+  switch (Opcode) {
+  case RISCV::C_J:
+  case RISCV::C_JR:
+    return true;
+  case RISCV::JAL:
+  case RISCV::JALR:
+    return Inst.getOperand(0).getReg() == RISCV::X0;
+  case RISCV::C_JAL:
+  case RISCV::C_JALR:
+    return false;
+  default:
+    return false;
+  }
+}
+
+/// Return true if this is a branch that may have the next instruction executed
+/// (cond branch fall-through, or call return). NOPs after such instructions
+/// are on the execution path.
+static bool isOnExecPathJump(const MCInst &Inst) {
+  unsigned Opcode = Inst.getOpcode();
+  switch (Opcode) {
+  case RISCV::BEQ:
+  case RISCV::BNE:
+  case RISCV::BLT:
+  case RISCV::BGE:
+  case RISCV::BLTU:
+  case RISCV::BGEU:
+  case RISCV::C_BEQZ:
+  case RISCV::C_BNEZ:
+    return true;
+  case RISCV::JAL:
+  case RISCV::JALR:
+    return Inst.getOperand(0).getReg() != RISCV::X0;
+  case RISCV::C_JAL:
+  case RISCV::C_JALR:
+    return true;
+  default:
+    return false;
+  }
+}
+
+// JALR opcode (bits [6:0])
+static constexpr uint8_t OPC_JALR = 0b1100111;
+
+// Scan fragment bytes for JALR, C.JR, C.JALR (RET/indirect jump - no fixup).
+// Append branch offsets to Out. Little-endian.
+static void collectJalrBranchesFromBytes(const MCFragment &Frag,
+                                         uint64_t FragOffset,
+                                         SmallVectorImpl<uint64_t> &Out) {
+  uint64_t Offset = FragOffset;
+  for (ArrayRef<char> Contents : {Frag.getContents(), Frag.getVarContents()}) {
+    const uint8_t *Bytes = reinterpret_cast<const uint8_t *>(Contents.data());
+    size_t Size = Contents.size();
+    size_t pos = 0;
+    while (pos + 2 <= Size) {
+      uint8_t b0 = Bytes[pos];
+      uint8_t b1 = pos + 1 < Size ? Bytes[pos + 1] : 0;
+      if ((b0 & 3) == 3) {
+        // 32-bit instruction
+        if ((b0 & 0x7F) == OPC_JALR) {
+          Out.push_back(Offset + pos);
+        }
+        pos += 4;
+      } else {
+        // 16-bit instruction
+        if ((b0 & 3) == 2 && ((b0 >> 2) & 0x1F) == 0) {
+          unsigned funct4 = (b1 >> 4) & 0xF;
+          unsigned rs1 = ((b1 & 0xF) << 1) | (b0 >> 7);
+          if (rs1 != 0 && (funct4 == 8 || funct4 == 9)) {
+            // C.JR (funct4=8) or C.JALR (funct4=9), exclude C.MV/C.ADD/C.EBREAK
+            Out.push_back(Offset + pos);
+          }
+        }
+        pos += 2;
+      }
+    }
+    Offset += Size;
+  }
+}
+
+unsigned RISCVAsmBackend::getNopSize(const MCInst &Inst,
+                                     const MCSubtargetInfo &STI) {
+  return Inst.getOpcode() == RISCV::C_NOP ? 2 : 4;
+}
+
+bool RISCVAsmBackend::emitInstructionBegin(MCObjectStreamer &S,
     const MCInst &Inst, const MCSubtargetInfo &STI) {
+  if (EnableRISCVBTBFetchLineBranchRelaxation) {
+    if (isNop(Inst)) {
+      MCFragment *CurFrag = S.getCurrentFragment();
+      // newSpecialFragment adds an empty fragment after MCNopsAfterBranchFragment,
+      // so CurFrag is never the NAF. Check if the previous fragment is a NAF we
+      // can merge into.
+      MCFragment *PrevFrag = nullptr;
+      for (MCFragment &F : *S.getCurrentSectionOnly()) {
+        if (F.getNext() == CurFrag) {
+          PrevFrag = &F;
+          break;
+        }
+      }
+      if (PrevFrag) {
+        if (auto *NAF = dyn_cast<MCNopsAfterBranchFragment>(PrevFrag)) {
+          NopsAfterBranchKind Kind = LastInstWasNoReturnJump
+              ? NopsAfterBranchKind::OffExecPath
+              : NopsAfterBranchKind::OnExecPath;
+          if (NAF->getInsertKind() == Kind) {
+            NAF->setNumBytes(NAF->getNumBytes() + getNopSize(Inst, STI));
+            return true;
+          }
+        }
+      }
+      if (LastInstWasNoReturnJump || LastInstWasOnExecPathBranch) {
+        NopsAfterBranchKind Kind = LastInstWasNoReturnJump
+            ? NopsAfterBranchKind::OffExecPath
+            : NopsAfterBranchKind::OnExecPath;
+        S.newSpecialFragment<MCNopsAfterBranchFragment>(
+            getNopSize(Inst, STI), Kind, STI);
+        return true;
+      }
+    }
+    LastInstWasNoReturnJump = isNoReturnJump(Inst);
+    LastInstWasOnExecPathBranch = isOnExecPathJump(Inst);
+  }
+
   if (BranchSpacingValue != 0 && needBranchSpacing(Inst)) {
     PendingBA = S.newSpecialFragment<MCBranchSpacingFragment>(STI);
     PendingBA->setSpacing(BranchSpacingValue);
     if (LastBA)
       PendingBA->setLastBA(LastBA);
     LastBA = PendingBA;
+  }
+  return false;
+}
+
+void RISCVAsmBackend::resetNopsAfterBranchState() {
+  LastInstWasNoReturnJump = false;
+  LastInstWasOnExecPathBranch = false;
+}
+
+void RISCVAsmBackend::performPostLayout(const MCAssembler &Asm) const {
+  verifyBTBFetchLineBranchLimits(Asm);
+}
+
+// Shrink NOPs after branch in a single section to satisfy BTB fetch-line limit.
+// Returns true if any fragment was modified.
+bool RISCVAsmBackend::shrinkSection(MCAssembler &Asm, MCSection &Sec,
+                                   uint64_t &RestartWinBase) {
+  LLVM_DEBUG(dbgs() << "shrinkSection: section " << Sec.getName()
+                    << " RestartWinBase=" << format_hex(RestartWinBase, 8)
+                    << "\n");
+
+  if (!EnableRISCVBTBFetchLineBranchRelaxation || BTBFetchLineSize == 0 ||
+      BTBMaxBranchesPerFetchLine == 0) {
+    LLVM_DEBUG(dbgs() << "  early return (disabled or N=0)\n");
+    return false;
+  }
+
+  const unsigned N = BTBMaxBranchesPerFetchLine;
+  const unsigned FetchLineSize = BTBFetchLineSize;
+  bool Changed = false;
+
+  uint64_t SectionSize = Asm.getSectionAddressSize(Sec);
+  if (RestartWinBase >= SectionSize)
+    RestartWinBase = 0;
+
+  // Collect align regions (start of padding, end) to determine segments and
+  // skip NOP regions. FT_Align can contain instructions in FixedSize before the
+  // padding; AlignStartOffsets stores the offset of the first NOP (padding).
+  // AlignEndOffsets[i] = end (upper boundary) of align region i.
+  // AlignStartOffsets[i] = start of padding (first NOP) in align region i.
+  SmallVector<uint64_t, 16> AlignStartOffsets, AlignEndOffsets;
+  for (MCFragment &F : Sec) {
+    if (F.getKind() == MCFragment::FT_Align) {
+      uint64_t FragOffset = Asm.getFragmentOffset(F);
+      uint64_t FragEnd = FragOffset + Asm.computeFragmentSize(F);
+      AlignStartOffsets.push_back(FragOffset + F.getFixedSize());
+      AlignEndOffsets.push_back(FragEnd);
+    }
+  }
+
+  // Find segment and WinBase for RestartWinBase
+  size_t AlignIdx = 0;
+  uint64_t SegmentStart = 0;
+  while (AlignIdx < AlignEndOffsets.size() &&
+         AlignEndOffsets[AlignIdx] <= RestartWinBase) {
+    SegmentStart = AlignEndOffsets[AlignIdx];
+    ++AlignIdx;
+  }
+
+  // RestartWinBase is the previous window's winbase where we made a change.
+  uint64_t WinBase = RestartWinBase;
+  // If WinBase fell inside an align padding region (e.g. on a NOP), skip to its end.
+  if (AlignIdx < AlignStartOffsets.size() &&
+      WinBase >= AlignStartOffsets[AlignIdx] &&
+      WinBase < AlignEndOffsets[AlignIdx]) {
+    WinBase = AlignEndOffsets[AlignIdx];
+  }
+
+  // Collect BranchOffsets (from segment start), NopsOnExecPath, NopsOffExecPath
+  // (from WinBase) for the region we will iterate. Include fixup-based branches
+  // and JALR/C.JR/C.JALR from opcode scan (RET, indirect jump - no fixup).
+  SmallVector<uint64_t, 64> BranchOffsets;
+  SmallVector<std::pair<uint64_t, MCNopsAfterBranchFragment *>, 32>
+      NopsOnExecPath, NopsOffExecPath;
+  for (MCFragment &F : Sec) {
+    uint64_t FragOffset = Asm.getFragmentOffset(F);
+    for (const MCFixup &Fixup : F.getFixups()) {
+      MCFixupKind Kind = Fixup.getKind();
+      if (Kind == RISCV::fixup_riscv_jal ||
+          Kind == RISCV::fixup_riscv_branch ||
+          Kind == RISCV::fixup_riscv_rvc_jump ||
+          Kind == RISCV::fixup_riscv_rvc_branch) {
+        uint64_t Off = FragOffset + Fixup.getOffset();
+        if (Off >= SegmentStart)
+          BranchOffsets.push_back(Off);
+      } else if (Kind == RISCV::fixup_riscv_call ||
+                 Kind == RISCV::fixup_riscv_call_plt) {
+        uint64_t Off = FragOffset + Fixup.getOffset() + 4;
+        if (Off >= SegmentStart)
+          BranchOffsets.push_back(Off);
+      }
+    }
+    for (const MCFixup &Fixup : F.getVarFixups()) {
+      MCFixupKind Kind = Fixup.getKind();
+      if (Kind == RISCV::fixup_riscv_jal ||
+          Kind == RISCV::fixup_riscv_branch ||
+          Kind == RISCV::fixup_riscv_rvc_jump ||
+          Kind == RISCV::fixup_riscv_rvc_branch) {
+        uint64_t Off = FragOffset + Fixup.getOffset();
+        if (Off >= SegmentStart)
+          BranchOffsets.push_back(Off);
+      } else if (Kind == RISCV::fixup_riscv_call ||
+                 Kind == RISCV::fixup_riscv_call_plt) {
+        uint64_t Off = FragOffset + Fixup.getOffset() + 4;
+        if (Off >= SegmentStart)
+          BranchOffsets.push_back(Off);
+      }
+    }
+    // FT_Align can contain instructions: emitValueToAlignment converts the
+    // current fragment to Align, so preceding instructions (e.g. ret) end up
+    // in the Align fragment's FixedSize part.
+    if (F.getKind() == MCFragment::FT_Data ||
+        F.getKind() == MCFragment::FT_Relaxable ||
+        (F.getKind() == MCFragment::FT_Align && F.getFixedSize() > 0)) {
+      collectJalrBranchesFromBytes(F, FragOffset, BranchOffsets);
+
+    }
+    if (auto *NAF = dyn_cast<MCNopsAfterBranchFragment>(&F)) {
+      if (NAF->getNumBytes() != 0 &&
+          FragOffset + NAF->getNumBytes() > SegmentStart) {
+        LLVM_DEBUG(dbgs() << "  NAF at " << format_hex(FragOffset, 8)
+                          << " size=" << NAF->getNumBytes()
+                          << " kind=" << (NAF->getInsertKind() == NopsAfterBranchKind::OnExecPath
+                                              ? "OnExecPath"
+                                              : "OffExecPath")
+                          << "\n");
+        if (NAF->getInsertKind() == NopsAfterBranchKind::OnExecPath)
+          NopsOnExecPath.push_back({FragOffset, NAF});
+        else
+          NopsOffExecPath.push_back({FragOffset, NAF});
+      }
+    }
+  }
+  llvm::sort(BranchOffsets);
+  BranchOffsets.erase(std::unique(BranchOffsets.begin(), BranchOffsets.end()),
+                      BranchOffsets.end());
+
+  LLVM_DEBUG(dbgs() << "  collected: branches=" << BranchOffsets.size()
+                    << " nopsOnExecPath=" << NopsOnExecPath.size()
+                    << " nopsOffExecPath=" << NopsOffExecPath.size()
+                    << " segmentStart=" << format_hex(SegmentStart, 8)
+                    << " winBase=" << format_hex(WinBase, 8) << "\n");
+
+  size_t BranchIdx = 0, NopOnExecPathIdx = 0, NopOffExecPathIdx = 0;
+  while (BranchIdx < BranchOffsets.size() &&
+         BranchOffsets[BranchIdx] < WinBase)
+    ++BranchIdx;
+
+  while (WinBase < SectionSize) {
+    // SegmentEnd = end of current code segment (start of align padding).
+    // AlignEnd = end of align region (start of next code segment).
+    uint64_t SegmentEnd =
+        AlignIdx < AlignStartOffsets.size() ? AlignStartOffsets[AlignIdx]
+                                              : SectionSize;
+    uint64_t AlignEnd =
+        AlignIdx < AlignEndOffsets.size() ? AlignEndOffsets[AlignIdx]
+                                            : SectionSize;
+
+    for (uint64_t w = WinBase; w < SegmentEnd; w += FetchLineSize) {
+      uint64_t WinEnd = w + FetchLineSize;
+
+      LLVM_DEBUG(dbgs() << "  window [" << format_hex(w, 8) << ", "
+                        << format_hex(WinEnd, 8) << ") segmentEnd="
+                        << format_hex(SegmentEnd, 8) << " alignEnd="
+                        << format_hex(AlignEnd, 8) << "\n");
+
+      // Print branches within this window
+      for (size_t i = BranchIdx; i < BranchOffsets.size(); ++i) {
+        uint64_t Off = BranchOffsets[i];
+        if (Off >= WinEnd)
+          break;
+        if (Off >= w)
+          LLVM_DEBUG(dbgs() << "    branch @ " << format_hex(Off, 8) << "\n");
+      }
+
+      // Count branches from BranchIdx with offset < SegmentEnd
+      size_t Count = 0;
+      size_t CriticalIdx = BranchOffsets.size();
+      for (size_t i = BranchIdx;
+           i < BranchOffsets.size() &&
+           BranchOffsets[i] < SegmentEnd;
+           ++i) {
+        ++Count;
+        if (Count == N + 1) {
+          CriticalIdx = i;
+          break;
+        }
+      }
+
+      uint64_t BCritical =
+          CriticalIdx < BranchOffsets.size()
+              ? BranchOffsets[CriticalIdx]
+              : UINT64_MAX; // No critical branch
+
+      LLVM_DEBUG({
+        dbgs() << "    BCritical=";
+        if (BCritical != UINT64_MAX)
+          dbgs() << format_hex(BCritical, 8);
+        else
+          dbgs() << "none";
+        dbgs() << " Count=" << Count << "\n";
+      });
+
+      auto tryShrink = [&](SmallVectorImpl<std::pair<uint64_t,
+                             MCNopsAfterBranchFragment *>> &NopsList,
+                          size_t &NopIdx) -> bool {
+        for (; NopIdx < NopsList.size(); ++NopIdx) {
+          auto [FragOff, Frag] = NopsList[NopIdx];
+          if (FragOff > SegmentEnd)
+            break;
+          if (BCritical != UINT64_MAX && FragOff > BCritical)
+            break;
+          if (FragOff < WinBase)
+            continue;
+          // Only shrink NOPs at least partially within the window [w, WinEnd).
+          if (FragOff >= WinEnd)
+            break;
+
+          int64_t max_removal = Frag->getNumBytes();
+          if (BCritical != UINT64_MAX) {
+            if (BCritical < WinEnd)
+              continue;
+            int64_t limit = BCritical - WinEnd;
+            max_removal = std::min(max_removal, limit);
+          }
+          int64_t removal = (max_removal / 2) * 2;
+          if (removal <= 0)
+            continue;
+
+          LLVM_DEBUG(dbgs() << "    shrink: FragOff=" << format_hex(FragOff, 8)
+                            << " oldBytes=" << Frag->getNumBytes()
+                            << " removal=" << removal << "\n");
+          if (removal >= Frag->getNumBytes())
+            Frag->setNumBytes(0);
+          else
+            Frag->setNumBytes(Frag->getNumBytes() - removal);
+          return true;
+        }
+        return false;
+      };
+
+      if (tryShrink(NopsOnExecPath, NopOnExecPathIdx) ||
+          tryShrink(NopsOffExecPath, NopOffExecPathIdx)) {
+        LLVM_DEBUG(dbgs() << "    made change, break to re-layout\n");
+        RestartWinBase = w;
+        Changed = true;
+        break;
+      }
+
+      // Advance queue indices
+      while (BranchIdx < BranchOffsets.size() &&
+             BranchOffsets[BranchIdx] < WinEnd)
+        ++BranchIdx;
+      while (NopOnExecPathIdx < NopsOnExecPath.size()) {
+        auto [Off, Frag] = NopsOnExecPath[NopOnExecPathIdx];
+        uint64_t End = Off + Frag->getNumBytes();
+        if (Off >= w && End <= WinEnd)
+          ++NopOnExecPathIdx;
+        else
+          break;
+      }
+      while (NopOffExecPathIdx < NopsOffExecPath.size()) {
+        auto [Off, Frag] = NopsOffExecPath[NopOffExecPathIdx];
+        uint64_t End = Off + Frag->getNumBytes();
+        if (Off >= w && End <= WinEnd)
+          ++NopOffExecPathIdx;
+        else
+          break;
+      }
+    }
+    if (Changed)
+      break;
+    ++AlignIdx;
+    WinBase = AlignEnd;
+  }
+
+  // Remove empty NOP fragments
+  SmallVector<MCNopsAfterBranchFragment *, 8> ToRemove;
+  for (MCFragment &F : Sec) {
+    auto *NAF = dyn_cast<MCNopsAfterBranchFragment>(&F);
+    if (NAF && NAF->getNumBytes() == 0)
+      ToRemove.push_back(NAF);
+  }
+  LLVM_DEBUG(dbgs() << "  remove " << ToRemove.size()
+                    << " empty NOP fragment(s)\n");
+  for (MCNopsAfterBranchFragment *NAF : ToRemove)
+    Sec.removeFragment(*NAF);
+  if (!ToRemove.empty())
+    Changed = true;
+
+  LLVM_DEBUG(dbgs() << "  shrinkSection returns "
+                    << (Changed ? "true" : "false") << "\n");
+  return Changed;
+}
+
+void RISCVAsmBackend::verifyBTBFetchLineBranchLimits(
+    const MCAssembler &Asm) const {
+  if (!EnableRISCVBTBFetchLineBranchRelaxation || BTBFetchLineSize == 0 ||
+      BTBMaxBranchesPerFetchLine == 0)
+    return;
+
+  for (const MCSection &Sec : Asm) {
+    if (!Sec.isText())
+      continue;
+
+    SmallVector<uint64_t, 64> BranchOffsets;
+    SmallVector<uint64_t, 16> AlignEndOffsets;
+    for (const MCFragment &F : Sec) {
+      uint64_t FragOffset = Asm.getFragmentOffset(F);
+      for (const MCFixup &Fixup : F.getFixups()) {
+        MCFixupKind Kind = Fixup.getKind();
+        if (Kind == RISCV::fixup_riscv_jal ||
+            Kind == RISCV::fixup_riscv_branch ||
+            Kind == RISCV::fixup_riscv_rvc_jump ||
+            Kind == RISCV::fixup_riscv_rvc_branch)
+          BranchOffsets.push_back(FragOffset + Fixup.getOffset());
+        else if (Kind == RISCV::fixup_riscv_call ||
+                 Kind == RISCV::fixup_riscv_call_plt)
+          BranchOffsets.push_back(FragOffset + Fixup.getOffset() + 4);
+      }
+      for (const MCFixup &Fixup : F.getVarFixups()) {
+        MCFixupKind Kind = Fixup.getKind();
+        if (Kind == RISCV::fixup_riscv_jal ||
+            Kind == RISCV::fixup_riscv_branch ||
+            Kind == RISCV::fixup_riscv_rvc_jump ||
+            Kind == RISCV::fixup_riscv_rvc_branch)
+          BranchOffsets.push_back(FragOffset + Fixup.getOffset());
+        else if (Kind == RISCV::fixup_riscv_call ||
+                 Kind == RISCV::fixup_riscv_call_plt)
+          BranchOffsets.push_back(FragOffset + Fixup.getOffset() + 4);
+      }
+      // FT_Align can contain instructions in FixedSize (PR #149030).
+      if (F.getKind() == MCFragment::FT_Data ||
+          F.getKind() == MCFragment::FT_Relaxable ||
+          (F.getKind() == MCFragment::FT_Align && F.getFixedSize() > 0))
+        collectJalrBranchesFromBytes(F, FragOffset, BranchOffsets);
+      if (F.getKind() == MCFragment::FT_Align)
+        AlignEndOffsets.push_back(FragOffset + Asm.computeFragmentSize(F));
+    }
+    llvm::sort(BranchOffsets);
+    BranchOffsets.erase(std::unique(BranchOffsets.begin(), BranchOffsets.end()),
+                        BranchOffsets.end());
+
+    if (BranchOffsets.empty())
+      continue;
+
+    uint64_t SectionSize = Asm.getSectionAddressSize(Sec);
+    auto ItLow = BranchOffsets.begin();
+    size_t AlignIdx = 0;
+    uint64_t WinBase = 0;
+
+    // Segment by align region end boundaries, same as shrinkSection.
+    while (WinBase < SectionSize) {
+      uint64_t NextAlignEnd =
+          AlignIdx < AlignEndOffsets.size() ? AlignEndOffsets[AlignIdx]
+                                            : SectionSize;
+
+      for (uint64_t w = WinBase; w < NextAlignEnd; w += BTBFetchLineSize) {
+        uint64_t WinEnd = w + BTBFetchLineSize;
+        auto ItHigh = llvm::lower_bound(
+            llvm::make_range(ItLow, BranchOffsets.end()), WinEnd);
+        unsigned Count = ItHigh - ItLow;
+        if (Count > BTBMaxBranchesPerFetchLine) {
+          SmallString<512> Buf;
+          raw_svector_ostream OS(Buf);
+          OS << "BTB fetch-line limit violated in section '" << Sec.getName()
+             << "': [0x";
+          OS.write_hex(w);
+          OS << ", 0x";
+          OS.write_hex(WinEnd);
+          OS << ") has " << Count << " branches (max "
+             << BTBMaxBranchesPerFetchLine << "). Offsets: ";
+          for (auto I = ItLow; I != ItHigh; ++I) {
+            if (I != ItLow)
+              OS << ", ";
+            OS << "0x";
+            OS.write_hex(*I);
+          }
+          Asm.getContext().reportWarning(SMLoc(), Buf);
+        }
+        ItLow = ItHigh;
+      }
+      ++AlignIdx;
+      WinBase = NextAlignEnd;
+    }
   }
 }

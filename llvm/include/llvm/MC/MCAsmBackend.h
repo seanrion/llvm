@@ -12,6 +12,7 @@
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/MC/MCDirectives.h"
 #include "llvm/MC/MCFixup.h"
+#include "llvm/MC/MCSection.h"
 #include "llvm/Support/Compiler.h"
 #include "llvm/Support/Endian.h"
 #include <cstdint>
@@ -201,6 +202,18 @@ public:
   // Return true if fragment offsets have been adjusted and an extra layout
   // iteration is needed.
   virtual bool finishLayout() const { return false; }
+
+  /// Perform target-specific shrink of fragments in a single section (e.g. NOP
+  /// cleanup). Return true if any fragment was modified and layout should be
+  /// re-run.
+  virtual bool shrinkSection(MCAssembler &Asm, MCSection &Sec,
+                            uint64_t &RestartWinBase) {
+    return false;
+  }
+
+  /// Perform target-specific verification after final layout. Called once
+  /// layout is complete (e.g. to verify constraints using actual offsets).
+  virtual void performPostLayout(const MCAssembler &Asm) const {}
 
   /// Generate the compact unwind encoding for the CFI instructions.
   virtual uint64_t generateCompactUnwindEncoding(const MCDwarfFrameInfo *FI,

@@ -43,6 +43,9 @@ void initializeRISCVDeadRegisterDefinitionsPass(PassRegistry &);
 FunctionPass *createRISCVIndirectBranchTrackingPass();
 void initializeRISCVIndirectBranchTrackingPass(PassRegistry &);
 
+FunctionPass *createRISCVBTBFetchLineBranchRelaxationPass();
+void initializeRISCVBTBFetchLineBranchRelaxationPass(PassRegistry &);
+
 FunctionPass *createRISCVLandingPadSetupPass();
 void initializeRISCVLandingPadSetupPass(PassRegistry &);
 

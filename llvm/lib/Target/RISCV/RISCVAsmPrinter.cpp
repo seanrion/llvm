@@ -18,6 +18,7 @@
 #include "MCTargetDesc/RISCVMatInt.h"
 #include "MCTargetDesc/RISCVTargetStreamer.h"
 #include "RISCV.h"
+#include "llvm/Target/RISCV/RISCVBTBFetchLineBranchRelaxation.h"
 #include "RISCVConstantPoolValue.h"
 #include "RISCVMachineFunctionInfo.h"
 #include "RISCVRegisterInfo.h"
@@ -41,6 +42,7 @@
 #include "llvm/MC/TargetRegistry.h"
 #include "llvm/Support/Compiler.h"
 #include "llvm/Support/raw_ostream.h"
+#include "llvm/Support/RISCVAttributes.h"
 #include "llvm/TargetParser/RISCVISAInfo.h"
 #include "llvm/Transforms/Instrumentation/HWAddressSanitizer.h"
 
@@ -602,6 +604,8 @@ void RISCVAsmPrinter::emitAttributes(const MCSubtargetInfo &SubtargetInfo) {
   // attributes that differ from other functions in the module and we have no
   // way to know which function is correct.
   RTS.emitTargetAttributes(SubtargetInfo, /*EmitStackAlign*/ true);
+  if (EnableRISCVBTBFetchLineBranchRelaxation)
+    RTS.emitAttribute(RISCVAttrs::RIVAI_BTB_OPTIMIZED, 1);
 }
 
 void RISCVAsmPrinter::emitFunctionEntryLabel() {

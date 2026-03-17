@@ -16,6 +16,7 @@
 #include "RISCVMCTargetDesc.h"
 #include "llvm/BinaryFormat/ELF.h"
 #include "llvm/MC/MCAsmBackend.h"
+#include "llvm/Support/Casting.h"
 #include "llvm/MC/MCAssembler.h"
 #include "llvm/MC/MCCodeEmitter.h"
 #include "llvm/MC/MCContext.h"
@@ -162,13 +163,18 @@ void RISCVELFStreamer::changeSection(MCSection *Section, uint32_t Subsection) {
   LastMappingSymbols[getPreviousSection().first] = LastEMS;
   LastEMS = LastMappingSymbols.lookup(Section);
 
+  auto &Backend = static_cast<RISCVAsmBackend &>(this->getAssemblerPtr()->getBackend());
+  Backend.resetNopsAfterBranchState();
+
   MCELFStreamer::changeSection(Section, Subsection);
 }
 
 void RISCVELFStreamer::emitInstruction(const MCInst &Inst,
                                        const MCSubtargetInfo &STI) {
-  auto &Backend = static_cast<RISCVAsmBackend &> (this->getAssemblerPtr()->getBackend());
-  Backend.emitInstructionBegin(*this, Inst, STI);
+  auto &Backend = static_cast<RISCVAsmBackend &>(
+      this->getAssemblerPtr()->getBackend());
+  if (Backend.emitInstructionBegin(*this, Inst, STI))
+    return;
   emitInstructionsMappingSymbol();
   MCELFStreamer::emitInstruction(Inst, STI);
 }

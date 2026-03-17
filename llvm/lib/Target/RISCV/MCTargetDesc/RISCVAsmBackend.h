@@ -33,10 +33,17 @@ protected:
   unsigned BranchSpacingValue = 0;
   MCBranchSpacingFragment *LastBA = nullptr;
   MCBranchSpacingFragment *PendingBA = nullptr;
+
+  /// True if last instruction was a jump/ret (rd=x0) - NOPs after won't execute.
+  bool LastInstWasNoReturnJump = false;
+  /// True if last instruction was cond branch or call - NOPs after may execute.
+  bool LastInstWasOnExecPathBranch = false;
   // Temporary symbol used to check whether a PC-relative fixup is resolved.
   MCSymbol *PCRelTemp = nullptr;
 
   bool isPCRelFixupResolved(const MCSymbol *SymA, const MCFragment &F);
+
+  void verifyBTBFetchLineBranchLimits(const MCAssembler &Asm) const;
 
   StringMap<MCSymbol *> VendorSymbols;
 
@@ -80,12 +87,23 @@ public:
   bool writeNopData(raw_ostream &OS, uint64_t Count,
                     const MCSubtargetInfo *STI) const override;
 
+  void performPostLayout(const MCAssembler &Asm) const override;
+
+  bool shrinkSection(MCAssembler &Asm, MCSection &Sec,
+                     uint64_t &RestartWinBase) override;
+
   const MCTargetOptions &getTargetOptions() const { return TargetOptions; }
 
   bool needBranchSpacing(const MCInst &Inst)const;
   void BranchSpacing();
-  void emitInstructionBegin(MCObjectStreamer &S, const MCInst &Inst,
+  static bool isNop(const MCInst &Inst);
+  static unsigned getNopSize(const MCInst &Inst, const MCSubtargetInfo &STI);
+  /// Returns true if NOP was handled (created/extended MCNopsAfterBranchFragment).
+  bool emitInstructionBegin(MCObjectStreamer &S, const MCInst &Inst,
                             const MCSubtargetInfo &STI);
+
+  /// Reset NOP-after-branch tracking when section changes.
+  void resetNopsAfterBranchState();
 };
 }
 

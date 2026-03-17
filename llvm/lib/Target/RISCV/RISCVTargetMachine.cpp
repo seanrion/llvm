@@ -13,6 +13,7 @@
 #include "RISCVTargetMachine.h"
 #include "MCTargetDesc/RISCVBaseInfo.h"
 #include "RISCV.h"
+#include "llvm/Target/RISCV/RISCVBTBFetchLineBranchRelaxation.h"
 #include "RISCVMachineFunctionInfo.h"
 #include "RISCVMachineScheduler.h"
 #include "RISCVTargetObjectFile.h"
@@ -159,6 +160,7 @@ extern "C" LLVM_ABI LLVM_EXTERNAL_VISIBILITY void LLVMInitializeRISCVTarget() {
   initializeRISCVMoveMergePass(*PR);
   initializeRISCVPushPopOptPass(*PR);
   initializeRISCVIndirectBranchTrackingPass(*PR);
+  initializeRISCVBTBFetchLineBranchRelaxationPass(*PR);
   initializeRISCVLoadStoreOptPass(*PR);
   initializeRISCVPreAllocZilsdOptPass(*PR);
   initializeRISCVExpandAtomicPseudoPass(*PR);
@@ -624,6 +626,9 @@ void RISCVPassConfig::addPreEmitPass2() {
 
   if (EnableCFIInstrInserter)
     addPass(createCFIInstrInserter());
+
+  if (EnableRISCVBTBFetchLineBranchRelaxation)
+    addPass(createRISCVBTBFetchLineBranchRelaxationPass());
 }
 
 void RISCVPassConfig::addMachineSSAOptimization() {
