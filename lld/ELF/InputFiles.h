@@ -158,6 +158,10 @@ public:
   // [.got, .got + 0xFFFC].
   bool ppc64SmallCodeModelTocRelocs = false;
 
+  // True if the object was compiled with RISC-V BTB fetch-line branch
+  // optimization (Tag_rivai_btb_optimized). Used for relaxation-layout-preserve.
+  bool hasBtbOptimized = false;
+
 public:
   // If not empty, this stores the name of the archive containing this file.
   // We use this string for creating error messages.

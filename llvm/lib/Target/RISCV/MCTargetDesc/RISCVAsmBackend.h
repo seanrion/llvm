@@ -21,6 +21,7 @@
 namespace llvm {
 class MCAssembler;
 class MCObjectTargetWriter;
+class MCSection;
 class raw_ostream;
 
 class RISCVAsmBackend : public MCAsmBackend {
@@ -33,8 +34,20 @@ protected:
   unsigned BranchSpacingValue = 0;
   MCBranchSpacingFragment *LastBA = nullptr;
   MCBranchSpacingFragment *PendingBA = nullptr;
+
   // Temporary symbol used to check whether a PC-relative fixup is resolved.
   MCSymbol *PCRelTemp = nullptr;
+
+  /// Cached §4 post-pool sizes for this backend (F, N, M(STI) fixed at construction).
+  unsigned BTBOffPoolInitialBytes = 0;
+  unsigned BTBOnCallPoolInitialBytes = 0;
+  unsigned BTBOnCondPoolInitialBytes = 0;
+
+  unsigned getBTBPostPoolInitialBytes(NopsBesideBranchKind Kind,
+                                      bool LastWasConditional) const;
+
+  /// Initialize \p BTB*PoolInitialBytes from CLI (F, N) and \p STI (Zca → M).
+  void initBTBPostPoolInitialBytes();
 
   bool isPCRelFixupResolved(const MCSymbol *SymA, const MCFragment &F);
 
@@ -80,12 +93,22 @@ public:
   bool writeNopData(raw_ostream &OS, uint64_t Count,
                     const MCSubtargetInfo *STI) const override;
 
+  void performPostLayout(const MCAssembler &Asm) const override;
+
+  bool shrinkSection(MCAssembler &Asm, MCSection &Sec,
+                     uint64_t &RestartWinBase) override;
+
   const MCTargetOptions &getTargetOptions() const { return TargetOptions; }
 
   bool needBranchSpacing(const MCInst &Inst)const;
   void BranchSpacing();
   void emitInstructionBegin(MCObjectStreamer &S, const MCInst &Inst,
                             const MCSubtargetInfo &STI);
+  void emitInstructionEnd(MCObjectStreamer &S, const MCInst &Inst,
+                          const MCSubtargetInfo &STI);
+
+  void refreshNBFInsertKindsAfterRelax(const MCAssembler &Asm,
+                                     MCSection &Sec) override;
 };
 }
 
