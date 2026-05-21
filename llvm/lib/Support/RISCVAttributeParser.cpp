@@ -41,11 +41,23 @@ const RISCVAttributeParser::DisplayHandler
             RISCVAttrs::ATOMIC_ABI,
             &RISCVAttributeParser::atomicAbi,
         },
+        {
+            RISCVAttrs::RIVAI_BTB_OPTIMIZED,
+            &RISCVAttributeParser::rivaiBtbOptimized,
+        },
 };
 
 Error RISCVAttributeParser::atomicAbi(unsigned Tag) {
   uint64_t Value = de.getULEB128(cursor);
   printAttribute(Tag, Value, "Atomic ABI is " + utostr(Value));
+  return Error::success();
+}
+
+Error RISCVAttributeParser::rivaiBtbOptimized(unsigned Tag) {
+  uint64_t Value = de.getULEB128(cursor);
+  printAttribute(Tag, Value,
+                 Value ? "BTB fetch-line branch optimization enabled"
+                       : "BTB fetch-line branch optimization disabled");
   return Error::success();
 }
 
