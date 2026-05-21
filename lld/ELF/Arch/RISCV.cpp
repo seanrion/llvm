@@ -76,6 +76,8 @@ public:
 #define INTERNAL_R_RISCV_GPREL_S 257
 #define INTERNAL_R_RISCV_X0REL_I 258
 #define INTERNAL_R_RISCV_X0REL_S 259
+#define INTERNAL_R_RISCV_NOP 260
+#define INTERNAL_R_RISCV_NOP_JAL 261
 
 const uint64_t dtpOffset = 0x800;
 
@@ -307,6 +309,7 @@ RelExpr RISCV::getRelExpr(const RelType type, const Symbol &s,
   case R_RISCV_SUB64:
     return RE_RISCV_ADD;
   case R_RISCV_JAL:
+  case INTERNAL_R_RISCV_NOP_JAL:
   case R_RISCV_BRANCH:
   case R_RISCV_PCREL_HI20:
   case R_RISCV_RVC_BRANCH:
@@ -341,6 +344,7 @@ RelExpr RISCV::getRelExpr(const RelType type, const Symbol &s,
     return R_RELAX_HINT;
   case R_RISCV_TPREL_ADD:
   case R_RISCV_RELAX:
+  case INTERNAL_R_RISCV_NOP:
     return ctx.arg.relax ? R_RELAX_HINT : R_NONE;
   case R_RISCV_SET_ULEB128:
   case R_RISCV_SUB_ULEB128:
@@ -404,6 +408,25 @@ void RISCV::relocate(uint8_t *loc, const Relocation &rel, uint64_t val) const {
   }
 
   case R_RISCV_JAL: {
+    checkInt(ctx, loc, val, 21, rel);
+    checkAlignment(ctx, loc, val, 2, rel);
+
+    uint32_t insn = read32le(loc) & 0xFFF;
+    uint32_t imm20 = extractBits(val, 20, 20) << 31;
+    uint32_t imm10_1 = extractBits(val, 10, 1) << 21;
+    uint32_t imm11 = extractBits(val, 11, 11) << 20;
+    uint32_t imm19_12 = extractBits(val, 19, 12) << 12;
+    insn |= imm20 | imm10_1 | imm11 | imm19_12;
+
+    write32le(loc, insn);
+    return;
+  }
+
+  case INTERNAL_R_RISCV_NOP_JAL: {
+    // NOP+jal layout: loc points to NOP, jal at loc+4. val was computed with
+    // PC at NOP, so use val-4 for jal's displacement.
+    loc += 4;
+    val -= 4;
     checkInt(ctx, loc, val, 21, rel);
     checkAlignment(ctx, loc, val, 2, rel);
 
@@ -767,23 +790,48 @@ static void relaxCall(Ctx &ctx, const InputSection &sec, size_t i, uint64_t loc,
   const uint32_t rd = extractBits(insnPair, 32 + 11, 32 + 7);
   const uint64_t dest =
       (r.expr == R_PLT_PC ? sym.getPltVA(ctx) : sym.getVA(ctx)) + r.addend;
+  const bool btbPreserve = sec.file && sec.file->hasBtbOptimized;
+  loc = btbPreserve ? loc + 4 : loc;
   const int64_t displace = dest - loc;
 
   // When the caller specifies the old value of `remove`, disallow its
   // increment.
   if (remove >= 6 && rvc && isInt<12>(displace) && rd == X_X0) {
-    sec.relaxAux->relocTypes[i] = R_RISCV_RVC_JUMP;
-    sec.relaxAux->writes.push_back(0xa001); // c.j
-    remove = 6;
+    if (btbPreserve) {
+      // Use NOP+jal (8 bytes) instead of NOP+c.j (6 bytes) to preserve layout.
+      sec.relaxAux->relocTypes[i] = INTERNAL_R_RISCV_NOP_JAL;
+      sec.relaxAux->writes.push_back(0x00000013); // nop (replaces auipc)
+      sec.relaxAux->writes.push_back(0x6f | X_X0 << 7); // jal x0, ... (j)
+      remove = 0;
+    } else {
+      sec.relaxAux->relocTypes[i] = R_RISCV_RVC_JUMP;
+      sec.relaxAux->writes.push_back(0xa001); // c.j
+      remove = 6;
+    }
   } else if (remove >= 6 && rvc && isInt<12>(displace) && rd == X_RA &&
              !ctx.arg.is64) { // RV32C only
-    sec.relaxAux->relocTypes[i] = R_RISCV_RVC_JUMP;
-    sec.relaxAux->writes.push_back(0x2001); // c.jal
-    remove = 6;
+    if (btbPreserve) {
+      // Use NOP+jal (8 bytes) instead of NOP+c.jal (6 bytes) to preserve layout.
+      sec.relaxAux->relocTypes[i] = INTERNAL_R_RISCV_NOP_JAL;
+      sec.relaxAux->writes.push_back(0x00000013); // nop (replaces auipc)
+      sec.relaxAux->writes.push_back(0x6f | X_RA << 7); // jal ra, ...
+      remove = 0;
+    } else {
+      sec.relaxAux->relocTypes[i] = R_RISCV_RVC_JUMP;
+      sec.relaxAux->writes.push_back(0x2001); // c.jal
+      remove = 6;
+    }
   } else if (remove >= 4 && isInt<21>(displace)) {
-    sec.relaxAux->relocTypes[i] = R_RISCV_JAL;
-    sec.relaxAux->writes.push_back(0x6f | rd << 7); // jal
-    remove = 4;
+    if (btbPreserve) {
+      sec.relaxAux->relocTypes[i] = INTERNAL_R_RISCV_NOP_JAL;
+      sec.relaxAux->writes.push_back(0x00000013); // nop (replaces auipc)
+      sec.relaxAux->writes.push_back(0x6f | rd << 7); // jal
+      remove = 0;
+    } else {
+      sec.relaxAux->relocTypes[i] = R_RISCV_JAL;
+      sec.relaxAux->writes.push_back(0x6f | rd << 7); // jal
+      remove = 4;
+    }
   } else {
     remove = 0;
   }
@@ -795,13 +843,20 @@ static void relaxTlsLe(Ctx &ctx, const InputSection &sec, size_t i,
   uint64_t val = r.sym->getVA(ctx, r.addend);
   if (hi20(val) != 0)
     return;
+  const bool btbPreserve = sec.file && sec.file->hasBtbOptimized;
   uint32_t insn = read32le(sec.content().data() + r.offset);
   switch (r.type) {
   case R_RISCV_TPREL_HI20:
   case R_RISCV_TPREL_ADD:
     // Remove lui rd, %tprel_hi(x) and add rd, rd, tp, %tprel_add(x).
-    sec.relaxAux->relocTypes[i] = R_RISCV_RELAX;
-    remove = 4;
+    if (btbPreserve) {
+      sec.relaxAux->relocTypes[i] = INTERNAL_R_RISCV_NOP;
+      sec.relaxAux->writes.push_back(0x00000013); // nop (replaces removed insn)
+      remove = 0;
+    } else {
+      sec.relaxAux->relocTypes[i] = R_RISCV_RELAX;
+      remove = 4;
+    }
     break;
   case R_RISCV_TPREL_LO12_I:
     // addi rd, rd, %tprel_lo(x) => addi rd, tp, st_value(x)
@@ -820,14 +875,21 @@ static void relaxTlsLe(Ctx &ctx, const InputSection &sec, size_t i,
 
 static void relaxHi20Lo12(Ctx &ctx, const InputSection &sec, size_t i,
                           uint64_t loc, Relocation &r, uint32_t &remove) {
+  const bool btbPreserve = sec.file && sec.file->hasBtbOptimized;
 
   // Fold into use of x0+offset
   if (isInt<12>(r.sym->getVA(ctx, r.addend))) {
     switch (r.type) {
     case R_RISCV_HI20:
       // Remove lui rd, %hi20(x).
-      sec.relaxAux->relocTypes[i] = R_RISCV_RELAX;
-      remove = 4;
+      if (btbPreserve) {
+        sec.relaxAux->relocTypes[i] = INTERNAL_R_RISCV_NOP;
+        sec.relaxAux->writes.push_back(0x00000013); // nop (replaces lui)
+        remove = 0;
+      } else {
+        sec.relaxAux->relocTypes[i] = R_RISCV_RELAX;
+        remove = 4;
+      }
       break;
     case R_RISCV_LO12_I:
       sec.relaxAux->relocTypes[i] = INTERNAL_R_RISCV_X0REL_I;
@@ -849,8 +911,14 @@ static void relaxHi20Lo12(Ctx &ctx, const InputSection &sec, size_t i,
   switch (r.type) {
   case R_RISCV_HI20:
     // Remove lui rd, %hi20(x).
-    sec.relaxAux->relocTypes[i] = R_RISCV_RELAX;
-    remove = 4;
+    if (btbPreserve) {
+      sec.relaxAux->relocTypes[i] = INTERNAL_R_RISCV_NOP;
+      sec.relaxAux->writes.push_back(0x00000013); // nop (replaces lui)
+      remove = 0;
+    } else {
+      sec.relaxAux->relocTypes[i] = R_RISCV_RELAX;
+      remove = 4;
+    }
     break;
   case R_RISCV_LO12_I:
     sec.relaxAux->relocTypes[i] = INTERNAL_R_RISCV_GPREL_I;
@@ -924,12 +992,26 @@ static bool relax(Ctx &ctx, int pass, InputSection &sec) {
       [[fallthrough]];
     case R_RISCV_TLSDESC_LOAD_LO12:
       // For TLSDESC=>LE/IE, AUIPC and L[DW] are removed if relaxable.
-      if (tlsdescRelax && r.expr != R_TLSDESC_PC)
-        remove = 4;
+      if (tlsdescRelax && r.expr != R_TLSDESC_PC) {
+        if (sec.file && sec.file->hasBtbOptimized) {
+          aux.relocTypes[i] = INTERNAL_R_RISCV_NOP;
+          aux.writes.push_back(0x00000013); // nop (replaces removed insn)
+          remove = 0;
+        } else {
+          remove = 4;
+        }
+      }
       break;
     case R_RISCV_TLSDESC_ADD_LO12:
-      if (toLeShortForm)
-        remove = 4;
+      if (toLeShortForm) {
+        if (sec.file && sec.file->hasBtbOptimized) {
+          aux.relocTypes[i] = INTERNAL_R_RISCV_NOP;
+          aux.writes.push_back(0x00000013); // nop (replaces removed insn)
+          remove = 0;
+        } else {
+          remove = 4;
+        }
+      }
       break;
     }
 
@@ -1129,9 +1211,12 @@ void RISCV::finalizeRelax(int passes) const {
 
         // Copy from last location to the current relocated location.
         const Relocation &r = rels[i];
-        uint64_t size = r.offset - offset;
-        memcpy(p, old.data() + offset, size);
-        p += size;
+        // Skip copy when r.offset <= offset (multiple relocs at same offset).
+        if (r.offset > offset) {
+          uint64_t size = r.offset - offset;
+          memcpy(p, old.data() + offset, size);
+          p += size;
+        }
 
         // For R_RISCV_ALIGN, we will place `offset` in a location (among NOPs)
         // to satisfy the alignment requirement. If both `remove` and r.addend
@@ -1159,6 +1244,16 @@ void RISCV::finalizeRelax(int passes) const {
             break;
           case R_RISCV_RELAX:
             // Used by relaxTlsLe to indicate the relocation is ignored.
+            break;
+          case INTERNAL_R_RISCV_NOP:
+            skip = 4;
+            write32le(p, aux.writes[writesIdx++]); // nop (BTB preserve)
+            aux.relocTypes[i] = R_RISCV_RELAX;    // for relocateAlloc
+            break;
+          case INTERNAL_R_RISCV_NOP_JAL:
+            skip = 8;
+            write32le(p, aux.writes[writesIdx++]);     // nop (replaces auipc)
+            write32le(p + 4, aux.writes[writesIdx++]); // jal
             break;
           case R_RISCV_RVC_JUMP:
             skip = 2;
@@ -1399,6 +1494,12 @@ mergeAttributesSection(Ctx &ctx,
                         static_cast<RISCVAtomicAbiTag>(*i));
         }
         continue;
+
+      case RISCVAttrs::RIVAI_BTB_OPTIMIZED:
+        if (auto i = parser.getAttributeValue(tag.attr))
+          if (*i)
+            sec->file->hasBtbOptimized = true;
+        continue; // Do not merge to output; used only for linker decisions.
       }
 
       // Fallback for deprecated priv_spec* and other unknown attributes: retain

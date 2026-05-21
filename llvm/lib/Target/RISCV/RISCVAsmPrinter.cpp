@@ -18,6 +18,7 @@
 #include "MCTargetDesc/RISCVMatInt.h"
 #include "MCTargetDesc/RISCVTargetStreamer.h"
 #include "RISCV.h"
+#include "llvm/Target/RISCV/RISCVBTBBranchRelaxation.h"
 #include "RISCVConstantPoolValue.h"
 #include "RISCVMachineFunctionInfo.h"
 #include "RISCVRegisterInfo.h"
@@ -39,10 +40,13 @@
 #include "llvm/MC/MCStreamer.h"
 #include "llvm/MC/MCSymbol.h"
 #include "llvm/MC/TargetRegistry.h"
+#include "llvm/Support/Alignment.h"
 #include "llvm/Support/Compiler.h"
 #include "llvm/Support/raw_ostream.h"
+#include "llvm/Support/RISCVAttributes.h"
 #include "llvm/TargetParser/RISCVISAInfo.h"
 #include "llvm/Transforms/Instrumentation/HWAddressSanitizer.h"
+#include <algorithm>
 
 using namespace llvm;
 
@@ -485,6 +489,15 @@ bool RISCVAsmPrinter::runOnMachineFunction(MachineFunction &MF) {
   bool EmittedOptionArch = emitDirectiveOptionArch();
 
   SetupMachineFunction(MF);
+
+  // BTB fetch-line: align function entry to at least F bytes (see
+  // BTBPassDesign.md §2.1 step 2). -riscv-fetchline-size is validated (>0,
+  // power of two) when set from the command line.
+  if (EnableRISCVBTBFetchLineBranchRelaxation && BTBFetchLineSize > 0) {
+    Align FetchLineAlign(BTBFetchLineSize);
+    MF.setAlignment(std::max(MF.getAlignment(), FetchLineAlign));
+  }
+
   emitFunctionBody();
 
   // Emit the XRay table
@@ -602,6 +615,8 @@ void RISCVAsmPrinter::emitAttributes(const MCSubtargetInfo &SubtargetInfo) {
   // attributes that differ from other functions in the module and we have no
   // way to know which function is correct.
   RTS.emitTargetAttributes(SubtargetInfo, /*EmitStackAlign*/ true);
+  if (EnableRISCVBTBFetchLineBranchRelaxation)
+    RTS.emitAttribute(RISCVAttrs::RIVAI_BTB_OPTIMIZED, 1);
 }
 
 void RISCVAsmPrinter::emitFunctionEntryLabel() {

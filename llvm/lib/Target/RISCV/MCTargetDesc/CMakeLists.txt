@@ -1,5 +1,6 @@
 add_llvm_component_library(LLVMRISCVDesc
   RISCVAsmBackend.cpp
+  RISCVBTBBranchRelaxation.cpp
   RISCVBaseInfo.cpp
   RISCVELFObjectWriter.cpp
   RISCVInstPrinter.cpp
