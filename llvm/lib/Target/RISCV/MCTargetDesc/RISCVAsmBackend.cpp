@@ -8,6 +8,7 @@
 
 #include "RISCVAsmBackend.h"
 #include "RISCVFixupKinds.h"
+#include "llvm/Target/RISCV/RISCVBTBBranchRelaxation.h"
 #include "llvm/ADT/APInt.h"
 #include "llvm/MC/MCAsmInfo.h"
 #include "llvm/MC/MCAssembler.h"
@@ -38,7 +39,7 @@ static cl::opt<bool>
              cl::desc("When generating R_RISCV_ALIGN, insert $alignment-2 "
                       "bytes of NOPs even in norvc code"));
 
-// Define a option to control the spacing betweenRISC-V branch instructions.
+// Define a option to control the spacing between RISC-V branch instructions.
 static cl::opt<unsigned> RISCVBranchSpacing(
   "riscv-branch-spacing", cl::init(0),
   cl::desc(
@@ -54,6 +55,7 @@ RISCVAsmBackend::RISCVAsmBackend(const MCSubtargetInfo &STI, uint8_t OSABI,
       STI(STI), OSABI(OSABI), Is64Bit(Is64Bit), TargetOptions(Options) {
   RISCVFeatures::validate(STI.getTargetTriple(), STI.getFeatureBits());
   BranchSpacing();
+  initBTBPostPoolInitialBytes();
 }
 
 std::optional<MCFixupKind> RISCVAsmBackend::getFixupKind(StringRef Name) const {
@@ -1001,10 +1003,56 @@ MCAsmBackend *llvm::createRISCVAsmBackend(const Target &T,
 }
 
 void RISCVAsmBackend::BranchSpacing() {
-  if(RISCVBranchSpacing.getNumOccurrences()) {
+  if (RISCVBranchSpacing.getNumOccurrences()) {
     BranchSpacingValue = RISCVBranchSpacing;
   }
-  return;
+}
+
+void RISCVAsmBackend::initBTBPostPoolInitialBytes() {
+  BTBOffPoolInitialBytes = 0;
+  BTBOnCallPoolInitialBytes = 0;
+  BTBOnCondPoolInitialBytes = 0;
+
+  const unsigned F = BTBFetchLineSize;
+  const unsigned N = BTBMaxBranchesPerFetchLine;
+  if (!EnableRISCVBTBFetchLineBranchRelaxation || F == 0 || N == 0)
+    return;
+
+  // I_min is the smallest branch encoding (2 with Zca, else 4); M matches I_min.
+  //
+  // OnExecPath (call / fall-through):
+  //   OnBase = F - N * I_min
+  //   BTBOnCallPoolInitialBytes = OnBase <= 0 ? 0 : max(OnBase, M)
+  //   BTBOnCondPoolInitialBytes   = max(BTBOnCallPoolInitialBytes, F)
+  //
+  // OffExecPath (N == 1): BTBOffPoolInitialBytes = F
+  // OffExecPath (N >= 2):
+  //   OffRaw = (F - I_min) / (N - 1) - I_min   // integer division
+  //   BTBOffPoolInitialBytes = OffRaw <= 0 ? 0 : max(OffRaw, M)
+  const unsigned I_min = STI.hasFeature(RISCV::FeatureStdExtZca) ? 2u : 4u;
+  const unsigned M = I_min;
+
+  const int64_t OnRaw = static_cast<int64_t>(F) -
+                        static_cast<int64_t>(N) * static_cast<int64_t>(I_min);
+  if (OnRaw <= 0) {
+    BTBOnCallPoolInitialBytes = 0;
+    BTBOnCondPoolInitialBytes = 0;
+  } else {
+    const unsigned OnBase = static_cast<unsigned>(OnRaw);
+    BTBOnCallPoolInitialBytes = std::max(OnBase, M);
+    BTBOnCondPoolInitialBytes = std::max(BTBOnCallPoolInitialBytes, F);
+  }
+
+  if (N <= 1) {
+    BTBOffPoolInitialBytes = F;
+    return;
+  }
+
+  const int64_t OffRaw = (static_cast<int64_t>(F) - static_cast<int64_t>(I_min)) /
+                             static_cast<int64_t>(N - 1) -
+                         static_cast<int64_t>(I_min);
+  BTBOffPoolInitialBytes = OffRaw <= 0 ? 0u
+                                         : std::max(static_cast<unsigned>(OffRaw), M);
 }
 
 bool RISCVAsmBackend::needBranchSpacing(const MCInst &Inst) const {
@@ -1016,6 +1064,8 @@ bool RISCVAsmBackend::needBranchSpacing(const MCInst &Inst) const {
     case RISCV::BGE:
     case RISCV::BLTU:
     case RISCV::BGEU:
+    case RISCV::BEQI:
+    case RISCV::BNEI:
     case RISCV::C_BEQZ:
     case RISCV::C_BNEZ:
       return true;
@@ -1024,8 +1074,23 @@ bool RISCVAsmBackend::needBranchSpacing(const MCInst &Inst) const {
   }
 }
 
+void RISCVAsmBackend::refreshNBFInsertKindsAfterRelax(const MCAssembler &Asm,
+                                                    MCSection &Sec) {
+  (void)Asm;
+  RISCVBTB::refreshNBFInsertKindsAfterRelax(Sec);
+}
+
+unsigned RISCVAsmBackend::getBTBPostPoolInitialBytes(
+    NopsBesideBranchKind Kind, bool LastWasConditional) const {
+  if (Kind == NopsBesideBranchKind::OffExecPath)
+    return BTBOffPoolInitialBytes;
+  return LastWasConditional ? BTBOnCondPoolInitialBytes
+                            : BTBOnCallPoolInitialBytes;
+}
+
 void RISCVAsmBackend::emitInstructionBegin(MCObjectStreamer &S,
-    const MCInst &Inst, const MCSubtargetInfo &STI) {
+                                           const MCInst &Inst,
+                                           const MCSubtargetInfo &STI) {
   if (BranchSpacingValue != 0 && needBranchSpacing(Inst)) {
     PendingBA = S.newSpecialFragment<MCBranchSpacingFragment>(STI);
     PendingBA->setSpacing(BranchSpacingValue);
@@ -1033,4 +1098,32 @@ void RISCVAsmBackend::emitInstructionBegin(MCObjectStreamer &S,
       PendingBA->setLastBA(LastBA);
     LastBA = PendingBA;
   }
+}
+
+void RISCVAsmBackend::emitInstructionEnd(MCObjectStreamer &S,
+                                         const MCInst &Inst,
+                                         const MCSubtargetInfo &STI) {
+  if (!EnableRISCVBTBFetchLineBranchRelaxation)
+    return;
+
+  const bool Off = RISCVBTB::isOffExecPathJump(Inst);
+  const bool On = RISCVBTB::isOnExecPathJump(Inst);
+  if (!Off && !On)
+    return;
+
+  const NopsBesideBranchKind PoolKind = Off ? NopsBesideBranchKind::OffExecPath
+                                            : NopsBesideBranchKind::OnExecPath;
+  const unsigned Initial =
+      getBTBPostPoolInitialBytes(PoolKind, RISCVBTB::isConditionalBranch(Inst));
+  if (Initial > 0)
+    S.newSpecialFragment<MCNopsBesideBranchFragment>(Initial, PoolKind, STI);
+}
+
+void RISCVAsmBackend::performPostLayout(const MCAssembler &Asm) const {
+  RISCVBTB::verifyBTBFetchLineBranchLimits(Asm);
+}
+
+bool RISCVAsmBackend::shrinkSection(MCAssembler &Asm, MCSection &Sec,
+                                   uint64_t &RestartWinBase) {
+  return RISCVBTB::shrinkSection(Asm, Sec, RestartWinBase);
 }

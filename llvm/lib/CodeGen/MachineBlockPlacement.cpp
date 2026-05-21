@@ -63,6 +63,7 @@
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Target/TargetMachine.h"
+#include "llvm/Target/RISCV/RISCVBTBBranchRelaxation.h"
 #include "llvm/Transforms/Utils/CodeLayout.h"
 #include <algorithm>
 #include <cassert>
@@ -3002,6 +3003,12 @@ void MachineBlockPlacement::alignBlocks() {
   // exclusively on the loop info here so that we can align backedges in
   // unnatural CFGs and backedges that were introduced purely because of the
   // loop rotations done during this layout pass.
+  // Skip alignment when BTB optimization is enabled; alignment adds NOPs that
+  // conflict with BTB fetch-line layout (MC layer will handle NOP placement).
+  // Only applies to RISC-V: the flag is registered globally via CodeGen TUs.
+  if (EnableRISCVBTBFetchLineBranchRelaxation &&
+      F->getTarget().getTargetTriple().isRISCV())
+    return;
   if (!AlignAllBlock && !AlignAllNonFallThruBlocks) {
     if (F->getFunction().hasMinSize() ||
         (F->getFunction().hasOptSize() && !TLI->alignLoopsWithOptSize()))
