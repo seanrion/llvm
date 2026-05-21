@@ -34,6 +34,9 @@ enum AttrType : unsigned {
   PRIV_SPEC_MINOR = 10,
   PRIV_SPEC_REVISION = 12,
   ATOMIC_ABI = 14,
+  // Non-standard attribute (tag >= 32768 per psABI). Object was compiled with
+  // BTB fetch-line branch optimization; linker uses relaxation-layout-preserve.
+  RIVAI_BTB_OPTIMIZED = 32768,
 };
 
 enum class RISCVAtomicAbiTag : unsigned {
