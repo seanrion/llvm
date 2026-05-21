@@ -59,6 +59,8 @@ LLVM_DUMP_METHOD void MCFragment::dump() const {
   case MCFragment::FT_SymbolId:      OS << "SymbolId"; break;
   case MCFragment::FT_CVInlineLines: OS << "CVInlineLineTable"; break;
   case MCFragment::FT_CVDefRange:    OS << "CVDefRangeTable"; break;
+  case MCFragment::FT_BranchSpacing: OS << "BranchSpacing"; break;
+  case MCFragment::FT_NopsBesideBranch: OS << "NopsBesideBranch"; break;
     // clang-format on
   }
 
@@ -188,6 +190,17 @@ LLVM_DUMP_METHOD void MCFragment::dump() const {
       OS << " RangeStart:" << RangeStartEnd.first;
       OS << " RangeEnd:" << RangeStartEnd.second;
     }
+    break;
+  }
+  case MCFragment::FT_BranchSpacing: {
+    const auto *BF = cast<MCBranchSpacingFragment>(this);
+    OS << " Size:" << BF->getSize() << " Spacing:" << BF->getSpacing();
+    break;
+  }
+  case MCFragment::FT_NopsBesideBranch: {
+    const auto *NF = cast<MCNopsBesideBranchFragment>(this);
+    OS << " NumBytes:" << NF->getNumBytes()
+       << " InsertKind:" << static_cast<unsigned>(NF->getInsertKind());
     break;
   }
   }

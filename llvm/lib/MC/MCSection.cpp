@@ -32,6 +32,26 @@ MCSymbol *MCSection::getEndSymbol(MCContext &Ctx) {
 
 bool MCSection::hasEnded() const { return End && End->isInSection(); }
 
+void MCSection::removeFragment(MCFragment &F) {
+  assert(F.getParent() == this && "Fragment does not belong to this section");
+  FragList *List = curFragList();
+  if (List->Head == &F) {
+    List->Head = F.getNext();
+    if (!List->Head)
+      List->Tail = nullptr;
+  } else {
+    MCFragment *Prev = List->Head;
+    while (Prev && Prev->getNext() != &F)
+      Prev = Prev->getNext();
+    assert(Prev && "Fragment not found in this section");
+    Prev->Next = F.getNext();
+    if (List->Tail == &F)
+      List->Tail = Prev;
+  }
+  F.setParent(nullptr);
+  F.Next = nullptr;
+}
+
 #if !defined(NDEBUG) || defined(LLVM_ENABLE_DUMP)
 LLVM_DUMP_METHOD void MCSection::dump(
     DenseMap<const MCFragment *, SmallVector<const MCSymbol *, 0>> *FragToSyms)
