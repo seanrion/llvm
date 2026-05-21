@@ -16,6 +16,7 @@
 #include "RISCVMCTargetDesc.h"
 #include "llvm/BinaryFormat/ELF.h"
 #include "llvm/MC/MCAsmBackend.h"
+#include "llvm/Support/Casting.h"
 #include "llvm/MC/MCAssembler.h"
 #include "llvm/MC/MCCodeEmitter.h"
 #include "llvm/MC/MCContext.h"
@@ -167,10 +168,12 @@ void RISCVELFStreamer::changeSection(MCSection *Section, uint32_t Subsection) {
 
 void RISCVELFStreamer::emitInstruction(const MCInst &Inst,
                                        const MCSubtargetInfo &STI) {
-  auto &Backend = static_cast<RISCVAsmBackend &> (this->getAssemblerPtr()->getBackend());
+  auto &Backend = static_cast<RISCVAsmBackend &>(
+      this->getAssemblerPtr()->getBackend());
   Backend.emitInstructionBegin(*this, Inst, STI);
   emitInstructionsMappingSymbol();
   MCELFStreamer::emitInstruction(Inst, STI);
+  Backend.emitInstructionEnd(*this, Inst, STI);
 }
 
 void RISCVELFStreamer::emitBytes(StringRef Data) {

@@ -65,6 +65,7 @@ public:
     FT_CVInlineLines,
     FT_CVDefRange,
     FT_BranchSpacing,
+    FT_NopsBesideBranch,
   };
 
 private:
@@ -632,6 +633,8 @@ public:
   /// Check whether this section is "virtual", that is has no actual object
   /// file contents.
   bool isBssSection() const { return IsBss; }
+
+  void removeFragment(MCFragment &F);
 };
 
 inline MutableArrayRef<char> MCFragment::getContents() {
@@ -703,37 +706,80 @@ inline MCSection::iterator &MCSection::iterator::operator++() {
 }
 
 class MCBranchSpacingFragment : public MCFragment {
-  /// The previous MCBranchSpacingFragment in the setof fragments.
+  /// The previous MCBranchSpacingFragment in the set of fragments.
   const MCBranchSpacingFragment *LastBA = nullptr;
-  /// The size of the fragment. The size is lazily set duriing relaxation, and
+  /// The size of the fragment.  The size is lazily set during relaxation, and
   /// is not meaningful before that.
   uint64_t Size = 0;
-  /// The variable Spacing determines the minimum spacing between tthe current
+  /// The variable Spacing determines the minimum spacing between the current
   /// MCBranchSpacingFragment and the previous MCBranchSpacingFragment. It is
   /// defined by the option "--riscv-branch-spacing." If this option is not
   /// specified, it is initialized to 0. If the option is provided, it will be
   /// set during the initialization of the RISCVAsmBackend.
   uint64_t Spacing = 0;
-  /// When emitting Nops some subtargets have specific nop encodings
+
+  /// When emitting Nops some subtargets have specific nop encodings.
   const MCSubtargetInfo &STI;
 
 public:
   MCBranchSpacingFragment(const MCSubtargetInfo &STI)
-      : MCFragment(FT_BranchSpacing, false), STI(STI) {}
+      : MCFragment(FT_BranchSpacing, false),
+        STI(STI) {}
 
   uint64_t getSize() const { return Size; }
   void setSize(uint64_t Value) { Size = Value; }
 
   const MCBranchSpacingFragment *getLastBA() const { return LastBA; }
-  void setLastBA(const MCBranchSpacingFragment *F) { LastBA = F; }
+  void setLastBA(const MCBranchSpacingFragment *F) {
+    LastBA = F;
+  }
 
   uint64_t getSpacing() const { return Spacing; }
-  void setSpacing(const uint64_t Value) { Spacing = Value; }
+  void setSpacing(const uint64_t Value) {
+    Spacing = Value;
+  }
 
-  const MCSubtargetInfo *getSubtargetinfo() const { return &STI; }
+  const MCSubtargetInfo *getSubtargetInfo() const { return &STI; }
 
   static bool classof(const MCFragment *F) {
     return F->getKind() == MCFragment::FT_BranchSpacing;
+  }
+};
+
+/// Insertion context for NOP pools adjacent to a branch (before or after).
+/// Used by MC-layer NopsBesideBranch cleanup to prioritize removal (OnExecPath
+/// first).
+enum class NopsBesideBranchKind : uint8_t {
+  /// NOPs not on any execution path (e.g. after j/ret/jr rd=x0), low removal.
+  OffExecPath,
+  /// NOPs on execution path (e.g. after call or cond branch), high removal.
+  OnExecPath,
+};
+
+/// Fragment for a NOP pool beside a branch instruction (before or after).
+/// Variable-length: can hold multiple consecutive NOPs. Filled via writeNopData
+/// during write.
+class MCNopsBesideBranchFragment : public MCFragment {
+  int64_t Size;
+  NopsBesideBranchKind InsertKind;
+  const MCSubtargetInfo &STI;
+
+public:
+  MCNopsBesideBranchFragment(int64_t NumBytes, NopsBesideBranchKind Kind,
+                             const MCSubtargetInfo &STI)
+      : MCFragment(FT_NopsBesideBranch, false), Size(NumBytes), InsertKind(Kind),
+        STI(STI) {}
+
+  int64_t getNumBytes() const { return Size; }
+  void setNumBytes(int64_t Value) { Size = Value; }
+
+  NopsBesideBranchKind getInsertKind() const { return InsertKind; }
+  void setInsertKind(NopsBesideBranchKind K) { InsertKind = K; }
+
+  const MCSubtargetInfo *getSubtargetInfo() const { return &STI; }
+
+  static bool classof(const MCFragment *F) {
+    return F->getKind() == MCFragment::FT_NopsBesideBranch;
   }
 };
 } // end namespace llvm
