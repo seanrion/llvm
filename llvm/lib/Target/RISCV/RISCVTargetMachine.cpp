@@ -58,6 +58,11 @@ static cl::opt<bool>
                           cl::desc("Enable the machine combiner pass"),
                           cl::init(true), cl::Hidden);
 
+static cl::opt<bool> EnableLateMachineCombiner(
+    "riscv-late-machine-combiner",
+    cl::desc("Run MachineCombiner again after RISCVOptWInstrs"),
+    cl::init(false), cl::Hidden);
+
 static cl::opt<unsigned> RVVVectorBitsMaxOpt(
     "riscv-v-vector-bits-max",
     cl::desc("Assume V extension vector registers are at most this big, "
@@ -634,6 +639,10 @@ void RISCVPassConfig::addMachineSSAOptimization() {
 
   if (TM->getTargetTriple().isRISCV64()) {
     addPass(createRISCVOptWInstrsPass());
+    // OptW may strip SLLIW/ADDW to SLLI/ADD, exposing SH*ADD combines that
+    // were not legal (or not present) before. Re-run MachineCombiner.
+    if (EnableMachineCombiner && EnableLateMachineCombiner)
+      addPass(&MachineCombinerID);
   }
 }
 
