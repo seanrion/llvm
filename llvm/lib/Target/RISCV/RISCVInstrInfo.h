@@ -76,6 +76,10 @@ enum RISCVMachineCombinerPattern : unsigned {
   FNMSUB,
   SHXADD_ADD_SLLI_OP1,
   SHXADD_ADD_SLLI_OP2,
+  /// ADD whose operand 1 is a one-use SLLI with imm in {1,2,3} → SH*ADD.
+  SHXADD_FROM_SLLI_OP1,
+  /// ADD whose operand 2 is a one-use SLLI with imm in {1,2,3} → SH*ADD.
+  SHXADD_FROM_SLLI_OP2,
 };
 
 class RISCVInstrInfo : public RISCVGenInstrInfo {

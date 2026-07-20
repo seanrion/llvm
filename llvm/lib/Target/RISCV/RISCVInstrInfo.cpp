@@ -2934,12 +2934,57 @@ static bool getSHXADDPatterns(const MachineInstr &Root,
   return Found;
 }
 
+static unsigned getSHXADDOpcodeForShiftAmt(unsigned ShiftAmt) {
+  switch (ShiftAmt) {
+  default:
+    llvm_unreachable("Unexpected SHXADD shift amount");
+  case 1:
+    return RISCV::SH1ADD;
+  case 2:
+    return RISCV::SH2ADD;
+  case 3:
+    return RISCV::SH3ADD;
+  }
+}
+
+/// Combine (add (slli x, sh), y) / (add y, (slli x, sh)) → SH*ADD when
+/// sh ∈ {1,2,3}. Intended for cases that become ADD+SLLI only after
+/// RISCVOptWInstrs strips W suffixes from SLLIW+ADDW.
+static bool
+getSHXADDFromShiftAddPatterns(const MachineInstr &Root,
+                              SmallVectorImpl<unsigned> &Patterns,
+                              const RISCVSubtarget &STI) {
+  if (!STI.hasStdExtZba() || Root.getOpcode() != RISCV::ADD)
+    return false;
+
+  const MachineBasicBlock &MBB = *Root.getParent();
+  bool Found = false;
+
+  auto TryOperand = [&](unsigned OpIdx, unsigned Pattern) {
+    const MachineInstr *ShiftMI =
+        canCombine(MBB, Root.getOperand(OpIdx), RISCV::SLLI);
+    if (!ShiftMI)
+      return;
+    unsigned ShiftAmt = ShiftMI->getOperand(2).getImm();
+    if (ShiftAmt < 1 || ShiftAmt > 3)
+      return;
+    Patterns.push_back(Pattern);
+    Found = true;
+  };
+
+  TryOperand(1, RISCVMachineCombinerPattern::SHXADD_FROM_SLLI_OP1);
+  TryOperand(2, RISCVMachineCombinerPattern::SHXADD_FROM_SLLI_OP2);
+  return Found;
+}
+
 CombinerObjective RISCVInstrInfo::getCombinerObjective(unsigned Pattern) const {
   switch (Pattern) {
   case RISCVMachineCombinerPattern::FMADD_AX:
   case RISCVMachineCombinerPattern::FMADD_XA:
   case RISCVMachineCombinerPattern::FMSUB:
   case RISCVMachineCombinerPattern::FNMSUB:
+  case RISCVMachineCombinerPattern::SHXADD_FROM_SLLI_OP1:
+  case RISCVMachineCombinerPattern::SHXADD_FROM_SLLI_OP2:
     return CombinerObjective::MustReduceDepth;
   default:
     return TargetInstrInfo::getCombinerObjective(Pattern);
@@ -2954,6 +2999,9 @@ bool RISCVInstrInfo::getMachineCombinerPatterns(
     return true;
 
   if (getSHXADDPatterns(Root, Patterns))
+    return true;
+
+  if (getSHXADDFromShiftAddPatterns(Root, Patterns, STI))
     return true;
 
   return TargetInstrInfo::getMachineCombinerPatterns(Root, Patterns,
@@ -3099,6 +3147,50 @@ genShXAddAddShift(MachineInstr &Root, unsigned AddOpIdx,
   DelInstrs.push_back(&Root);
 }
 
+/// Combine ADD + one-use SLLI{1,2,3} into a single SH*ADD.
+/// \p SlliOpIdx is the ADD operand index (1 or 2) defined by the SLLI.
+static void
+genSHXADDFromShiftAdd(MachineInstr &Root, unsigned SlliOpIdx,
+                      SmallVectorImpl<MachineInstr *> &InsInstrs,
+                      SmallVectorImpl<MachineInstr *> &DelInstrs) {
+  MachineFunction *MF = Root.getMF();
+  MachineRegisterInfo &MRI = MF->getRegInfo();
+  const TargetInstrInfo *TII = MF->getSubtarget().getInstrInfo();
+
+  MachineInstr *ShiftMI =
+      MRI.getUniqueVRegDef(Root.getOperand(SlliOpIdx).getReg());
+  assert(ShiftMI && ShiftMI->getOpcode() == RISCV::SLLI &&
+         "Expected one-use SLLI producing an ADD operand");
+
+  unsigned ShiftAmt = ShiftMI->getOperand(2).getImm();
+  unsigned NewOpc = getSHXADDOpcodeForShiftAmt(ShiftAmt);
+
+  const MachineOperand &ShiftSrc = ShiftMI->getOperand(1);
+  const MachineOperand &Other = Root.getOperand(3 - SlliOpIdx);
+  Register DstReg = Root.getOperand(0).getReg();
+
+  bool ShiftSrcIsKill = ShiftSrc.isKill();
+  bool OtherIsKill = Other.isKill();
+
+  // Extending live ranges past kills; also handle the mul-by-3 case where
+  // ShiftSrc and Other are the same vreg.
+  MRI.clearKillFlags(ShiftSrc.getReg());
+  if (Other.getReg() != ShiftSrc.getReg())
+    MRI.clearKillFlags(Other.getReg());
+
+  DebugLoc MergedLoc = DILocation::getMergedLocation(Root.getDebugLoc(),
+                                                     ShiftMI->getDebugLoc());
+
+  MachineInstrBuilder MIB =
+      BuildMI(*MF, MergedLoc, TII->get(NewOpc), DstReg)
+          .addReg(ShiftSrc.getReg(), getKillRegState(ShiftSrcIsKill))
+          .addReg(Other.getReg(), getKillRegState(OtherIsKill));
+
+  InsInstrs.push_back(MIB);
+  DelInstrs.push_back(ShiftMI);
+  DelInstrs.push_back(&Root);
+}
+
 void RISCVInstrInfo::genAlternativeCodeSequence(
     MachineInstr &Root, unsigned Pattern,
     SmallVectorImpl<MachineInstr *> &InsInstrs,
@@ -3127,6 +3219,12 @@ void RISCVInstrInfo::genAlternativeCodeSequence(
     return;
   case RISCVMachineCombinerPattern::SHXADD_ADD_SLLI_OP2:
     genShXAddAddShift(Root, 2, InsInstrs, DelInstrs, InstrIdxForVirtReg);
+    return;
+  case RISCVMachineCombinerPattern::SHXADD_FROM_SLLI_OP1:
+    genSHXADDFromShiftAdd(Root, 1, InsInstrs, DelInstrs);
+    return;
+  case RISCVMachineCombinerPattern::SHXADD_FROM_SLLI_OP2:
+    genSHXADDFromShiftAdd(Root, 2, InsInstrs, DelInstrs);
     return;
   }
 }

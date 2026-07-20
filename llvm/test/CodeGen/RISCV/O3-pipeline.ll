@@ -3,8 +3,10 @@
 ; RUN:   FileCheck %s --check-prefixes=CHECK,RV32
 ; RUN: llc -mtriple=riscv64 -O3 -debug-pass=Structure < %s -o /dev/null 2>&1 | \
 ; RUN:   grep -v "Verify generated machine code" | \
-; RUN:   FileCheck %s --check-prefixes=CHECK,RV64
-
+; RUN:   FileCheck %s --check-prefixes=CHECK,RV64,RV64-NOLATE
+; RUN: llc -mtriple=riscv64 -O3 -riscv-late-machine-combiner=true -debug-pass=Structure < %s -o /dev/null 2>&1 | \
+; RUN:   grep -v "Verify generated machine code" | \
+; RUN:   FileCheck %s --check-prefixes=CHECK,RV64,RV64-LATE
 ; REQUIRES: asserts
 
 ; CHECK-LABEL: Pass Arguments:
@@ -132,6 +134,11 @@
 ; CHECK-NEXT:       Peephole Optimizations
 ; CHECK-NEXT:       Remove dead machine instructions
 ; RV64-NEXT:        RISC-V Optimize W Instructions
+; RV64-LATE-NEXT:   MachineDominator Tree Construction
+; RV64-LATE-NEXT:   Machine Natural Loop Construction
+; RV64-LATE-NEXT:   Machine Trace Metrics 
+; RV64-LATE-NEXT:   Lazy Machine Block Frequency Analysis 
+; RV64-LATE-NEXT:   Machine InstCombiner 
 ; CHECK-NEXT:       RISC-V Pre-RA pseudo instruction expansion pass
 ; CHECK-NEXT:       RISC-V Merge Base Offset
 ; CHECK-NEXT:       MachineDominator Tree Construction
