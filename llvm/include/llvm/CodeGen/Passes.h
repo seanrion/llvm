@@ -191,6 +191,10 @@ LLVM_ABI extern char &SpillPlacementID;
 // instruction and update the MachineFunctionInfo with that information.
 LLVM_ABI extern char &ShrinkWrapID;
 
+/// ShrinkWrapping pass (multi-point, data-flow based).
+/// Splits CSR save/restore into multiple points using Chow's algorithm.
+LLVM_ABI extern char &ShrinkWrappingID;
+
 /// LiveRangeShrink pass. Move instruction close to its definition to shrink
 /// the definition's live range.
 LLVM_ABI extern char &LiveRangeShrinkID;

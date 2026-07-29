@@ -1,0 +1,45 @@
+# RUN: llc -mtriple=riscv64 -run-pass=shrink-wrapping -riscv-shrink-wrapping-dataflow=true %s -o - | FileCheck %s --check-prefixes=CHECK-DF
+# RUN: llc -mtriple=riscv64 -run-pass=shrink-wrapping -riscv-shrink-wrapping-dataflow=false %s -o - | FileCheck %s --check-prefixes=CHECK-OFF
+#
+# M2: data-flow ShrinkWrapping places CSR save/restore around uses.
+# Early-exit path (bb.1) does not use s1 ($x9); cold path (bb.2) does.
+# Pass may split edges, so save/restore BB numbers are not hard-coded.
+
+---
+name:            split_s1_away_from_early_exit
+tracksRegLiveness: true
+body:             |
+  bb.0:
+    liveins: $x10
+    successors: %bb.1, %bb.2
+
+    BNE $x10, $x0, %bb.2
+    PseudoBR %bb.1
+
+  bb.1:
+    liveins: $x10
+    ; No callee-saved register use on the fast path.
+    $x10 = ADDI $x0, 0
+    PseudoRET implicit $x10
+
+  bb.2:
+    liveins: $x10
+    ; Def of s1 ($x9) forces a callee-saved spill/restore for this path.
+    $x9 = ADDI $x10, 1
+    $x10 = ADD $x9, $x10
+    PseudoRET implicit $x10
+
+...
+
+# CHECK-DF-LABEL: name: split_s1_away_from_early_exit
+# CHECK-DF:       savePoint:
+# CHECK-DF:         - point: {{'%bb.[0-9]+'}}
+# CHECK-DF-NEXT:      registers:
+# CHECK-DF-NEXT:        - '$x9'
+# CHECK-DF:       restorePoint:
+# CHECK-DF:         - point: {{'%bb.[0-9]+'}}
+# CHECK-DF-NEXT:      registers:
+# CHECK-DF-NEXT:        - '$x9'
+
+# CHECK-OFF-LABEL: name: split_s1_away_from_early_exit
+# CHECK-OFF-NOT:  savePoint:
