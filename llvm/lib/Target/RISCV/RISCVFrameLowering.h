@@ -74,6 +74,7 @@ public:
   bool canUseAsEpilogue(const MachineBasicBlock &MBB) const override;
 
   bool enableShrinkWrapping(const MachineFunction &MF) const override;
+  bool enableCSRSaveRestorePointsSplit() const override;
 
   void emitCFIsEarly(MachineFunction &MF, ReachingDefInfo &RDI) const override;
 

@@ -998,6 +998,11 @@ bool ShrinkWrapLegacy::runOnMachineFunction(MachineFunction &MF) {
       !ShrinkWrapImpl::isShrinkWrapEnabled(MF))
     return false;
 
+  // If the data-flow ShrinkWrapping pass already placed save/restore points,
+  // do not override them with single-point placement.
+  if (!MF.getFrameInfo().getSavePoints().empty())
+    return false;
+
   MachineDominatorTree *MDT =
       &getAnalysis<MachineDominatorTreeWrapperPass>().getDomTree();
   MachinePostDominatorTree *MPDT =

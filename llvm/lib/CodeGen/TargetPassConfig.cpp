@@ -1184,6 +1184,7 @@ void TargetPassConfig::addMachinePasses() {
   // Insert prolog/epilog code.  Eliminate abstract frame index references...
   if (getOptLevel() != CodeGenOptLevel::None) {
     addPass(&PostRAMachineSinkingID);
+    addPass(&ShrinkWrappingID);
     addPass(&ShrinkWrapID);
   }
 
