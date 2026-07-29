@@ -82,8 +82,12 @@ class PEIImpl {
   RegScavenger *RS = nullptr;
   ReachingDefInfo &RDI;
 
-  // Save and Restore blocks of the current function. Typically there is a
-  // single save block, unless Windows EH funclets are involved.
+  // Prolog and Epilog blocks: stack allocation / deallocation.
+  MBBVector PrologBlocks;
+  MBBVector EpilogBlocks;
+
+  // Save and Restore blocks: CSR spill / restore (may differ from prolog
+  // when enableCSRSaveRestorePointsSplit is true).
   MBBVector SaveBlocks;
   MBBVector RestoreBlocks;
 
@@ -101,6 +105,7 @@ class PEIImpl {
 
   void calculateCallFrameInfo(MachineFunction &MF);
   void calculateSaveRestoreBlocks(MachineFunction &MF);
+  void calculatePrologEpilogBlocks(MachineFunction &MF);
   void spillCalleeSavedRegs(MachineFunction &MF);
 
   void calculateFrameObjectOffsets(MachineFunction &MF);
@@ -236,14 +241,18 @@ bool PEIImpl::run(MachineFunction &MF) {
   // information. Also eliminates call frame pseudo instructions.
   calculateCallFrameInfo(MF);
 
-  // Determine placement of CSR spill/restore code and prolog/epilog code:
-  // place all spills in the entry block, all restores in return blocks.
+  // Determine placement of CSR spill/restore code:
+  // place all spills in the entry block, all restores in return blocks
+  // (or use shrink-wrapping / multi-point save-restore maps).
   calculateSaveRestoreBlocks(MF);
+
+  // Determine placement of prolog/epilog (stack allocation) code.
+  calculatePrologEpilogBlocks(MF);
 
   // Stash away DBG_VALUEs that should not be moved by insertion of prolog code.
   SavedDbgValuesMap EntryDbgValues;
-  for (MachineBasicBlock *SaveBlock : SaveBlocks)
-    stashEntryDbgValues(*SaveBlock, EntryDbgValues);
+  for (MachineBasicBlock *PrologBlock : PrologBlocks)
+    stashEntryDbgValues(*PrologBlock, EntryDbgValues);
 
   // Handle CSR spilling and restoring, for targets that need it.
   if (MF.getTarget().usesPhysRegsForValues())
@@ -351,6 +360,8 @@ bool PEIImpl::run(MachineFunction &MF) {
   delete RS;
   SaveBlocks.clear();
   RestoreBlocks.clear();
+  PrologBlocks.clear();
+  EpilogBlocks.clear();
   MFI.clearSavePoints();
   MFI.clearRestorePoints();
   return true;
@@ -421,29 +432,79 @@ void PEIImpl::calculateCallFrameInfo(MachineFunction &MF) {
   }
 }
 
-/// Compute the sets of entry and return blocks for saving and restoring
-/// callee-saved registers, and placing prolog and epilog code.
+/// Compute blocks for placing prolog and epilog (stack allocation) code.
+void PEIImpl::calculatePrologEpilogBlocks(MachineFunction &MF) {
+  const TargetFrameLowering *TFI = MF.getSubtarget().getFrameLowering();
+  const MachineFrameInfo &MFI = MF.getFrameInfo();
+
+  if (MFI.getProlog()) {
+    PrologBlocks.push_back(MFI.getProlog());
+  } else if (!TFI->enableCSRSaveRestorePointsSplit() &&
+             !MFI.getSavePoints().empty()) {
+    // Legacy shrink-wrap colocates prolog with the (single) save point.
+    PrologBlocks = SaveBlocks;
+  } else {
+    PrologBlocks.push_back(&MF.front());
+    for (MachineBasicBlock &MBB : MF) {
+      if (MBB.isEHFuncletEntry())
+        PrologBlocks.push_back(&MBB);
+    }
+  }
+
+  if (MFI.getEpilog()) {
+    EpilogBlocks.push_back(MFI.getEpilog());
+  } else if (!TFI->enableCSRSaveRestorePointsSplit() &&
+             !MFI.getRestorePoints().empty()) {
+    // Legacy shrink-wrap colocates epilog with the (single) restore point.
+    EpilogBlocks = RestoreBlocks;
+  } else {
+    for (MachineBasicBlock &MBB : MF) {
+      if (MBB.isReturnBlock())
+        EpilogBlocks.push_back(&MBB);
+    }
+  }
+}
+
+/// Compute the sets of blocks for saving and restoring callee-saved registers.
 void PEIImpl::calculateSaveRestoreBlocks(MachineFunction &MF) {
   const MachineFrameInfo &MFI = MF.getFrameInfo();
+  const TargetFrameLowering *TFI = MF.getSubtarget().getFrameLowering();
   // Even when we do not change any CSR, we still want to insert the
   // prologue and epilogue of the function.
   // So set the save points for those.
 
   // Use the points found by shrink-wrapping, if any.
   if (!MFI.getSavePoints().empty()) {
-    assert(MFI.getSavePoints().size() == 1 &&
-           "Multiple save points are not yet supported!");
-    const auto &SavePoint = *MFI.getSavePoints().begin();
-    SaveBlocks.push_back(SavePoint.first);
-    assert(MFI.getRestorePoints().size() == 1 &&
-           "Multiple restore points are not yet supported!");
-    const auto &RestorePoint = *MFI.getRestorePoints().begin();
-    MachineBasicBlock *RestoreBlock = RestorePoint.first;
-    // If RestoreBlock does not have any successor and is not a return block
-    // then the end point is unreachable and we do not need to insert any
-    // epilogue.
-    if (!RestoreBlock->succ_empty() || RestoreBlock->isReturnBlock())
-      RestoreBlocks.push_back(RestoreBlock);
+    if (!TFI->enableCSRSaveRestorePointsSplit()) {
+      assert(MFI.getSavePoints().size() == 1 &&
+             "Multiple save points require enableCSRSaveRestorePointsSplit!");
+      const auto &SavePoint = *MFI.getSavePoints().begin();
+      SaveBlocks.push_back(SavePoint.first);
+      assert(MFI.getRestorePoints().size() == 1 &&
+             "Multiple restore points require enableCSRSaveRestorePointsSplit!");
+      const auto &RestorePoint = *MFI.getRestorePoints().begin();
+      MachineBasicBlock *RestoreBlock = RestorePoint.first;
+      // If RestoreBlock does not have any successor and is not a return block
+      // then the end point is unreachable and we do not need to insert any
+      // epilogue.
+      if (!RestoreBlock->succ_empty() || RestoreBlock->isReturnBlock())
+        RestoreBlocks.push_back(RestoreBlock);
+      return;
+    }
+
+    assert(!MFI.getRestorePoints().empty() &&
+           "Both restore and save must be set");
+    for (const auto &Item : MFI.getSavePoints())
+      SaveBlocks.push_back(Item.first);
+
+    for (const auto &Item : MFI.getRestorePoints()) {
+      MachineBasicBlock *RestoreBlock = Item.first;
+      // If RestoreBlock does not have any successor and is not a return block
+      // then the end point is unreachable and we do not need to insert any
+      // epilogue.
+      if (!RestoreBlock->succ_empty() || RestoreBlock->isReturnBlock())
+        RestoreBlocks.push_back(RestoreBlock);
+    }
     return;
   }
 
@@ -546,9 +607,62 @@ static void assignCalleeSavedSpillSlots(MachineFunction &F,
   MFI.setCalleeSavedInfo(CSI);
 }
 
+/// Helper function to update the liveness information for one callee-saved
+/// register under multi-point save/restore maps.
+static void updateLivenessSplit(MachineFunction &MF, CalleeSavedInfo &Info) {
+  MachineFrameInfo &MFI = MF.getFrameInfo();
+  // Visited contains blocks where the CSR is still live (outside the
+  // save→restore region for this register).
+  SmallPtrSet<MachineBasicBlock *, 8> Visited;
+  SmallVector<MachineBasicBlock *, 8> WorkList;
+  MachineBasicBlock *Entry = &MF.front();
+
+  WorkList.push_back(Entry);
+  Visited.insert(Entry);
+  while (!WorkList.empty()) {
+    bool AddSucc = true;
+    const MachineBasicBlock *CurBB = WorkList.pop_back_val();
+    auto SaveIt = MFI.getSavePoints().find(CurBB);
+    auto RestoreIt = MFI.getRestorePoints().find(CurBB);
+    if (SaveIt != MFI.getSavePoints().end() &&
+        count_if(SaveIt->second, [&Info](const CalleeSavedInfo &Other) {
+          return Other.getReg() == Info.getReg();
+        })) {
+      AddSucc = false;
+      if (RestoreIt != MFI.getRestorePoints().end() &&
+          count_if(RestoreIt->second, [&Info](const CalleeSavedInfo &Other) {
+            return Other.getReg() == Info.getReg();
+          }))
+        AddSucc = true;
+    }
+
+    if (AddSucc) {
+      for (MachineBasicBlock *SuccBB : CurBB->successors())
+        if (Visited.insert(SuccBB).second)
+          WorkList.push_back(SuccBB);
+    }
+  }
+
+  MachineRegisterInfo &MRI = MF.getRegInfo();
+  for (MachineBasicBlock *MBB : Visited) {
+    MCRegister Reg = Info.getReg();
+    if (!MRI.isReserved(Reg) && !MBB->isLiveIn(Reg))
+      MBB->addLiveIn(Reg);
+  }
+  if (Info.isSpilledToReg()) {
+    for (MachineBasicBlock &MBB : MF) {
+      if (Visited.count(&MBB))
+        continue;
+      MCRegister DstReg = Info.getDstReg();
+      if (!MBB.isLiveIn(DstReg))
+        MBB.addLiveIn(DstReg);
+    }
+  }
+}
+
 /// Helper function to update the liveness information for the callee-saved
-/// registers.
-static void updateLiveness(MachineFunction &MF) {
+/// registers (legacy single save/restore point).
+static void updateLivenessLegacy(MachineFunction &MF) {
   MachineFrameInfo &MFI = MF.getFrameInfo();
   // Visited will contain all the basic blocks that are in the region
   // where the callee saved registers are alive:
@@ -631,6 +745,9 @@ static void updateLiveness(MachineFunction &MF) {
 /// Insert spill code for the callee-saved registers used in the function.
 static void insertCSRSaves(MachineBasicBlock &SaveBlock,
                            ArrayRef<CalleeSavedInfo> CSI) {
+  if (CSI.empty())
+    return;
+
   MachineFunction &MF = *SaveBlock.getParent();
   const TargetInstrInfo *TII = MF.getSubtarget().getInstrInfo();
   const TargetFrameLowering *TFI = MF.getSubtarget().getFrameLowering();
@@ -646,7 +763,10 @@ static void insertCSRSaves(MachineBasicBlock &SaveBlock,
 
 /// Insert restore code for the callee-saved registers used in the function.
 static void insertCSRRestores(MachineBasicBlock &RestoreBlock,
-                              std::vector<CalleeSavedInfo> &CSI) {
+                              std::vector<CalleeSavedInfo> CSI) {
+  if (CSI.empty())
+    return;
+
   MachineFunction &MF = *RestoreBlock.getParent();
   const TargetInstrInfo *TII = MF.getSubtarget().getInstrInfo();
   const TargetFrameLowering *TFI = MF.getSubtarget().getFrameLowering();
@@ -663,6 +783,60 @@ static void insertCSRRestores(MachineBasicBlock &RestoreBlock,
   }
 }
 
+/// Fill per-BB CalleeSavedInfo vectors for multi-point save/restore maps.
+/// Registers listed in SavePoints/RestorePoints are resolved against
+/// \p RegToInfo. Any CSR missing from those lists is spilled/restored in
+/// the prolog/epilog blocks instead.
+static void fillCSInfoPerBB(MachineFrameInfo &MFI,
+                            DenseMap<MCRegister, CalleeSavedInfo *> &RegToInfo,
+                            MBBVector &PrologEpilogBlocks, bool IsSave) {
+  std::vector<CalleeSavedInfo> GCSIV;
+  const SaveRestorePoints &SRPoints =
+      IsSave ? MFI.getSavePoints() : MFI.getRestorePoints();
+  SaveRestorePoints Inner;
+  for (const auto &[BB, Regs] : SRPoints) {
+    std::vector<CalleeSavedInfo> CSIV;
+    for (const CalleeSavedInfo &Reg : Regs) {
+      auto It = RegToInfo.find(Reg.getReg());
+      if (It == RegToInfo.end())
+        continue;
+      CSIV.push_back(*It->second);
+      GCSIV.push_back(*It->second);
+    }
+    // AArch64 expects CSI sorted by frame index.
+    sort(CSIV, [](const CalleeSavedInfo &Lhs, const CalleeSavedInfo &Rhs) {
+      return Lhs.getFrameIdx() < Rhs.getFrameIdx();
+    });
+    Inner.try_emplace(BB, std::move(CSIV));
+  }
+
+  // Spill/restore any CSR not assigned to a split point in prolog/epilog.
+  if (GCSIV.size() < RegToInfo.size()) {
+    for (auto &RTI : RegToInfo) {
+      if (count_if(GCSIV, [&RTI](const CalleeSavedInfo &CSI) {
+            return CSI.getReg() == RTI.first;
+          }))
+        continue;
+      for (MachineBasicBlock *BB : PrologEpilogBlocks) {
+        if (auto Entry = Inner.find(BB); Entry != Inner.end()) {
+          auto &CSI = Entry->second;
+          CSI.push_back(*RTI.second);
+          sort(CSI, [](const CalleeSavedInfo &Lhs, const CalleeSavedInfo &Rhs) {
+            return Lhs.getFrameIdx() < Rhs.getFrameIdx();
+          });
+          continue;
+        }
+        Inner.try_emplace(BB, std::vector<CalleeSavedInfo>{*RTI.second});
+      }
+    }
+  }
+
+  if (IsSave)
+    MFI.setSavePoints(std::move(Inner));
+  else
+    MFI.setRestorePoints(std::move(Inner));
+}
+
 void PEIImpl::spillCalleeSavedRegs(MachineFunction &MF) {
   // We can't list this requirement in getRequiredProperties because some
   // targets (WebAssembly) use virtual registers past this point, and the pass
@@ -674,6 +848,7 @@ void PEIImpl::spillCalleeSavedRegs(MachineFunction &MF) {
   const Function &F = MF.getFunction();
   const TargetFrameLowering *TFI = MF.getSubtarget().getFrameLowering();
   MachineFrameInfo &MFI = MF.getFrameInfo();
+  const bool SplitPoints = TFI->enableCSRSaveRestorePointsSplit();
 
   // Determine which of the registers in the callee save list should be saved.
   BitVector SavedRegs;
@@ -688,31 +863,68 @@ void PEIImpl::spillCalleeSavedRegs(MachineFunction &MF) {
 
     std::vector<CalleeSavedInfo> &CSI = MFI.getCalleeSavedInfo();
 
-    // Fill SavePoints and RestorePoints with CalleeSavedRegisters
-    if (!MFI.getSavePoints().empty()) {
-      SaveRestorePoints SaveRestorePts;
-      for (const auto &SavePoint : MFI.getSavePoints())
-        SaveRestorePts.insert({SavePoint.first, CSI});
-      MFI.setSavePoints(std::move(SaveRestorePts));
+    if (SplitPoints) {
+      DenseMap<MCRegister, CalleeSavedInfo *> RegToInfo;
+      for (CalleeSavedInfo &CS : CSI)
+        RegToInfo.insert({CS.getReg(), &CS});
 
-      SaveRestorePts.clear();
-      for (const auto &RestorePoint : MFI.getRestorePoints())
-        SaveRestorePts.insert({RestorePoint.first, CSI});
-      MFI.setRestorePoints(std::move(SaveRestorePts));
-    }
+      if (!MFI.getSavePoints().empty()) {
+        fillCSInfoPerBB(MFI, RegToInfo, PrologBlocks, /*IsSave=*/true);
+        fillCSInfoPerBB(MFI, RegToInfo, EpilogBlocks, /*IsSave=*/false);
+      } else {
+        SaveRestorePoints SavePts;
+        for (MachineBasicBlock *PrologBlock : PrologBlocks)
+          SavePts.insert({PrologBlock, MFI.getCalleeSavedInfo()});
+        MFI.setSavePoints(std::move(SavePts));
+      }
 
-    if (!CSI.empty()) {
-      if (!MFI.hasCalls())
-        NumLeafFuncWithSpills++;
+      if (!CSI.empty()) {
+        if (!MFI.hasCalls())
+          NumLeafFuncWithSpills++;
 
-      for (MachineBasicBlock *SaveBlock : SaveBlocks)
-        insertCSRSaves(*SaveBlock, CSI);
+        for (MachineBasicBlock &MBB : MF)
+          insertCSRSaves(MBB, MFI.getSaveCSInfo(&MBB));
 
-      // Update the live-in information of all the blocks up to the save point.
-      updateLiveness(MF);
+        for (CalleeSavedInfo &CS : CSI)
+          updateLivenessSplit(MF, CS);
 
-      for (MachineBasicBlock *RestoreBlock : RestoreBlocks)
-        insertCSRRestores(*RestoreBlock, CSI);
+        if (MFI.getRestorePoints().empty()) {
+          SaveRestorePoints RestorePts;
+          for (MachineBasicBlock *EpilogBlock : EpilogBlocks)
+            RestorePts.insert({EpilogBlock, MFI.getCalleeSavedInfo()});
+          MFI.setRestorePoints(std::move(RestorePts));
+        }
+
+        for (MachineBasicBlock &MBB : MF)
+          insertCSRRestores(MBB, MFI.getRestoreCSInfo(&MBB));
+      }
+    } else {
+      // Legacy path: single save/restore point (or entry/returns).
+      if (!MFI.getSavePoints().empty()) {
+        SaveRestorePoints SaveRestorePts;
+        for (const auto &SavePoint : MFI.getSavePoints())
+          SaveRestorePts.insert({SavePoint.first, CSI});
+        MFI.setSavePoints(std::move(SaveRestorePts));
+
+        SaveRestorePts.clear();
+        for (const auto &RestorePoint : MFI.getRestorePoints())
+          SaveRestorePts.insert({RestorePoint.first, CSI});
+        MFI.setRestorePoints(std::move(SaveRestorePts));
+      }
+
+      if (!CSI.empty()) {
+        if (!MFI.hasCalls())
+          NumLeafFuncWithSpills++;
+
+        for (MachineBasicBlock *SaveBlock : SaveBlocks)
+          insertCSRSaves(*SaveBlock, CSI);
+
+        // Update the live-in information of all the blocks up to the save point.
+        updateLivenessLegacy(MF);
+
+        for (MachineBasicBlock *RestoreBlock : RestoreBlocks)
+          insertCSRRestores(*RestoreBlock, CSI);
+      }
     }
   }
 }
@@ -1185,26 +1397,26 @@ void PEIImpl::insertPrologEpilogCode(MachineFunction &MF) {
   }
 
   // Add prologue to the function...
-  for (MachineBasicBlock *SaveBlock : SaveBlocks)
-    TFI.emitPrologue(MF, *SaveBlock);
+  for (MachineBasicBlock *PrologBlock : PrologBlocks)
+    TFI.emitPrologue(MF, *PrologBlock);
 
   // Add epilogue to restore the callee-save registers in each exiting block.
-  for (MachineBasicBlock *RestoreBlock : RestoreBlocks)
-    TFI.emitEpilogue(MF, *RestoreBlock);
+  for (MachineBasicBlock *EpilogBlock : EpilogBlocks)
+    TFI.emitEpilogue(MF, *EpilogBlock);
 
   // Zero call used registers before restoring callee-saved registers.
   insertZeroCallUsedRegs(MF);
 
-  for (MachineBasicBlock *SaveBlock : SaveBlocks)
-    TFI.inlineStackProbe(MF, *SaveBlock);
+  for (MachineBasicBlock *PrologBlock : PrologBlocks)
+    TFI.inlineStackProbe(MF, *PrologBlock);
 
   // Emit additional code that is required to support segmented stacks, if
   // we've been asked for it.  This, when linked with a runtime with support
   // for segmented stacks (libgcc is one), will result in allocating stack
   // space in small chunks instead of one large contiguous block.
   if (MF.shouldSplitStack()) {
-    for (MachineBasicBlock *SaveBlock : SaveBlocks)
-      TFI.adjustForSegmentedStacks(MF, *SaveBlock);
+    for (MachineBasicBlock *PrologBlock : PrologBlocks)
+      TFI.adjustForSegmentedStacks(MF, *PrologBlock);
   }
 
   // Emit additional code that is required to explicitly handle the stack in
@@ -1213,8 +1425,8 @@ void PEIImpl::insertPrologEpilogCode(MachineFunction &MF) {
   // different conditional check and another BIF for allocating more stack
   // space.
   if (MF.getFunction().getCallingConv() == CallingConv::HiPE)
-    for (MachineBasicBlock *SaveBlock : SaveBlocks)
-      TFI.adjustForHiPEPrologue(MF, *SaveBlock);
+    for (MachineBasicBlock *PrologBlock : PrologBlocks)
+      TFI.adjustForHiPEPrologue(MF, *PrologBlock);
 }
 
 /// insertZeroCallUsedRegs - Zero out call used registers.
