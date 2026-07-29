@@ -194,6 +194,11 @@ public:
     return false;
   }
 
+  /// Returns true if the target supports multiple CSR save/restore points
+  /// that may differ from prolog/epilog blocks (data-flow shrink-wrapping).
+  /// When false, PEI keeps the legacy single save/restore point behavior.
+  virtual bool enableCSRSaveRestorePointsSplit() const { return false; }
+
   /// Returns true if the stack slot holes in the fixed and callee-save stack
   /// area should be used when allocating other stack locations to reduce stack
   /// size.
