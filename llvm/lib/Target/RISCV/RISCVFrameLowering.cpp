@@ -39,6 +39,11 @@ static cl::opt<std::string> UserDefinedUncondPrologCSRs(
   cl::desc("Comma-separated list of registerst that have to be saved / restored in prolog / epilog. Used for testing only"), cl::init(""),
   cl::Hidden);
 
+static cl::opt<bool> RISCVShrinkWrappingDataflow(
+    "riscv-shrink-wrapping-dataflow", cl::init(false), cl::Hidden,
+    cl::desc("Enable data-flow based multi-point CSR shrink-wrapping for "
+             "RISC-V (excludes ra/fp from splitting)"));
+
 static Align getABIStackAlignment(RISCVABI::ABI ABI) {
   if (ABI == RISCVABI::ABI_ILP32E)
     return Align(4);
@@ -2346,6 +2351,10 @@ bool RISCVFrameLowering::enableShrinkWrapping(const MachineFunction &MF) const {
     return false;
 
   return true;
+}
+
+bool RISCVFrameLowering::enableCSRSaveRestorePointsSplit() const {
+  return RISCVShrinkWrappingDataflow;
 }
 
 bool RISCVFrameLowering::canUseAsPrologue(const MachineBasicBlock &MBB) const {
