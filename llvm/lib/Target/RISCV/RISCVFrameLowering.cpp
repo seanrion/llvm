@@ -29,6 +29,7 @@
 #include "llvm/Support/LEB128.h"
 
 #include <algorithm>
+#include <limits>
 
 #define DEBUG_TYPE "riscv-frame"
 
@@ -42,7 +43,9 @@ static cl::opt<std::string> UserDefinedUncondPrologCSRs(
 static cl::opt<bool> RISCVShrinkWrappingDataflow(
     "riscv-shrink-wrapping-dataflow", cl::init(false), cl::Hidden,
     cl::desc("Enable data-flow based multi-point CSR shrink-wrapping for "
-             "RISC-V (excludes ra/fp from splitting)"));
+             "RISC-V (mutually exclusive with -riscv-save-csrs-early)"));
+
+extern cl::opt<bool> RISCVSaveCSRsEarly;
 
 static Align getABIStackAlignment(RISCVABI::ABI ABI) {
   if (ABI == RISCVABI::ABI_ILP32E)
@@ -561,9 +564,9 @@ uint64_t RISCVFrameLowering::getStackSizeWithRVVPadding(
   return alignTo(MFI.getStackSize() + RVFI->getRVVPadding(), getStackAlign());
 }
 
-static SmallVector<CalleeSavedInfo, 8>
-getUnmanagedCSI(const MachineFunction &MF,
-                const std::vector<CalleeSavedInfo> &CSI) {
+SmallVector<CalleeSavedInfo, 8>
+RISCVFrameLowering::getUnmanagedCSI(const MachineFunction &MF,
+                                    ArrayRef<CalleeSavedInfo> CSI) const {
   const MachineFrameInfo &MFI = MF.getFrameInfo();
   SmallVector<CalleeSavedInfo, 8> NonLibcallCSI;
 
@@ -578,7 +581,7 @@ getUnmanagedCSI(const MachineFunction &MF,
 
 static SmallVector<CalleeSavedInfo, 8>
 getRVVCalleeSavedInfo(const MachineFunction &MF,
-                      const std::vector<CalleeSavedInfo> &CSI) {
+                      ArrayRef<CalleeSavedInfo> CSI) {
   const MachineFrameInfo &MFI = MF.getFrameInfo();
   SmallVector<CalleeSavedInfo, 8> RVVCSI;
 
@@ -593,7 +596,7 @@ getRVVCalleeSavedInfo(const MachineFunction &MF,
 
 static SmallVector<CalleeSavedInfo, 8>
 getPushOrLibCallsSavedInfo(const MachineFunction &MF,
-                           const std::vector<CalleeSavedInfo> &CSI) {
+                           ArrayRef<CalleeSavedInfo> CSI) {
   auto *RVFI = MF.getInfo<RISCVMachineFunctionInfo>();
 
   SmallVector<CalleeSavedInfo, 8> PushOrLibCallsCSI;
@@ -620,7 +623,7 @@ getPushOrLibCallsSavedInfo(const MachineFunction &MF,
 
 static SmallVector<CalleeSavedInfo, 8>
 getQCISavedInfo(const MachineFunction &MF,
-                const std::vector<CalleeSavedInfo> &CSI) {
+                ArrayRef<CalleeSavedInfo> CSI) {
   auto *RVFI = MF.getInfo<RISCVMachineFunctionInfo>();
 
   SmallVector<CalleeSavedInfo, 8> QCIInterruptCSI;
@@ -955,15 +958,34 @@ void RISCVFrameLowering::emitPrologue(MachineFunction &MF,
   // Determine the correct frame layout
   determineFrameLayout(MF);
 
-  const auto &CSI = MFI.getCalleeSavedInfo();
+  // Under multi-point shrink-wrapping, use per-BB CSI; otherwise the global
+  // callee-saved list (legacy single-point / no data-flow).
+  std::vector<CalleeSavedInfo> SplitCSI;
+  ArrayRef<CalleeSavedInfo> CSI;
+  const bool SplitPoints = enableCSRSaveRestorePointsSplit();
+  if (SplitPoints) {
+    SplitCSI = MFI.getSaveCSInfo(&MBB);
+    CSI = SplitCSI;
+  } else {
+    CSI = MFI.getCalleeSavedInfo();
+  }
 
   // Skip to before the spills of scalar callee-saved registers
   // FIXME: assumes exactly one instruction is used to restore each
   // callee-saved register.
-  MBBI = std::prev(MBBI, getRVVCalleeSavedInfo(MF, CSI).size() +
-                             getUnmanagedCSI(MF, CSI).size());
-  CFIInstBuilder CFIBuilder(MBB, MBBI, MachineInstr::FrameSetup);
   bool NeedsDwarfCFI = needsDwarfCFI(MF);
+
+  // For Zilsd on RV32, CFI stays in the prologue (pair regs). Otherwise, when
+  // data-flow shrink-wrapping is on, scalar spill CFI is already next to the
+  // stores (spill + cfi), so skip twice as many FrameSetup instructions.
+  bool UseZilsd = !STI.is64Bit() && STI.hasStdExtZilsd() &&
+                  STI.getZilsdAlign() <= getStackAlign();
+  int ScalarDistance = getUnmanagedCSI(MF, CSI).size();
+  if (SplitPoints && NeedsDwarfCFI && !UseZilsd)
+    ScalarDistance *= 2;
+  int VectorDistance = getRVVCalleeSavedInfo(MF, CSI).size();
+  MBBI = std::prev(MBBI, VectorDistance + ScalarDistance);
+  CFIInstBuilder CFIBuilder(MBB, MBBI, MachineInstr::FrameSetup);
 
   // If libcalls are used to spill and restore callee-saved registers, the frame
   // has two sections; the opaque section managed by the libcalls, and the
@@ -1079,16 +1101,29 @@ void RISCVFrameLowering::emitPrologue(MachineFunction &MF,
   // registers as the frame pointer must be modified after it has been saved
   // to the stack, not before.
   // FIXME: assumes exactly one instruction is used to save each callee-saved
-  // register.
-  std::advance(MBBI, getUnmanagedCSI(MF, CSI).size());
-  CFIBuilder.setInsertPoint(MBBI);
+  // register. When SplitPoints && !UseZilsd, ScalarDistance already counts
+  // spill+cfi pairs.
+  std::advance(MBBI, ScalarDistance);
+  if (!SplitPoints || UseZilsd)
+    CFIBuilder.setInsertPoint(MBBI);
 
   // Iterate over list of callee-saved registers and emit .cfi_offset
-  // directives.
-  if (NeedsDwarfCFI)
-    for (const CalleeSavedInfo &CS : getUnmanagedCSI(MF, CSI))
-      CFIBuilder.buildOffset(CS.getReg(),
-                             MFI.getObjectOffset(CS.getFrameIdx()));
+  // directives. With data-flow shrink-wrapping, scalar CFI is emitted next to
+  // the spills; only Zilsd (or legacy mode) still emits them here.
+  if (NeedsDwarfCFI && (!SplitPoints || UseZilsd)) {
+    for (const CalleeSavedInfo &CS : getUnmanagedCSI(MF, CSI)) {
+      MCRegister Reg = CS.getReg();
+      int64_t Offset = MFI.getObjectOffset(CS.getFrameIdx());
+      if (UseZilsd && RISCV::GPRPairRegClass.contains(Reg)) {
+        MCRegister EvenReg = RI->getSubReg(Reg, RISCV::sub_gpr_even);
+        MCRegister OddReg = RI->getSubReg(Reg, RISCV::sub_gpr_odd);
+        CFIBuilder.buildOffset(EvenReg, Offset);
+        CFIBuilder.buildOffset(OddReg, Offset + 4);
+      } else {
+        CFIBuilder.buildOffset(Reg, Offset);
+      }
+    }
+  }
 
   // Generate new FP.
   if (hasFP(MF)) {
@@ -1107,8 +1142,10 @@ void RISCVFrameLowering::emitPrologue(MachineFunction &MF,
           MachineInstr::FrameSetup, getStackAlign());
     }
 
-    if (NeedsDwarfCFI)
+    if (NeedsDwarfCFI) {
+      CFIBuilder.setInsertPoint(MBBI);
       CFIBuilder.buildDefCFA(FPReg, RVFI->getVarArgsSaveSize());
+    }
   }
 
   uint64_t SecondSPAdjustAmount = 0;
@@ -1246,7 +1283,15 @@ void RISCVFrameLowering::emitEpilogue(MachineFunction &MF,
       --MBBI;
   }
 
-  const auto &CSI = MFI.getCalleeSavedInfo();
+  std::vector<CalleeSavedInfo> SplitCSI;
+  ArrayRef<CalleeSavedInfo> CSI;
+  const bool SplitPoints = enableCSRSaveRestorePointsSplit();
+  if (SplitPoints) {
+    SplitCSI = MFI.getRestoreCSInfo(&MBB);
+    CSI = SplitCSI;
+  } else {
+    CSI = MFI.getCalleeSavedInfo();
+  }
 
   // Skip to before the restores of scalar callee-saved registers
   // FIXME: assumes exactly one instruction is used to restore each
@@ -1256,6 +1301,9 @@ void RISCVFrameLowering::emitEpilogue(MachineFunction &MF,
   CFIInstBuilder CFIBuilder(MBB, FirstScalarCSRRestoreInsn,
                             MachineInstr::FrameDestroy);
   bool NeedsDwarfCFI = needsDwarfCFI(MF);
+
+  bool UseZilsd = !STI.is64Bit() && STI.hasStdExtZilsd() &&
+                  STI.getZilsdAlign() <= getStackAlign();
 
   uint64_t FirstSPAdjustAmount = getFirstSPAdjustAmount(MF);
   uint64_t RealStackSize = FirstSPAdjustAmount ? FirstSPAdjustAmount
@@ -1322,11 +1370,15 @@ void RISCVFrameLowering::emitEpilogue(MachineFunction &MF,
 
   // Skip to after the restores of scalar callee-saved registers
   // FIXME: assumes exactly one instruction is used to restore each
-  // callee-saved register.
-  MBBI = std::next(FirstScalarCSRRestoreInsn, getUnmanagedCSI(MF, CSI).size());
-  CFIBuilder.setInsertPoint(MBBI);
+  // callee-saved register. With SplitPoints, also skip co-located cfi_restore.
+  int ScalarDistance = getUnmanagedCSI(MF, CSI).size();
+  if (SplitPoints && NeedsDwarfCFI && !UseZilsd)
+    ScalarDistance *= 2;
+  MBBI = std::next(FirstScalarCSRRestoreInsn, ScalarDistance);
+  if (!SplitPoints || UseZilsd)
+    CFIBuilder.setInsertPoint(MBBI);
 
-  if (getLibCallID(MF, CSI) != -1) {
+  if (getLibCallID(MF, MFI.getCalleeSavedInfo()) != -1) {
     // tail __riscv_restore_[0-12] instruction is considered as a terminator,
     // therefore it is unnecessary to place any CFI instructions after it. Just
     // deallocate stack if needed and return.
@@ -1339,10 +1391,19 @@ void RISCVFrameLowering::emitEpilogue(MachineFunction &MF,
     return;
   }
 
-  // Recover callee-saved registers.
-  if (NeedsDwarfCFI)
-    for (const CalleeSavedInfo &CS : getUnmanagedCSI(MF, CSI))
-      CFIBuilder.buildRestore(CS.getReg());
+  // Recover callee-saved registers. With data-flow shrink-wrapping, restores
+  // already have co-located cfi_restore; only Zilsd/legacy emit here.
+  if (NeedsDwarfCFI && (!SplitPoints || UseZilsd)) {
+    for (const CalleeSavedInfo &CS : getUnmanagedCSI(MF, CSI)) {
+      MCRegister Reg = CS.getReg();
+      if (UseZilsd && RISCV::GPRPairRegClass.contains(Reg)) {
+        CFIBuilder.buildRestore(RI->getSubReg(Reg, RISCV::sub_gpr_even));
+        CFIBuilder.buildRestore(RI->getSubReg(Reg, RISCV::sub_gpr_odd));
+      } else {
+        CFIBuilder.buildRestore(Reg);
+      }
+    }
+  }
 
   if (RVFI->isPushable(MF) && MBBI != MBB.end() && isPop(MBBI->getOpcode())) {
     // Use available stack adjustment in pop instruction to deallocate stack
@@ -2135,6 +2196,30 @@ bool RISCVFrameLowering::assignCalleeSavedSpillSlots(
   return true;
 }
 
+static int64_t calculateCSRSpillOffsets(MachineFrameInfo &MFI,
+                                        const TargetFrameLowering *TFI,
+                                        unsigned MinCSFI, int FrameIdx) {
+  int LocalAreaOffset = -TFI->getOffsetOfLocalArea();
+  Align Alignment = MFI.getObjectAlign(FrameIdx);
+  int64_t Offset = LocalAreaOffset;
+
+  for (int i = MFI.getObjectIndexBegin(); i != 0; ++i) {
+    // Only allocate objects on the default stack.
+    if (MFI.getStackID(i) != TargetStackID::Default)
+      continue;
+
+    int64_t FixedOff = -MFI.getObjectOffset(i);
+    if (FixedOff > Offset)
+      Offset = FixedOff;
+  }
+
+  for (unsigned i = MinCSFI; i <= (unsigned)FrameIdx; ++i)
+    Offset += MFI.getObjectSize(i);
+
+  Offset = alignTo(Offset, Alignment);
+  return -Offset;
+}
+
 bool RISCVFrameLowering::spillCalleeSavedRegisters(
     MachineBasicBlock &MBB, MachineBasicBlock::iterator MI,
     ArrayRef<CalleeSavedInfo> CSI, const TargetRegisterInfo *TRI) const {
@@ -2205,6 +2290,42 @@ bool RISCVFrameLowering::spillCalleeSavedRegisters(
     }
   };
   storeRegsToStackSlots(UnmanagedCSI);
+
+  // With data-flow multi-point shrink-wrapping, emit .cfi_offset next to the
+  // spills (final object offsets are not finalized yet — estimate them).
+  bool NeedsDwarfCFI = needsDwarfCFI(*MF);
+  bool UseZilsd = !STI.is64Bit() && STI.hasStdExtZilsd() &&
+                  STI.getZilsdAlign() <= getStackAlign();
+  if (enableCSRSaveRestorePointsSplit() && NeedsDwarfCFI && !UseZilsd &&
+      !UnmanagedCSI.empty()) {
+    CFIInstBuilder CFIBuilder(MBB, MI, MachineInstr::FrameSetup);
+    MachineFrameInfo &MFI = MF->getFrameInfo();
+    unsigned MinCSFI = std::numeric_limits<unsigned>::max();
+    for (const CalleeSavedInfo &CS : MFI.getCalleeSavedInfo()) {
+      if (CS.getFrameIdx() >= 0)
+        MinCSFI = std::min(MinCSFI, (unsigned)CS.getFrameIdx());
+    }
+    if (MinCSFI == std::numeric_limits<unsigned>::max())
+      MinCSFI = 0;
+    if (RVFI->isSiFivePreemptibleInterrupt(*MF)) {
+      for (int I = 0; I < 2; ++I) {
+        int FI = RVFI->getInterruptCSRFrameIndex(I);
+        MinCSFI = std::min(MinCSFI, (unsigned)FI);
+      }
+    }
+    for (const CalleeSavedInfo &CS : UnmanagedCSI) {
+      int FrameIdx = CS.getFrameIdx();
+      int64_t Offset = 0;
+      if (FrameIdx < 0 &&
+          (RVFI->isPushable(*MF) || RVFI->useSaveRestoreLibCalls(*MF))) {
+        Offset = MFI.getObjectOffset(FrameIdx);
+      } else {
+        Offset = calculateCSRSpillOffsets(MFI, this, MinCSFI, FrameIdx);
+      }
+      CFIBuilder.buildOffset(CS.getReg(), Offset);
+    }
+  }
+
   storeRegsToStackSlots(RVVCSI);
 
   return true;
@@ -2301,6 +2422,16 @@ bool RISCVFrameLowering::restoreCalleeSavedRegisters(
   loadRegFromStackSlot(RVVCSI);
   loadRegFromStackSlot(UnmanagedCSI);
 
+  // Co-locate .cfi_restore with CSR reloads under data-flow shrink-wrapping.
+  bool NeedsDwarfCFI = needsDwarfCFI(*MF);
+  bool UseZilsd = !STI.is64Bit() && STI.hasStdExtZilsd() &&
+                  STI.getZilsdAlign() <= getStackAlign();
+  if (enableCSRSaveRestorePointsSplit() && NeedsDwarfCFI && !UseZilsd) {
+    CFIInstBuilder CFIBuilder(MBB, MI, MachineInstr::FrameDestroy);
+    for (const CalleeSavedInfo &CS : UnmanagedCSI)
+      CFIBuilder.buildRestore(CS.getReg());
+  }
+
   RISCVMachineFunctionInfo *RVFI = MF->getInfo<RISCVMachineFunctionInfo>();
   if (RVFI->useQCIInterrupt(*MF)) {
     // Don't emit anything here because restoration is handled by
@@ -2353,7 +2484,13 @@ bool RISCVFrameLowering::enableShrinkWrapping(const MachineFunction &MF) const {
 }
 
 bool RISCVFrameLowering::enableCSRSaveRestorePointsSplit() const {
-  return RISCVShrinkWrappingDataflow;
+  if (!RISCVShrinkWrappingDataflow)
+    return false;
+  if (RISCVSaveCSRsEarly)
+    report_fatal_error(
+        "-riscv-shrink-wrapping-dataflow and -riscv-save-csrs-early are "
+        "mutually exclusive");
+  return true;
 }
 
 bool RISCVFrameLowering::canUseAsPrologue(const MachineBasicBlock &MBB) const {

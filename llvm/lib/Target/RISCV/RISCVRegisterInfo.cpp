@@ -12,6 +12,7 @@
 
 #include "RISCVRegisterInfo.h"
 #include "RISCV.h"
+#include "RISCVFrameLowering.h"
 #include "RISCVSubtarget.h"
 #include "llvm/ADT/SmallSet.h"
 #include "llvm/BinaryFormat/Dwarf.h"
@@ -503,6 +504,29 @@ void RISCVRegisterInfo::lowerSegmentSpillReload(MachineBasicBlock::iterator II,
   II->eraseFromParent();
 }
 
+int64_t RISCVRegisterInfo::getCSIFrameOffset(MachineFunction *MF) const {
+  uint64_t FirstSPAdjustAmount =
+      getFrameLowering(*MF)->getFirstSPAdjustAmount(*MF);
+  if (FirstSPAdjustAmount)
+    return getFrameLowering(*MF)->getStackSizeWithRVVPadding(*MF) -
+           FirstSPAdjustAmount;
+  return 0;
+}
+
+bool RISCVRegisterInfo::isCSIFrameIndex(MachineFunction *MF,
+                                        int FrameIndex) const {
+  const MachineFrameInfo &MFI = MF->getFrameInfo();
+  const auto &CSI = getFrameLowering(*MF)->getUnmanagedCSI(
+      *MF, MFI.getCalleeSavedInfo());
+  if (!CSI.empty()) {
+    int MinCSFI = CSI.front().getFrameIdx();
+    int MaxCSFI = CSI.back().getFrameIdx();
+    if (FrameIndex >= MinCSFI && FrameIndex <= MaxCSFI)
+      return true;
+  }
+  return false;
+}
+
 bool RISCVRegisterInfo::eliminateFrameIndexInMI(MachineInstr &MI, int SPAdj,
                          unsigned FIOperandNum,
                          RegScavenger *RS) const {
@@ -515,6 +539,11 @@ bool RISCVRegisterInfo::eliminateFrameIndexInMI(MachineInstr &MI, int SPAdj,
   Register FrameReg;
   StackOffset Offset =
       getFrameLowering(MF)->getFrameIndexReference(MF, FrameIndex, FrameReg);
+  // Historically RISC-V ignored SPAdj (and asserted it was 0). Only apply it
+  // under multi-point shrink-wrapping, where PEI may pass a non-zero CSI
+  // adjustment for spills outside the prolog/epilog.
+  if (getFrameLowering(MF)->enableCSRSaveRestorePointsSplit())
+    Offset += StackOffset::getFixed(SPAdj);
   bool IsRVVSpill = RISCV::isRVVSpill(MI);
   if (!IsRVVSpill)
     Offset += StackOffset::getFixed(MI.getOperand(FIOperandNum + 1).getImm());
@@ -625,8 +654,8 @@ bool RISCVRegisterInfo::eliminateFrameIndexInMI(MachineInstr &MI, int SPAdj,
 bool RISCVRegisterInfo::eliminateFrameIndex(MachineBasicBlock::iterator II,
                                             int SPAdj, unsigned FIOperandNum,
                                             RegScavenger *RS) const {
-  assert(SPAdj == 0 && "Unexpected non-zero SPAdj value");
-
+  // Non-zero SPAdj is used for CSR spills outside the prolog/epilog under
+  // multi-point shrink-wrapping (split SP adjustment).
   MachineInstr &MI = *II;
   MachineBasicBlock &MBB = *MI.getParent();
   if (!MI.isBundle())
