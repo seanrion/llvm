@@ -55,6 +55,7 @@
 #include "llvm/CodeGen/RegisterBankInfo.h"
 #include "llvm/CodeGen/SlotIndexes.h"
 #include "llvm/CodeGen/StackMaps.h"
+#include "llvm/CodeGen/TargetFrameLowering.h"
 #include "llvm/CodeGen/TargetInstrInfo.h"
 #include "llvm/CodeGen/TargetLowering.h"
 #include "llvm/CodeGen/TargetOpcodes.h"
@@ -88,6 +89,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <iterator>
+#include <optional>
 #include <string>
 #include <utility>
 
@@ -355,6 +357,9 @@ struct MachineVerifier {
   void verifyStackFrame();
   /// Check that the stack protector is the top-most object in the stack.
   void verifyStackProtector();
+  /// When CSR save/restore points may be split, check FrameDestroy CFI
+  /// restores match CSR reloads in each MBB.
+  void verifyCFI();
 
   void verifySlotIndexes() const;
   void verifyProperties(const MachineFunction &MF);
@@ -714,6 +719,7 @@ void MachineVerifier::visitMachineFunctionBefore() {
   MRI->verifyUseLists();
 
   if (!MF->empty()) {
+    verifyCFI();
     verifyStackFrame();
     verifyStackProtector();
   }
@@ -4170,6 +4176,35 @@ void MachineVerifier::verifyStackProtector() {
         (!StackGrowsDown && SPStart >= ObjStart)) {
       report("Stack protector is not the top-most object on the stack", MF);
       break;
+    }
+  }
+}
+
+void MachineVerifier::verifyCFI() {
+  const TargetFrameLowering *TFL = MF->getSubtarget().getFrameLowering();
+  // Only enforce co-located CSR reload/CFI when multi-point save/restore is
+  // enabled; other targets/configs may place FrameDestroy CFI differently.
+  if (!TFL->enableCSRSaveRestorePointsSplit())
+    return;
+
+  for (const MachineBasicBlock &MBB : *MF) {
+    SmallVector<unsigned, 16> FrameDestroyCFI;
+    SmallVector<unsigned, 16> Restores;
+    for (const MachineInstr &MI : MBB) {
+      if (std::optional<unsigned> Id = TII->isReloadOfCSR(&MI))
+        Restores.push_back(*Id);
+      if (std::optional<unsigned> Id = TII->isCFIRestoreOfCSR(&MI))
+        FrameDestroyCFI.push_back(*Id);
+    }
+    if (Restores.size() != FrameDestroyCFI.size() ||
+        any_of(FrameDestroyCFI, [&](unsigned Reg) {
+          for (unsigned Reg2 : Restores)
+            if (TRI->regsOverlap(Reg, Reg2))
+              return false;
+          return true;
+        })) {
+      report("Invalid CFI information", MF);
+      OS << "\nCFI info does not match restores of CSRs.\n" << MBB << "\n";
     }
   }
 }

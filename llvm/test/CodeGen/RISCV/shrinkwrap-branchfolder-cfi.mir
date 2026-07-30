@@ -1,0 +1,41 @@
+# RUN: llc -mtriple=riscv64 -run-pass=branch-folder -verify-machineinstrs \
+# RUN:     -riscv-shrink-wrapping-dataflow=true %s -o - | FileCheck %s
+#
+# when common-tail merge would start at identical CFI restores
+# while CSR reloads differ (and stay in each pred), tryFixupCFI keeps the
+# FrameDestroy CFI with the reload instead of pulling it into the shared tail.
+
+---
+name:            cfi_stays_with_csr_reload
+tracksRegLiveness: true
+body:             |
+  bb.0:
+    liveins: $x10
+    successors: %bb.1, %bb.2
+
+    BNE $x10, $x0, %bb.2
+    PseudoBR %bb.1
+
+  bb.1:
+    liveins: $x10
+    $x8 = frame-destroy LD $x2, 8 :: (load (s64))
+    frame-destroy CFI_INSTRUCTION restore $x8
+    $x10 = ADDI $x10, 1
+    $x10 = ADDI $x10, 2
+    PseudoRET implicit $x10
+
+  bb.2:
+    liveins: $x10
+    $x8 = frame-destroy LD $x2, 16 :: (load (s64))
+    frame-destroy CFI_INSTRUCTION restore $x8
+    $x10 = ADDI $x10, 1
+    $x10 = ADDI $x10, 2
+    PseudoRET implicit $x10
+
+...
+
+# CHECK-LABEL: name: cfi_stays_with_csr_reload
+# CHECK: $x8 = frame-destroy LD $x2, 8
+# CHECK-NEXT: frame-destroy CFI_INSTRUCTION restore $x8
+# CHECK: $x8 = frame-destroy LD $x2, 16
+# CHECK-NEXT: frame-destroy CFI_INSTRUCTION restore $x8
