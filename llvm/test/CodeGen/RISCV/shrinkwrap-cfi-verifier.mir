@@ -1,0 +1,19 @@
+# RUN: not --crash llc -mtriple=riscv64 -run-pass=branch-folder -verify-machineinstrs \
+# RUN:     -riscv-shrink-wrapping-dataflow=true %s -o %t 2>&1 | FileCheck %s
+#
+# M4: with data-flow split enabled, FrameDestroy CSR reload without a matching
+# FrameDestroy CFI restore in the same MBB must fail MachineVerifier.
+# Use "not --crash" because MachineVerifier aborts via report_fatal_error.
+
+---
+name:            bad_cfi
+tracksRegLiveness: true
+body:             |
+  bb.0:
+    $x8 = frame-destroy LD $x2, 8 :: (load (s64))
+    PseudoRET
+
+...
+
+# CHECK: Invalid CFI information
+# CHECK: CFI info does not match restores of CSRs
