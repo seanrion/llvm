@@ -1734,8 +1734,20 @@ void PEIImpl::replaceFrameIndicesBackward(MachineBasicBlock *BB,
       if (replaceFrameIndexDebugInstr(MF, MI, Idx, SPAdj))
         continue;
 
+      int FrameIndex = MI.getOperand(Idx).getIndex();
+      int SPA = SPAdj;
+      // Only under multi-point CSR shrink-wrapping do CSR spills outside the
+      // prolog/epilog need an extra SP adjustment (split SP allocation).
+      if (TFI.enableCSRSaveRestorePointsSplit() &&
+          TRI.isCSIFrameIndex(&MF, FrameIndex) &&
+          !(is_contained(PrologBlocks, BB) || is_contained(EpilogBlocks, BB))) {
+        int CSIOff = TRI.getCSIFrameOffset(&MF);
+        if (CSIOff != 0)
+          SPA = CSIOff;
+      }
+
       // Eliminate this FrameIndex operand.
-      RemovedMI = TRI.eliminateFrameIndex(MI, SPAdj, Idx, LocalRS);
+      RemovedMI = TRI.eliminateFrameIndex(MI, SPA, Idx, LocalRS);
       if (RemovedMI)
         break;
     }

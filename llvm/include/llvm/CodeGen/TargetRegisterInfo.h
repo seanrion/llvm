@@ -1172,6 +1172,16 @@ public:
                                    int SPAdj, unsigned FIOperandNum,
                                    RegScavenger *RS = nullptr) const = 0;
 
+  /// True if \p FrameIndex is a CSR spill slot that may live outside the
+  /// prolog/epilog blocks under multi-point shrink-wrapping.
+  virtual bool isCSIFrameIndex(MachineFunction *MF, int FrameIndex) const {
+    return false;
+  }
+
+  /// Extra SP adjustment to apply when eliminating CSR frame indices that are
+  /// not in the prolog/epilog (e.g. after a split SP adjust).
+  virtual int64_t getCSIFrameOffset(MachineFunction *MF) const { return 0; }
+
   /// Return the assembly name for \p Reg.
   virtual StringRef getRegAsmName(MCRegister Reg) const {
     // FIXME: We are assuming that the assembly name is equal to the TableGen

@@ -76,6 +76,11 @@ public:
   bool enableShrinkWrapping(const MachineFunction &MF) const override;
   bool enableCSRSaveRestorePointsSplit() const override;
 
+  /// CSR spills not handled by push/pop or save-restore libcalls.
+  SmallVector<CalleeSavedInfo, 8>
+  getUnmanagedCSI(const MachineFunction &MF,
+                  ArrayRef<CalleeSavedInfo> CSI) const;
+
   void emitCFIsEarly(MachineFunction &MF, ReachingDefInfo &RDI) const override;
 
   bool isSupportedStackID(TargetStackID::Value ID) const override;

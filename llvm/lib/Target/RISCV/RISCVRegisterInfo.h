@@ -102,6 +102,9 @@ struct RISCVRegisterInfo : public RISCVGenRegisterInfo {
                            unsigned FIOperandNum,
                            RegScavenger *RS = nullptr) const override;
 
+  bool isCSIFrameIndex(MachineFunction *MF, int FrameIndex) const override;
+  int64_t getCSIFrameOffset(MachineFunction *MF) const override;
+
   bool requiresVirtualBaseRegisters(const MachineFunction &MF) const override;
 
   bool needsFrameBaseReg(MachineInstr *MI, int64_t Offset) const override;
