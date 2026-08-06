@@ -41,6 +41,7 @@
 #include "llvm/ADT/PostOrderIterator.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SetVector.h"
+#include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/SparseBitVector.h"
 #include "llvm/ADT/Statistic.h"
@@ -61,6 +62,8 @@
 #include "llvm/CodeGen/TargetLowering.h"
 #include "llvm/CodeGen/TargetRegisterInfo.h"
 #include "llvm/CodeGen/TargetSubtargetInfo.h"
+#include "llvm/IR/Attributes.h"
+#include "llvm/IR/Function.h"
 #include "llvm/InitializePasses.h"
 #include "llvm/MC/MCAsmInfo.h"
 #include "llvm/Support/CommandLine.h"
@@ -1388,17 +1391,16 @@ bool ShrinkWrappingImpl::calcRestorePlacements(
       SUCC = successors[i];
       availOutSucc &= (UsedCSRegs - AvailOut[SUCC]);
     }
-  } else {
-    CSRegSet Used;
-    if (Node->MatchMBB)
-      Used = CSRUsed[Node->MatchMBB];
-    if (!Used.empty() || !AvailOut[Node].empty()) {
-      // Handle uses in return blocks (which have no successors).
-      // This is necessary because the DFA formulation assumes the
-      // entry and (multiple) exit nodes cannot have CSR uses, which
-      // is not the case in the real world.
+  } else if (Node->MatchMBB && Node->MatchMBB->isReturnBlock()) {
+    // Leaf return blocks: place restores (DFA assumes exits have no uses).
+    // Do NOT treat noreturn exits (e.g. call __cxa_throw + barrier) as
+    // returns — restore+CFI after noreturn poisons FDE at the call RA
+    // (libunwind uses pc after the call). Unwind recovers CSRs via save
+    // CFI instead. Matches GCC separate shrink-wrap: epi only on paths
+    // that leave the framed region toward a normal EXIT.
+    CSRegSet Used = CSRUsed[Node->MatchMBB];
+    if (!Used.empty() || !AvailOut[Node].empty())
       availOutSucc = UsedCSRegs;
-    }
   }
   // Compute restores required at MBB:
   CSRRestore[Node] |= (AvailOut[Node] - AnticOut[Node]) & availOutSucc;
@@ -1563,6 +1565,100 @@ bool ShrinkWrappingImpl::run(MachineFunction &MF) {
           CSRRestore[AuxillaryCFG.getNode(RB)].set(Reg.id());
       }
     }
+  }
+
+  // Drop restores on noreturn exits (no ld/CFI after throw/abort/exit — that
+  // poisons FDE at the call RA). Rehome per-CSR only onto ReturnBlocks that
+  // are reachable from a Save of that CSR. Broadcasting to *all* returns
+  // causes early-exit paths that never spilled to execute ld of garbage
+  // (SIBsim4 / PENNANT SIGSEGV).
+  auto ContainsNoReturnCall = [](const MachineBasicBlock &MBB) {
+    for (const MachineInstr &MI : MBB) {
+      if (!MI.isCall())
+        continue;
+      for (const MachineOperand &MO : MI.operands()) {
+        if (MO.isGlobal()) {
+          if (const Function *F = dyn_cast<Function>(MO.getGlobal()))
+            if (F->doesNotReturn())
+              return true;
+        } else if (MO.isSymbol()) {
+          StringRef N = MO.getSymbolName();
+          if (N == "exit" || N == "_exit" || N == "abort" ||
+              N == "__cxa_throw" || N == "__cxa_rethrow" ||
+              N == "_Unwind_Resume" || N == "__assert_fail")
+            return true;
+        }
+      }
+    }
+    return false;
+  };
+
+  auto CollectReachableReturns =
+      [&](MachineBasicBlock *Start,
+          SmallPtrSetImpl<MachineBasicBlock *> &Out) {
+        SmallVector<MachineBasicBlock *, 16> Work;
+        SmallPtrSet<MachineBasicBlock *, 16> Visited;
+        Work.push_back(Start);
+        Visited.insert(Start);
+        while (!Work.empty()) {
+          MachineBasicBlock *BB = Work.pop_back_val();
+          if (BB->isReturnBlock() && !ContainsNoReturnCall(*BB))
+            Out.insert(BB);
+          // Paths past noreturn never return to the caller.
+          if (ContainsNoReturnCall(*BB))
+            continue;
+          for (MachineBasicBlock *Succ : BB->successors())
+            if (Visited.insert(Succ).second)
+              Work.push_back(Succ);
+        }
+      };
+
+  CSRegSet ClearedRegs;
+  for (auto &KV : CSRRestore) {
+    MachineBasicBlock *MBB = KV.first->MatchMBB;
+    if (!MBB || KV.second.empty())
+      continue;
+
+    const bool HasNoReturnCall = ContainsNoReturnCall(*MBB);
+    // Pure return blocks without noreturn keep their restores.
+    if (MBB->isReturnBlock() && !HasNoReturnCall)
+      continue;
+
+    bool CanReachReturn = false;
+    if (!HasNoReturnCall) {
+      for (df_iterator<MachineBasicBlock *> DI = df_begin(MBB),
+                                            DE = df_end(MBB);
+           DI != DE; ++DI) {
+        if ((*DI)->isReturnBlock()) {
+          CanReachReturn = true;
+          break;
+        }
+      }
+    }
+    if (!CanReachReturn || HasNoReturnCall) {
+      LLVM_DEBUG(dbgs() << "Clear RESTORE on noreturn/non-returning path "
+                        << printMBBReference(*MBB) << "\n");
+      ClearedRegs |= KV.second;
+      KV.second.clear();
+    }
+  }
+
+  for (unsigned Reg : ClearedRegs) {
+    SmallPtrSet<MachineBasicBlock *, 8> Targets;
+    bool AnySave = false;
+    for (const auto &SKV : CSRSave) {
+      if (!SKV.second.test(Reg) || !SKV.first->MatchMBB)
+        continue;
+      AnySave = true;
+      CollectReachableReturns(SKV.first->MatchMBB, Targets);
+    }
+    // No save recorded: keep ABI safe (e.g. frame-bound race) on all returns.
+    if (!AnySave) {
+      for (MachineBasicBlock *RB : ReturnBlocks)
+        Targets.insert(RB);
+    }
+    for (MachineBasicBlock *RB : Targets)
+      CSRRestore[AuxillaryCFG.getNode(RB)].set(Reg);
   }
 
   if (setupCFG()) {

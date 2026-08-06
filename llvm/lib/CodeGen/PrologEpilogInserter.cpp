@@ -776,19 +776,156 @@ static void insertCSRSaves(MachineBasicBlock &SaveBlock,
   }
 }
 
+/// True if \p MBB has no non-EH successor (noreturn / trap / throw-only exit).
+static bool isNoreturnOrEHOnlyExit(const MachineBasicBlock &MBB) {
+  if (MBB.isReturnBlock())
+    return false;
+  for (const MachineBasicBlock *Succ : MBB.successors()) {
+    if (!Succ->isEHPad())
+      return false;
+  }
+  return true;
+}
+
+static bool isNoReturnCallMI(const MachineInstr &MI) {
+  if (!MI.isCall())
+    return false;
+  for (const MachineOperand &MO : MI.operands()) {
+    if (MO.isGlobal()) {
+      if (const Function *F = dyn_cast<Function>(MO.getGlobal()))
+        if (F->doesNotReturn())
+          return true;
+    } else if (MO.isSymbol()) {
+      // Libcalls may appear as external symbols without an IR Function*.
+      StringRef N = MO.getSymbolName();
+      if (N == "exit" || N == "_exit" || N == "abort" || N == "__cxa_throw" ||
+          N == "__cxa_rethrow" || N == "_Unwind_Resume" ||
+          N == "__assert_fail")
+        return true;
+    }
+  }
+  return false;
+}
+
+static bool blockHasNoReturnCall(const MachineBasicBlock &MBB) {
+  return any_of(MBB, isNoReturnCallMI);
+}
+
+/// Collect return/epilog blocks reachable from \p Start without walking past
+/// a noreturn call. Used so restores are not placed on early exits that never
+/// executed the corresponding CSR save.
+static void collectReachableEpilogs(
+    MachineBasicBlock *Start, ArrayRef<MachineBasicBlock *> EpilogBlocks,
+    SmallPtrSetImpl<MachineBasicBlock *> &Out) {
+  SmallPtrSet<MachineBasicBlock *, 8> EpilogSet(EpilogBlocks.begin(),
+                                                EpilogBlocks.end());
+  SmallVector<MachineBasicBlock *, 16> Work;
+  SmallPtrSet<MachineBasicBlock *, 16> Visited;
+  Work.push_back(Start);
+  Visited.insert(Start);
+  while (!Work.empty()) {
+    MachineBasicBlock *BB = Work.pop_back_val();
+    if (EpilogSet.contains(BB) && !blockHasNoReturnCall(*BB))
+      Out.insert(BB);
+    if (blockHasNoReturnCall(*BB))
+      continue;
+    for (MachineBasicBlock *Succ : BB->successors())
+      if (Visited.insert(Succ).second)
+        Work.push_back(Succ);
+  }
+}
+
+static void mergeCSIUnique(std::vector<CalleeSavedInfo> &DST,
+                           const CalleeSavedInfo &CS) {
+  if (any_of(DST, [&](const CalleeSavedInfo &E) {
+        return E.getReg() == CS.getReg();
+      }))
+    return;
+  DST.push_back(CS);
+  sort(DST, [](const CalleeSavedInfo &L, const CalleeSavedInfo &R) {
+    return L.getFrameIdx() < R.getFrameIdx();
+  });
+}
+
+/// Move RestorePoints off noreturn-tainted blocks onto epilogs reachable from
+/// the CSR's save points only (not every return — that broke SIBsim4/PENNANT).
+static void rehomeNoreturnRestorePoints(MachineFrameInfo &MFI,
+                                        MBBVector &EpilogBlocks) {
+  const SaveRestorePoints &Cur = MFI.getRestorePoints();
+  if (Cur.empty())
+    return;
+
+  SaveRestorePoints New;
+  // Reg -> CSIs cleared from noreturn blocks.
+  DenseMap<MCRegister, SmallVector<CalleeSavedInfo, 2>> ClearedByReg;
+  bool Changed = false;
+  for (const auto &[BB, Regs] : Cur) {
+    if (Regs.empty())
+      continue;
+
+    // Pure return blocks keep their restores.
+    if (BB->isReturnBlock() && !blockHasNoReturnCall(*BB)) {
+      New.try_emplace(BB, Regs);
+      continue;
+    }
+
+    if (isNoreturnOrEHOnlyExit(*BB) || blockHasNoReturnCall(*BB)) {
+      Changed = true;
+      LLVM_DEBUG(dbgs() << "PEI: rehome CSR restores from noreturn-tainted "
+                        << printMBBReference(*BB) << '\n');
+      for (const CalleeSavedInfo &CS : Regs)
+        ClearedByReg[CS.getReg()].push_back(CS);
+      continue;
+    }
+
+    New.try_emplace(BB, Regs);
+  }
+  if (!Changed)
+    return;
+
+  for (auto &[Reg, CSList] : ClearedByReg) {
+    SmallPtrSet<MachineBasicBlock *, 8> Targets;
+    bool AnySave = false;
+    for (const auto &[SaveBB, SaveRegs] : MFI.getSavePoints()) {
+      if (!any_of(SaveRegs, [&](const CalleeSavedInfo &S) {
+            return S.getReg() == Reg;
+          }))
+        continue;
+      AnySave = true;
+      collectReachableEpilogs(SaveBB, EpilogBlocks, Targets);
+    }
+    if (!AnySave) {
+      for (MachineBasicBlock *EB : EpilogBlocks)
+        Targets.insert(EB);
+    }
+    // Use the first CSI entry (same FI/reg for a given CSR).
+    const CalleeSavedInfo &CS = CSList.front();
+    for (MachineBasicBlock *EB : Targets)
+      mergeCSIUnique(New[EB], CS);
+  }
+
+  MFI.setRestorePoints(std::move(New));
+}
+
 /// Insert restore code for the callee-saved registers used in the function.
 static void insertCSRRestores(MachineBasicBlock &RestoreBlock,
                               std::vector<CalleeSavedInfo> CSI) {
   if (CSI.empty())
     return;
 
+  // Belt-and-suspenders: never emit restore(+CFI) on noreturn-only exits.
+  // ShrinkWrapping/PEI rehome should have emptied these already.
+  if (isNoreturnOrEHOnlyExit(RestoreBlock)) {
+    LLVM_DEBUG(dbgs() << "Skip CSR restores in noreturn/EH-only exit "
+                      << printMBBReference(RestoreBlock) << '\n');
+    return;
+  }
+
   MachineFunction &MF = *RestoreBlock.getParent();
   const TargetInstrInfo *TII = MF.getSubtarget().getInstrInfo();
   const TargetFrameLowering *TFI = MF.getSubtarget().getFrameLowering();
   const TargetRegisterInfo *TRI = MF.getSubtarget().getRegisterInfo();
 
-  // Restore all registers immediately before the return and any
-  // terminators that precede it.
   MachineBasicBlock::iterator I = RestoreBlock.getFirstTerminator();
 
   if (!TFI->restoreCalleeSavedRegisters(RestoreBlock, I, CSI, TRI)) {
@@ -801,11 +938,12 @@ static void insertCSRRestores(MachineBasicBlock &RestoreBlock,
 /// Fill per-BB CalleeSavedInfo vectors for multi-point save/restore maps.
 /// Registers listed in SavePoints/RestorePoints are resolved against
 /// \p RegToInfo. Any CSR missing from those lists is spilled/restored in
-/// the prolog/epilog blocks instead.
+/// the prolog/epilog blocks instead — for restores, only epilogs reachable
+/// from a save of that CSR (avoid early-exit ld without a prior sd).
 static void fillCSInfoPerBB(MachineFrameInfo &MFI,
                             DenseMap<MCRegister, CalleeSavedInfo *> &RegToInfo,
                             MBBVector &PrologEpilogBlocks, bool IsSave) {
-  std::vector<CalleeSavedInfo> GCSIV;
+  SmallSet<MCRegister, 16> AssignedRegs;
   const SaveRestorePoints &SRPoints =
       IsSave ? MFI.getSavePoints() : MFI.getRestorePoints();
   SaveRestorePoints Inner;
@@ -816,7 +954,7 @@ static void fillCSInfoPerBB(MachineFrameInfo &MFI,
       if (It == RegToInfo.end())
         continue;
       CSIV.push_back(*It->second);
-      GCSIV.push_back(*It->second);
+      AssignedRegs.insert(Reg.getReg());
     }
     // AArch64 expects CSI sorted by frame index.
     sort(CSIV, [](const CalleeSavedInfo &Lhs, const CalleeSavedInfo &Rhs) {
@@ -826,13 +964,33 @@ static void fillCSInfoPerBB(MachineFrameInfo &MFI,
   }
 
   // Spill/restore any CSR not assigned to a split point in prolog/epilog.
-  if (GCSIV.size() < RegToInfo.size()) {
+  if (AssignedRegs.size() < RegToInfo.size()) {
     for (auto &RTI : RegToInfo) {
-      if (count_if(GCSIV, [&RTI](const CalleeSavedInfo &CSI) {
-            return CSI.getReg() == RTI.first;
-          }))
+      if (AssignedRegs.contains(RTI.first))
         continue;
-      for (MachineBasicBlock *BB : PrologEpilogBlocks) {
+
+      SmallVector<MachineBasicBlock *, 4> Targets;
+      if (IsSave) {
+        Targets.assign(PrologEpilogBlocks.begin(), PrologEpilogBlocks.end());
+      } else {
+        // Path-sensitive: only epilogs reachable from a save of this CSR.
+        SmallPtrSet<MachineBasicBlock *, 8> Reachable;
+        bool AnySave = false;
+        for (const auto &[SaveBB, SaveRegs] : MFI.getSavePoints()) {
+          if (!any_of(SaveRegs, [&](const CalleeSavedInfo &S) {
+                return S.getReg() == RTI.first;
+              }))
+            continue;
+          AnySave = true;
+          collectReachableEpilogs(SaveBB, PrologEpilogBlocks, Reachable);
+        }
+        if (!AnySave)
+          Targets.assign(PrologEpilogBlocks.begin(), PrologEpilogBlocks.end());
+        else
+          Targets.assign(Reachable.begin(), Reachable.end());
+      }
+
+      for (MachineBasicBlock *BB : Targets) {
         if (auto Entry = Inner.find(BB); Entry != Inner.end()) {
           auto &CSI = Entry->second;
           CSI.push_back(*RTI.second);
@@ -882,6 +1040,11 @@ void PEIImpl::spillCalleeSavedRegs(MachineFunction &MF) {
       DenseMap<MCRegister, CalleeSavedInfo *> RegToInfo;
       for (CalleeSavedInfo &CS : CSI)
         RegToInfo.insert({CS.getReg(), &CS});
+
+      // Before fillCSInfoPerBB: move restores off noreturn-tainted blocks so
+      // those CSRs are not treated as "already assigned" then dropped.
+      if (!MFI.getRestorePoints().empty())
+        rehomeNoreturnRestorePoints(MFI, EpilogBlocks);
 
       if (!MFI.getSavePoints().empty()) {
         fillCSInfoPerBB(MFI, RegToInfo, PrologBlocks, /*IsSave=*/true);
