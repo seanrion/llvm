@@ -63,6 +63,7 @@
 #include <cassert>
 #include <cstdint>
 #include <limits>
+#include <optional>
 #include <utility>
 #include <vector>
 
@@ -265,6 +266,8 @@ bool PEIImpl::run(MachineFunction &MF) {
   // Calculate actual frame offsets for all abstract stack objects...
   calculateFrameObjectOffsets(MF);
 
+  TFI->emitPostFrameLayoutCFI(MF);
+
   // Add prolog and epilog code to the function.  This function is required
   // to align the stack frame as necessary for any stack variables or
   // called functions.  Because of this, calculateCalleeSavedRegisters()
@@ -437,10 +440,23 @@ void PEIImpl::calculatePrologEpilogBlocks(MachineFunction &MF) {
   const TargetFrameLowering *TFI = MF.getSubtarget().getFrameLowering();
   const MachineFrameInfo &MFI = MF.getFrameInfo();
 
+  // Data-flow CSR split (GCC-like separate shrink-wrapping): always allocate
+  // and free the full frame at entry / returns. Only CSR save/restore points
+  // may be multi-point; never shrink addi sp onto a cold path or loop latch.
+  if (TFI->enableCSRSaveRestorePointsSplit()) {
+    PrologBlocks.push_back(&MF.front());
+    for (MachineBasicBlock &MBB : MF) {
+      if (MBB.isEHFuncletEntry())
+        PrologBlocks.push_back(&MBB);
+      if (MBB.isReturnBlock())
+        EpilogBlocks.push_back(&MBB);
+    }
+    return;
+  }
+
   if (MFI.getProlog()) {
     PrologBlocks.push_back(MFI.getProlog());
-  } else if (!TFI->enableCSRSaveRestorePointsSplit() &&
-             !MFI.getSavePoints().empty()) {
+  } else if (!MFI.getSavePoints().empty()) {
     // Legacy shrink-wrap colocates prolog with the (single) save point.
     PrologBlocks = SaveBlocks;
   } else {
@@ -453,8 +469,7 @@ void PEIImpl::calculatePrologEpilogBlocks(MachineFunction &MF) {
 
   if (MFI.getEpilog()) {
     EpilogBlocks.push_back(MFI.getEpilog());
-  } else if (!TFI->enableCSRSaveRestorePointsSplit() &&
-             !MFI.getRestorePoints().empty()) {
+  } else if (!MFI.getRestorePoints().empty()) {
     // Legacy shrink-wrap colocates epilog with the (single) restore point.
     EpilogBlocks = RestoreBlocks;
   } else {
@@ -1075,6 +1090,63 @@ static void AssignProtectedObjSet(const StackObjSet &UnassignedObjs,
   }
 }
 
+/// After frame-index offsets are finalized, verify default-stack objects do not
+/// overlap. Only used with data-flow CSR save/restore splitting.
+static void verifyDefaultStackObjectLayout(const MachineFunction &MF) {
+  const MachineFrameInfo &MFI = MF.getFrameInfo();
+
+  auto objectInterval =
+      [&MFI](unsigned FI) -> std::optional<std::pair<int64_t, int64_t>> {
+    if (MFI.isDeadObjectIndex(FI))
+      return std::nullopt;
+    if (MFI.getStackID(FI) != TargetStackID::Default)
+      return std::nullopt;
+    if (MFI.isVariableSizedObjectIndex(FI))
+      return std::nullopt;
+    int64_t Start = MFI.getObjectOffset(FI);
+    return std::pair{Start, Start + (int64_t)MFI.getObjectSize(FI)};
+  };
+
+  int64_t MinBound = 0;
+  int64_t MaxBound = 0;
+  bool HaveBounds = false;
+
+  for (unsigned I = 0, E = MFI.getObjectIndexEnd(); I != E; ++I) {
+    auto A = objectInterval(I);
+    if (!A)
+      continue;
+
+    if (!HaveBounds) {
+      MinBound = A->first;
+      MaxBound = A->second;
+      HaveBounds = true;
+    } else {
+      MinBound = std::min(MinBound, A->first);
+      MaxBound = std::max(MaxBound, A->second);
+    }
+
+    for (unsigned J = I + 1; J != E; ++J) {
+      auto B = objectInterval(J);
+      if (!B)
+        continue;
+      if (A->first < B->second && B->first < A->second) {
+        report_fatal_error(Twine(MF.getName()) + ": stack object FI#" +
+                           Twine(I) +
+                           (MFI.isCalleeSavedObjectIndex(I) ? " (CSR)" : "") +
+                           " overlaps FI#" + Twine(J) +
+                           (MFI.isCalleeSavedObjectIndex(J) ? " (CSR)" : ""));
+      }
+    }
+  }
+
+  if (HaveBounds && MFI.getStackSize() &&
+      MaxBound - MinBound > (int64_t)MFI.getStackSize())
+    report_fatal_error(Twine(MF.getName()) +
+                       ": default stack objects span " +
+                       Twine(MaxBound - MinBound) + " bytes but StackSize is " +
+                       Twine(MFI.getStackSize()));
+}
+
 /// calculateFrameObjectOffsets - Calculate actual frame offsets for all of the
 /// abstract stack objects.
 void PEIImpl::calculateFrameObjectOffsets(MachineFunction &MF) {
@@ -1383,6 +1455,9 @@ void PEIImpl::calculateFrameObjectOffsets(MachineFunction &MF) {
   int64_t StackSize = Offset - LocalAreaOffset;
   MFI.setStackSize(StackSize);
   NumBytesStackSpace += StackSize;
+
+  if (TFI.enableCSRSaveRestorePointsSplit())
+    verifyDefaultStackObjectLayout(MF);
 }
 
 /// insertPrologEpilogCode - Scan the function for modified callee saved
