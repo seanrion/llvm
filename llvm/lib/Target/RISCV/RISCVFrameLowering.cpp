@@ -2497,6 +2497,16 @@ bool RISCVFrameLowering::enableCSRSaveRestorePointsSplit() const {
   return true;
 }
 
+bool RISCVFrameLowering::enableCFIFixup(const MachineFunction &MF) const {
+  // Stock CFIFixup finds prologue via reverse scan of all FrameSetup CFI;
+  // delayed CSR .cfi_offset (also FrameSetup) on cold throw paths then wins
+  // and remember/restore is never inserted correctly. ShrinkWrapCFIFixup
+  // handles this case instead.
+  if (enableCSRSaveRestorePointsSplit())
+    return false;
+  return TargetFrameLowering::enableCFIFixup(MF);
+}
+
 void RISCVFrameLowering::getFrameBoundCalleeSaves(
     const MachineFunction &MF, SmallVectorImpl<Register> &Regs) const {
   // Match GCC RISC-V separate shrink-wrapping: never delay ra / hard FP.
