@@ -14,8 +14,10 @@
 #define LLVM_CODEGEN_TARGETFRAMELOWERING_H
 
 #include "llvm/ADT/BitVector.h"
+#include "llvm/ADT/SmallVector.h"
 #include "llvm/CodeGen/MachineBasicBlock.h"
 #include "llvm/CodeGen/MachineOptimizationRemarkEmitter.h"
+#include "llvm/CodeGen/Register.h"
 #include "llvm/Support/Compiler.h"
 #include "llvm/Support/TypeSize.h"
 #include <vector>
@@ -198,6 +200,17 @@ public:
   /// that may differ from prolog/epilog blocks (data-flow shrink-wrapping).
   /// When false, PEI keeps the legacy single save/restore point behavior.
   virtual bool enableCSRSaveRestorePointsSplit() const { return false; }
+
+  /// After \c calculateFrameObjectOffsets, emit CFI for multi-point CSR spills
+  /// using finalized frame-index offsets (targets with data-flow shrink-wrap).
+  virtual void emitPostFrameLayoutCFI(MachineFunction &MF) const {}
+
+  /// Callee-saved registers that must stay with the stack-frame prolog/epilog
+  /// rather than multi-point save/restore (e.g. ra / FP on RISC-V, matching
+  /// GCC's separate shrink-wrapping policy).
+  virtual void
+  getFrameBoundCalleeSaves(const MachineFunction &MF,
+                            SmallVectorImpl<Register> &Regs) const {}
 
   /// Returns true if the stack slot holes in the fixed and callee-save stack
   /// area should be used when allocating other stack locations to reduce stack

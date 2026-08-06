@@ -75,6 +75,8 @@ public:
 
   bool enableShrinkWrapping(const MachineFunction &MF) const override;
   bool enableCSRSaveRestorePointsSplit() const override;
+  void getFrameBoundCalleeSaves(const MachineFunction &MF,
+                                 SmallVectorImpl<Register> &Regs) const override;
 
   /// CSR spills not handled by push/pop or save-restore libcalls.
   SmallVector<CalleeSavedInfo, 8>
@@ -82,6 +84,8 @@ public:
                   ArrayRef<CalleeSavedInfo> CSI) const;
 
   void emitCFIsEarly(MachineFunction &MF, ReachingDefInfo &RDI) const override;
+
+  void emitPostFrameLayoutCFI(MachineFunction &MF) const override;
 
   bool isSupportedStackID(TargetStackID::Value ID) const override;
   TargetStackID::Value getStackIDForScalableVectors() const override;

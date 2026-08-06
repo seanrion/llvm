@@ -2196,30 +2196,6 @@ bool RISCVFrameLowering::assignCalleeSavedSpillSlots(
   return true;
 }
 
-static int64_t calculateCSRSpillOffsets(MachineFrameInfo &MFI,
-                                        const TargetFrameLowering *TFI,
-                                        unsigned MinCSFI, int FrameIdx) {
-  int LocalAreaOffset = -TFI->getOffsetOfLocalArea();
-  Align Alignment = MFI.getObjectAlign(FrameIdx);
-  int64_t Offset = LocalAreaOffset;
-
-  for (int i = MFI.getObjectIndexBegin(); i != 0; ++i) {
-    // Only allocate objects on the default stack.
-    if (MFI.getStackID(i) != TargetStackID::Default)
-      continue;
-
-    int64_t FixedOff = -MFI.getObjectOffset(i);
-    if (FixedOff > Offset)
-      Offset = FixedOff;
-  }
-
-  for (unsigned i = MinCSFI; i <= (unsigned)FrameIdx; ++i)
-    Offset += MFI.getObjectSize(i);
-
-  Offset = alignTo(Offset, Alignment);
-  return -Offset;
-}
-
 bool RISCVFrameLowering::spillCalleeSavedRegisters(
     MachineBasicBlock &MBB, MachineBasicBlock::iterator MI,
     ArrayRef<CalleeSavedInfo> CSI, const TargetRegisterInfo *TRI) const {
@@ -2291,44 +2267,71 @@ bool RISCVFrameLowering::spillCalleeSavedRegisters(
   };
   storeRegsToStackSlots(UnmanagedCSI);
 
-  // With data-flow multi-point shrink-wrapping, emit .cfi_offset next to the
-  // spills (final object offsets are not finalized yet — estimate them).
-  bool NeedsDwarfCFI = needsDwarfCFI(*MF);
-  bool UseZilsd = !STI.is64Bit() && STI.hasStdExtZilsd() &&
-                  STI.getZilsdAlign() <= getStackAlign();
-  if (enableCSRSaveRestorePointsSplit() && NeedsDwarfCFI && !UseZilsd &&
-      !UnmanagedCSI.empty()) {
-    CFIInstBuilder CFIBuilder(MBB, MI, MachineInstr::FrameSetup);
-    MachineFrameInfo &MFI = MF->getFrameInfo();
-    unsigned MinCSFI = std::numeric_limits<unsigned>::max();
-    for (const CalleeSavedInfo &CS : MFI.getCalleeSavedInfo()) {
-      if (CS.getFrameIdx() >= 0)
-        MinCSFI = std::min(MinCSFI, (unsigned)CS.getFrameIdx());
-    }
-    if (MinCSFI == std::numeric_limits<unsigned>::max())
-      MinCSFI = 0;
-    if (RVFI->isSiFivePreemptibleInterrupt(*MF)) {
-      for (int I = 0; I < 2; ++I) {
-        int FI = RVFI->getInterruptCSRFrameIndex(I);
-        MinCSFI = std::min(MinCSFI, (unsigned)FI);
-      }
-    }
-    for (const CalleeSavedInfo &CS : UnmanagedCSI) {
-      int FrameIdx = CS.getFrameIdx();
-      int64_t Offset = 0;
-      if (FrameIdx < 0 &&
-          (RVFI->isPushable(*MF) || RVFI->useSaveRestoreLibCalls(*MF))) {
-        Offset = MFI.getObjectOffset(FrameIdx);
-      } else {
-        Offset = calculateCSRSpillOffsets(MFI, this, MinCSFI, FrameIdx);
-      }
-      CFIBuilder.buildOffset(CS.getReg(), Offset);
-    }
-  }
+  // Scalar spill CFI for data-flow shrink-wrapping is emitted in
+  // emitPostFrameLayoutCFI() after PEI finalizes frame-index offsets.
 
   storeRegsToStackSlots(RVVCSI);
 
   return true;
+}
+
+void RISCVFrameLowering::emitPostFrameLayoutCFI(MachineFunction &MF) const {
+  if (!enableCSRSaveRestorePointsSplit() || !needsDwarfCFI(MF))
+    return;
+
+  bool UseZilsd = !STI.is64Bit() && STI.hasStdExtZilsd() &&
+                  STI.getZilsdAlign() <= getStackAlign();
+  // Zilsd keeps scalar spill CFI in emitPrologue.
+  if (UseZilsd)
+    return;
+
+  MachineFrameInfo &MFI = MF.getFrameInfo();
+
+  auto emitForBlock = [&](MachineBasicBlock &MBB) {
+    std::vector<CalleeSavedInfo> CSIVec = MFI.getSaveCSInfo(&MBB);
+    if (CSIVec.empty())
+      return;
+
+    ArrayRef<CalleeSavedInfo> CSI = CSIVec;
+    const auto UnmanagedCSI = getUnmanagedCSI(MF, CSI);
+    if (UnmanagedCSI.empty())
+      return;
+
+    SmallVector<MachineInstr *, 8> SpillStores;
+    for (MachineInstr &MI : MBB) {
+      if (!MI.getFlag(MachineInstr::FrameSetup))
+        continue;
+      if (MI.getOpcode() == TargetOpcode::CFI_INSTRUCTION)
+        continue;
+      if (any_of(MI.operands(),
+                 [](const MachineOperand &MO) { return MO.isFI(); }))
+        SpillStores.push_back(&MI);
+    }
+
+    unsigned StoreIdx = 0;
+    for (const CalleeSavedInfo &CS : UnmanagedCSI) {
+      if (StoreIdx >= SpillStores.size())
+        break;
+
+      MachineInstr *Store = SpillStores[StoreIdx++];
+      MachineBasicBlock::iterator NextI = std::next(Store->getIterator());
+      if (NextI != MBB.end() &&
+          NextI->getOpcode() == TargetOpcode::CFI_INSTRUCTION)
+        continue;
+
+      int64_t Offset = MFI.getObjectOffset(CS.getFrameIdx());
+      CFIInstBuilder CFIBuilder(MBB, NextI, MachineInstr::FrameSetup);
+      CFIBuilder.buildOffset(CS.getReg(), Offset);
+    }
+  };
+
+  if (!MFI.getSavePoints().empty()) {
+    for (const auto &SavePoint : MFI.getSavePoints())
+      emitForBlock(*SavePoint.first);
+  } else {
+    for (MachineBasicBlock &MBB : MF)
+      emitForBlock(MBB);
+  }
 }
 
 static unsigned getCalleeSavedRVVNumRegs(const Register &BaseReg) {
@@ -2491,6 +2494,15 @@ bool RISCVFrameLowering::enableCSRSaveRestorePointsSplit() const {
         "-riscv-shrink-wrapping-dataflow and -riscv-save-csrs-early are "
         "mutually exclusive");
   return true;
+}
+
+void RISCVFrameLowering::getFrameBoundCalleeSaves(
+    const MachineFunction &MF, SmallVectorImpl<Register> &Regs) const {
+  // Match GCC RISC-V separate shrink-wrapping: never delay ra / hard FP.
+  // Delaying ra past a call clobbers the caller's return address.
+  Regs.push_back(RISCV::X1);
+  if (hasFP(MF))
+    Regs.push_back(RISCV::X8);
 }
 
 bool RISCVFrameLowering::canUseAsPrologue(const MachineBasicBlock &MBB) const {
