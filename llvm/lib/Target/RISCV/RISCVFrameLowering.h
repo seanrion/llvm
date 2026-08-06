@@ -75,6 +75,12 @@ public:
 
   bool enableShrinkWrapping(const MachineFunction &MF) const override;
   bool enableCSRSaveRestorePointsSplit() const override;
+
+  /// Prefer ShrinkWrapCFIFixup when multi-point CSR CFI is enabled: the
+  /// stock CFIFixup pass mistakes delayed spill FrameSetup CFI for the
+  /// real prologue.
+  bool enableCFIFixup(const MachineFunction &MF) const override;
+
   void getFrameBoundCalleeSaves(const MachineFunction &MF,
                                  SmallVectorImpl<Register> &Regs) const override;
 
