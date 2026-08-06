@@ -285,23 +285,20 @@ class ShrinkWrappingImpl {
       SRPoints.insert(Point);
     }
 
-    std::vector<MachineBasicBlock *> insertReg(
-        Register Reg, MachineBasicBlock *MBB,
-        std::optional<std::vector<MachineBasicBlock *>> SaveRestoreBlockList) {
+    /// Record that \p Reg is saved/restored in \p MBB. When
+    /// \p SaveRestoreBlockList is given, newly seen blocks are appended to it so
+    /// that the prolog/epilog placement sees every save/restore point.
+    void insertReg(Register Reg, MachineBasicBlock *MBB,
+                   std::vector<MachineBasicBlock *> *SaveRestoreBlockList) {
       assert(MBB && "MBB is nullptr");
       if (SRPoints.contains(MBB)) {
         SRPoints[MBB].push_back(CalleeSavedInfo(Reg));
-        if (SaveRestoreBlockList.has_value())
-          return SaveRestoreBlockList.value();
-        return std::vector<MachineBasicBlock *>();
+        return;
       }
       std::vector CSInfos{CalleeSavedInfo(Reg)};
       SRPoints.insert(std::make_pair(MBB, CSInfos));
-      if (SaveRestoreBlockList.has_value()) {
+      if (SaveRestoreBlockList)
         SaveRestoreBlockList->push_back(MBB);
-        return SaveRestoreBlockList.value();
-      }
-      return std::vector<MachineBasicBlock *>();
     }
 
     void print(raw_ostream &OS, const TargetRegisterInfo *TRI) const {
@@ -426,7 +423,10 @@ class ShrinkWrappingImpl {
   MachineBasicBlock *splitEdge(MachineBasicBlock *Pred,
                                MachineBasicBlock *Succ);
 
-  void setupCFG();
+  /// Split edges for save/restore points that need their own block. Returns
+  /// true if any new block was created, in which case the dominator trees are
+  /// stale and must be recomputed.
+  bool setupCFG();
 
   void setupSaveRestorePoints();
 
@@ -1541,17 +1541,51 @@ bool ShrinkWrappingImpl::run(MachineFunction &MF) {
     return false;
 
   placeSpillsAndRestores(MF);
-  setupCFG();
+
+  // Keep target-requested CSRs (e.g. ra / FP on RISC-V) with the frame setup
+  // rather than multi-point placement — matching GCC RISC-V separate
+  // shrink-wrapping. Pin saves to Entry and restores to ReturnBlocks (if any).
+  {
+    SmallVector<Register, 4> FrameBound;
+    MF.getSubtarget().getFrameLowering()->getFrameBoundCalleeSaves(MF,
+                                                                    FrameBound);
+    if (!FrameBound.empty()) {
+      AuxGraphNode *EntryNode = AuxillaryCFG.getNode(Entry);
+      for (Register Reg : FrameBound) {
+        if (!Reg || !UsedCSRegs.test(Reg.id()))
+          continue;
+        for (auto &KV : CSRSave)
+          KV.second.reset(Reg.id());
+        for (auto &KV : CSRRestore)
+          KV.second.reset(Reg.id());
+        CSRSave[EntryNode].set(Reg.id());
+        for (MachineBasicBlock *RB : ReturnBlocks)
+          CSRRestore[AuxillaryCFG.getNode(RB)].set(Reg.id());
+      }
+    }
+  }
+
+  if (setupCFG()) {
+    // setupCFG() splits edges and creates new blocks; rebuild dominators for
+    // any subsequent queries / verification.
+    MDT->recalculate(MF);
+    MPDT->recalculate(MF);
+  }
   verifySpillRestorePlacement();
 
+  // Drop stack-use pollution from calculateSets(); Save/Restore lists must
+  // come only from CSR placement.
+  SaveBlocks.clear();
+  RestoreBlocks.clear();
   setupSaveRestorePoints();
-  Prolog = SaveBlocks.empty()
-               ? nullptr
-               : MDT->findNearestCommonDominator(iterator_range(SaveBlocks));
-  Epilog =
-      RestoreBlocks.empty()
-          ? nullptr
-          : MPDT->findNearestCommonDominator(iterator_range(RestoreBlocks));
+
+  // GCC-like policy: do NOT shrink the stack frame (addi sp). PEI keeps
+  // Prolog/Epilog at entry/returns when enableCSRSaveRestorePointsSplit() is
+  // on. This pass only chooses multi-point CSR save/restore for non-frame-bound
+  // registers. Full frame layout (all CSR slots + locals) is finalized later
+  // in PEI before spills get concrete offsets.
+  Prolog = nullptr;
+  Epilog = nullptr;
 
   if (SavePoints.areMultiple() || RestorePoints.areMultiple()) {
     ++NumFuncWithSplitting;
@@ -1565,8 +1599,8 @@ bool ShrinkWrappingImpl::run(MachineFunction &MF) {
   LLVM_DEBUG(dbgs() << "RestorePoints:\n");
   LLVM_DEBUG(RestorePoints.dump(TRI));
 
-  MFI.setProlog(Prolog);
-  MFI.setEpilog(Epilog);
+  MFI.setProlog(nullptr);
+  MFI.setEpilog(nullptr);
   if (!SavePoints.get().empty() && !RestorePoints.get().empty()) {
     MFI.setSavePoints(SavePoints.get());
     MFI.setRestorePoints(RestorePoints.get());
@@ -1629,7 +1663,8 @@ MachineBasicBlock *ShrinkWrappingImpl::splitEdge(MachineBasicBlock *Pred,
   return NewBB;
 }
 
-void ShrinkWrappingImpl::setupCFG() {
+bool ShrinkWrappingImpl::setupCFG() {
+  bool SplitAnyEdge = false;
   for (auto &[Node, Regs] : CSRSave) {
     if (!Regs.empty() && !Node->MatchMBB) {
       assert(Node->pred_size() == 1 &&
@@ -1639,6 +1674,7 @@ void ShrinkWrappingImpl::setupCFG() {
       MachineBasicBlock *NewBB = splitEdge((*Node->pred_begin())->MatchMBB,
                                            (*Node->succ_begin())->MatchMBB);
       Node->MatchMBB = NewBB;
+      SplitAnyEdge = true;
     }
   }
 
@@ -1651,18 +1687,20 @@ void ShrinkWrappingImpl::setupCFG() {
       MachineBasicBlock *NewBB = splitEdge((*Node->pred_begin())->MatchMBB,
                                            (*Node->succ_begin())->MatchMBB);
       Node->MatchMBB = NewBB;
+      SplitAnyEdge = true;
     }
   }
+  return SplitAnyEdge;
 }
 
 void ShrinkWrappingImpl::setupSaveRestorePoints() {
   for (auto &[Node, Regs] : CSRSave) {
     for (Register Reg : Regs)
-      SavePoints.insertReg(Reg, Node->MatchMBB, SaveBlocks);
+      SavePoints.insertReg(Reg, Node->MatchMBB, &SaveBlocks);
   }
   for (auto &[Node, Regs] : CSRRestore) {
     for (Register Reg : Regs)
-      RestorePoints.insertReg(Reg, Node->MatchMBB, RestoreBlocks);
+      RestorePoints.insertReg(Reg, Node->MatchMBB, &RestoreBlocks);
   }
 }
 
