@@ -5,7 +5,7 @@
 ; stack object + call in a goto loop. Under GCC-like data-flow shrink-wrapping,
 ; addi sp stays at entry/exit; CSR restore must NOT appear on the backedge
 ; between call sink and the branch that re-enters the loop.
-; Restores after noreturn_exit (unreachable) are fine.
+; Noreturn exits must also NOT get CSR restore / .cfi_restore (M5b).
 
 declare void @sink(ptr)
 declare void @noreturn_exit() noreturn
@@ -19,8 +19,9 @@ define void @loop_with_stack_obj(i32 %i) {
 ; CHECK-NOT:   ld {{ra|s[0-9]+}},
 ; CHECK-NOT:   addi sp, sp, {{([1-9][0-9]*|0x[0-9a-fA-F]+)}}
 ; CHECK:       {{bne|beq|bnez|beqz|j|jal}}
-; Exit path may still emit epilogue after noreturn (unreachable).
 ; CHECK:       call noreturn_exit
+; CHECK-NOT:   ld {{ra|s[0-9]+}},
+; CHECK-NOT:   .cfi_restore
 entry:
   %t = alloca [56 x i8], align 8
   br label %again
