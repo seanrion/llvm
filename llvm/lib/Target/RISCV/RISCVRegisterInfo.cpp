@@ -539,9 +539,10 @@ bool RISCVRegisterInfo::eliminateFrameIndexInMI(MachineInstr &MI, int SPAdj,
   Register FrameReg;
   StackOffset Offset =
       getFrameLowering(MF)->getFrameIndexReference(MF, FrameIndex, FrameReg);
-  // Historically RISC-V ignored SPAdj (and asserted it was 0). Only apply it
-  // under multi-point shrink-wrapping, where PEI may pass a non-zero CSI
-  // adjustment for spills outside the prolog/epilog.
+  // Historically RISC-V ignored SPAdj (and asserted it was 0). Under data-flow
+  // shrink-wrapping the full frame is still allocated at entry; PEI may pass a
+  // non-zero CSI SPA for delayed spills when FirstSPAdjustAmount splits the
+  // initial addi sp (large frames).
   if (getFrameLowering(MF)->enableCSRSaveRestorePointsSplit())
     Offset += StackOffset::getFixed(SPAdj);
   bool IsRVVSpill = RISCV::isRVVSpill(MI);
@@ -654,8 +655,8 @@ bool RISCVRegisterInfo::eliminateFrameIndexInMI(MachineInstr &MI, int SPAdj,
 bool RISCVRegisterInfo::eliminateFrameIndex(MachineBasicBlock::iterator II,
                                             int SPAdj, unsigned FIOperandNum,
                                             RegScavenger *RS) const {
-  // Non-zero SPAdj is used for CSR spills outside the prolog/epilog under
-  // multi-point shrink-wrapping (split SP adjustment).
+  // Non-zero SPAdj: delayed CSR spills under data-flow shrink-wrapping when
+  // FirstSPAdjustAmount is non-zero (not a separate "split SP" frame policy).
   MachineInstr &MI = *II;
   MachineBasicBlock &MBB = *MI.getParent();
   if (!MI.isBundle())
