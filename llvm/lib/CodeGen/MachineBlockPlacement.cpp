@@ -37,6 +37,7 @@
 #include "llvm/Analysis/ProfileSummaryInfo.h"
 #include "llvm/CodeGen/MBFIWrapper.h"
 #include "llvm/CodeGen/MachineBasicBlock.h"
+#include "llvm/CodeGen/MachineFrameInfo.h"
 #include "llvm/CodeGen/MachineBlockFrequencyInfo.h"
 #include "llvm/CodeGen/MachineBranchProbabilityInfo.h"
 #include "llvm/CodeGen/MachineFunction.h"
@@ -645,6 +646,9 @@ public:
 
   bool runOnMachineFunction(MachineFunction &MF) override {
     if (skipFunction(MF.getFunction()))
+      return false;
+
+    if (MF.getFrameInfo().getProlog())
       return false;
 
     auto *MBPI =

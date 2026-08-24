@@ -57,6 +57,7 @@
 #include "llvm/ADT/Statistic.h"
 #include "llvm/ADT/iterator_range.h"
 #include "llvm/CodeGen/MachineBasicBlock.h"
+#include "llvm/CodeGen/MachineFrameInfo.h"
 #include "llvm/CodeGen/MachineFunction.h"
 #include "llvm/CodeGen/MachineFunctionPass.h"
 #include "llvm/CodeGen/MachineInstr.h"
@@ -1570,6 +1571,9 @@ void MachineCopyPropagation::EliminateSpillageCopies(MachineBasicBlock &MBB) {
 
 bool MachineCopyPropagationLegacy::runOnMachineFunction(MachineFunction &MF) {
   if (skipFunction(MF.getFunction()))
+    return false;
+
+  if (MF.getFrameInfo().getProlog())
     return false;
 
   return MachineCopyPropagation(UseCopyInstr).run(MF);

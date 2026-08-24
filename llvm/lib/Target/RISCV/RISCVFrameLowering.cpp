@@ -2507,6 +2507,22 @@ bool RISCVFrameLowering::enableCFIFixup(const MachineFunction &MF) const {
   return TargetFrameLowering::enableCFIFixup(MF);
 }
 
+void RISCVFrameLowering::resetCFIToInitialState(
+    MachineBasicBlock &MBB) const {
+  MachineFunction &MF = *MBB.getParent();
+
+  // Only emit reset CFI when shrink-frame is active (Prolog != entry).
+  // Without shrink-frame, the existing remember/restore mechanism handles CFI.
+  if (!MF.getFrameInfo().getProlog())
+    return;
+
+  const TargetInstrInfo &TII = *MF.getSubtarget().getInstrInfo();
+  unsigned CFIIndex = MF.addFrameInst(MCCFIInstruction::cfiDefCfa(
+      nullptr, STI.getRegisterInfo()->getDwarfRegNum(SPReg, true), 0));
+  BuildMI(MBB, MBB.begin(), DebugLoc(), TII.get(TargetOpcode::CFI_INSTRUCTION))
+      .addCFIIndex(CFIIndex);
+}
+
 void RISCVFrameLowering::getFrameBoundCalleeSaves(
     const MachineFunction &MF, SmallVectorImpl<Register> &Regs) const {
   // Match GCC RISC-V separate shrink-wrapping: never delay ra / hard FP.

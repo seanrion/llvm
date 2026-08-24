@@ -81,6 +81,8 @@ public:
   /// real prologue.
   bool enableCFIFixup(const MachineFunction &MF) const override;
 
+  void resetCFIToInitialState(MachineBasicBlock &MBB) const override;
+
   void getFrameBoundCalleeSaves(const MachineFunction &MF,
                                  SmallVectorImpl<Register> &Regs) const override;
 

@@ -998,9 +998,11 @@ bool ShrinkWrapLegacy::runOnMachineFunction(MachineFunction &MF) {
       !ShrinkWrapImpl::isShrinkWrapEnabled(MF))
     return false;
 
-  // If the data-flow ShrinkWrapping pass already placed save/restore points,
-  // do not override them with single-point placement.
+  // If the data-flow ShrinkWrapping pass already placed save/restore points
+  // or a shrink-frame Prolog, do not override.
   if (!MF.getFrameInfo().getSavePoints().empty())
+    return false;
+  if (MF.getFrameInfo().getProlog())
     return false;
 
   MachineDominatorTree *MDT =
@@ -1020,6 +1022,9 @@ PreservedAnalyses ShrinkWrapPass::run(MachineFunction &MF,
                                       MachineFunctionAnalysisManager &MFAM) {
   MFPropsModifier _(*this, MF);
   if (MF.empty() || !ShrinkWrapImpl::isShrinkWrapEnabled(MF))
+    return PreservedAnalyses::all();
+  if (!MF.getFrameInfo().getSavePoints().empty() ||
+      MF.getFrameInfo().getProlog())
     return PreservedAnalyses::all();
 
   MachineDominatorTree &MDT = MFAM.getResult<MachineDominatorTreeAnalysis>(MF);

@@ -36,6 +36,7 @@
 
 #include "llvm/CodeGen/ShrinkWrapping.h"
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/DepthFirstIterator.h"
 #include "llvm/ADT/GraphTraits.h"
 #include "llvm/ADT/PostOrderIterator.h"
@@ -76,6 +77,7 @@ using namespace llvm;
 
 STATISTIC(numSRReduced, "Number of CSR spills+restores reduced.");
 STATISTIC(NumFunc, "Number of functions");
+STATISTIC(NumShrinkFrame, "Number of functions with frame shrunk to non-entry");
 STATISTIC(NumNotSaveOrRestore,
           "Number of cases, in which one of the sets are empty.");
 STATISTIC(NumCandidates, "Number of shrink-wrapping candidates");
@@ -89,6 +91,10 @@ static cl::opt<cl::boolOrDefault>
 static cl::opt<bool> EnableShrinkWrappingSplitOpt(
     "enable-shrink-wrapping-into-multiple-points", cl::init(false), cl::Hidden,
     cl::desc("enable splitting of the save and restore blocks if possible"));
+
+static cl::opt<bool> DisableShrinkFrame(
+    "disable-shrink-frame", cl::init(false), cl::Hidden,
+    cl::desc("Disable moving stack frame setup from entry to a later block"));
 
 // Debugging level for shrink wrapping.
 enum ShrinkWrappingDebugLevel { Disabled, BasicInfo, Iterations, Details };
@@ -432,6 +438,14 @@ class ShrinkWrappingImpl {
   bool setupCFG();
 
   void setupSaveRestorePoints();
+
+  /// Determine whether a block requires a stack frame (has calls, FI uses,
+  /// or defs of ra/FP/SP).
+  bool blockNeedsFrame(const MachineBasicBlock &MBB) const;
+
+  /// Move frame setup from entry to the nearest common dominator of all
+  /// frame-requiring blocks. Returns true if a non-entry Prolog was chosen.
+  bool runShrinkFrame(MachineFunction &MF);
 
   void findFastExitPath();
 
@@ -1482,6 +1496,141 @@ void ShrinkWrappingImpl::placeSpillsAndRestores(MachineFunction &Fn) {
   });
 }
 
+bool ShrinkWrappingImpl::blockNeedsFrame(const MachineBasicBlock &MBB) const {
+  const TargetInstrInfo *TII = MachineFunc->getSubtarget().getInstrInfo();
+  const TargetRegisterInfo *TRI = MachineFunc->getSubtarget().getRegisterInfo();
+  Register StackPtr =
+      MachineFunc->getSubtarget().getTargetLowering()
+          ->getStackPointerRegisterToSaveRestore();
+  Register FramePtr = TRI->getFrameRegister(*MachineFunc);
+
+  for (const MachineInstr &MI : MBB) {
+    if (MI.isDebugInstr())
+      continue;
+
+    for (const MachineOperand &MO : MI.operands()) {
+      if (MO.isFI())
+        return true;
+    }
+
+    if (MI.isCall() && !TII->isTailCall(MI))
+      return true;
+
+    if (StackPtr && MI.modifiesRegister(StackPtr, TRI))
+      return true;
+    if (FramePtr && MI.modifiesRegister(FramePtr, TRI))
+      return true;
+
+    if (MI.getOpcode() == TargetOpcode::STATEPOINT ||
+        MI.getOpcode() == TargetOpcode::STACKMAP ||
+        MI.getOpcode() == TargetOpcode::PATCHPOINT)
+      return true;
+  }
+  return false;
+}
+
+bool ShrinkWrappingImpl::runShrinkFrame(MachineFunction &MF) {
+  if (DisableShrinkFrame)
+    return false;
+
+  const TargetFrameLowering *TFI = MF.getSubtarget().getFrameLowering();
+  MachineFrameInfo &MFI = MF.getFrameInfo();
+
+  // Bail-out conditions: these functions cannot have their frame shrunk.
+  const Function &F = MF.getFunction();
+  if (F.hasFnAttribute(Attribute::Naked) ||
+      F.hasFnAttribute(Attribute::NoReturn) ||
+      F.hasFnAttribute(Attribute::OptimizeNone) ||
+      MFI.hasVarSizedObjects() ||
+      MFI.hasOpaqueSPAdjustment() ||
+      MF.getFunction().getCallingConv() == CallingConv::GHC ||
+      MF.hasEHFunclets() ||
+      F.hasFnAttribute(Attribute::SanitizeAddress) ||
+      F.hasFnAttribute(Attribute::SanitizeThread) ||
+      F.hasFnAttribute(Attribute::SanitizeMemory) ||
+      F.hasFnAttribute(Attribute::SanitizeHWAddress))
+    return false;
+
+  // Check for EH pads (already checked by caller for irreducible CFG).
+  for (const MachineBasicBlock &MBB : MF) {
+    if (MBB.isEHPad() || MBB.isEHFuncletEntry())
+      return false;
+  }
+
+  // Collect all blocks that need a frame.
+  SmallVector<MachineBasicBlock *, 16> FrameBlocks;
+  for (MachineBasicBlock &MBB : MF) {
+    if (blockNeedsFrame(MBB))
+      FrameBlocks.push_back(&MBB);
+  }
+
+  // If no block needs a frame, nothing to do.
+  if (FrameBlocks.empty())
+    return false;
+
+  // If entry itself needs a frame, no benefit from shrinking.
+  if (FrameBlocks.size() == 1 && FrameBlocks[0] == Entry)
+    return false;
+
+  // Compute NCD (nearest common dominator) of all frame-needing blocks.
+  MachineBasicBlock *P = FrameBlocks[0];
+  for (unsigned I = 1, E = FrameBlocks.size(); I < E; ++I) {
+    P = MDT->findNearestCommonDominator(P, FrameBlocks[I]);
+    if (!P)
+      break;
+  }
+
+  if (!P || P == Entry)
+    return false;
+
+  // Prolog must not be inside a loop — lift to preheader, repeating for nested
+  // loops until P is outside every loop (a single lift can leave P inside an
+  // outer loop's body).
+  while (MachineLoop *L = MLI->getLoopFor(P)) {
+    MachineBasicBlock *PH = L->getLoopPreheader();
+    if (!PH || PH == Entry)
+      return false;
+    P = PH;
+    if (P == Entry)
+      return false;
+  }
+
+  // Verify no "mixed SP" convergence: a return reachable from Prolog but not
+  // dominated by it means a framed path shares a frameless epilogue (no ld ra /
+  // addi). Classic symptom: call clobbers ra, ret jumps to the post-call insn
+  // → infinite loop (502.gcc is_gimple_invariant_address). Checking only
+  // "P dominates a predecessor of the return" misses joins where the
+  // immediate predecessor is itself a merge of framed and frameless paths.
+  for (MachineBasicBlock &MBB : MF) {
+    if (!MBB.isReturnBlock())
+      continue;
+    if (MDT->dominates(P, &MBB))
+      continue;
+    // Frameless return: must not be reachable from P.
+    for (auto DI = df_begin(P), DE = df_end(P); DI != DE; ++DI) {
+      if (*DI == &MBB) {
+        LLVM_DEBUG(dbgs() << "Shrink-frame bail: return "
+                          << printMBBReference(MBB)
+                          << " reachable from Prolog "
+                          << printMBBReference(*P)
+                          << " but not dominated by it\n");
+        return false;
+      }
+    }
+  }
+
+  // Check canUseAsPrologue (target hook).
+  if (!TFI->canUseAsPrologue(*P))
+    return false;
+
+  LLVM_DEBUG(dbgs() << "Shrink-frame: setting Prolog to "
+                    << printMBBReference(*P) << "\n");
+
+  MFI.setProlog(P);
+  ++NumShrinkFrame;
+  return true;
+}
+
 bool ShrinkWrappingImpl::run(MachineFunction &MF) {
   LLVM_DEBUG(dbgs() << "**** Analysing " << MF.getName() << '\n');
 
@@ -1531,6 +1680,10 @@ bool ShrinkWrappingImpl::run(MachineFunction &MF) {
                              "JumpTables are not supported yet.",
                              MF.getFunction().getSubprogram(), &MF.front());
 
+  // Attempt to shrink the stack frame setup to a later block.
+  // This must run before calculateSets/Chow since it sets the Prolog.
+  runShrinkFrame(MF);
+
   createAuxillaryCFG();
 
   // Initially, conservatively assume that stack addresses can be used in each
@@ -1539,33 +1692,88 @@ bool ShrinkWrappingImpl::run(MachineFunction &MF) {
   StackAddressUsedBlockInfo.resize(MF.getNumBlockIDs(), true);
   bool HasCandidates = calculateSets(MF, RPOT, RS.get());
   StackAddressUsedBlockInfo.clear();
-  if (!HasCandidates)
-    return false;
+  if (!HasCandidates) {
+    // If shrink-frame placed a Prolog but Chow found no CSR candidates,
+    // check if there are delayed (non-frame-bound) CSRs. If so, PEI would
+    // place saves in entry (no frame) → rollback.
+    if (MFI.getProlog()) {
+      SmallVector<Register, 4> FrameBound;
+      MF.getSubtarget().getFrameLowering()->getFrameBoundCalleeSaves(
+          MF, FrameBound);
+      SmallDenseSet<unsigned, 4> FrameBoundSet;
+      for (Register R : FrameBound)
+        if (R)
+          FrameBoundSet.insert(R.id());
+
+      bool HasDelayedCSR = false;
+      for (unsigned Reg : UsedCSRegs) {
+        if (!FrameBoundSet.count(Reg)) {
+          HasDelayedCSR = true;
+          break;
+        }
+      }
+      if (HasDelayedCSR) {
+        LLVM_DEBUG(dbgs() << "Shrink-frame rollback: Chow failed with "
+                             "delayed CSRs present\n");
+        MFI.setProlog(nullptr);
+      }
+    }
+    return MFI.getProlog() != nullptr;
+  }
 
   placeSpillsAndRestores(MF);
 
-  // Keep target-requested CSRs (e.g. ra / FP on RISC-V) with the frame setup
-  // rather than multi-point placement — matching GCC RISC-V separate
-  // shrink-wrapping. Pin saves to Entry and restores to ReturnBlocks (if any).
-  {
+  // Frame-bound CSRs (ra / hard FP on RISC-V): never delay as separate
+  // components — match GCC TARGET_SHRINK_WRAP_GET_SEPARATE_COMPONENTS.
+  // Important: MRI.isPhysRegModified(ra) can be false around calls because the
+  // ABI regmask treats ra as preserved; PEI still spills ra when hasCalls.
+  // Leaf functions may still use ra as a scratch GPR after a conditional save
+  // (scale_bitcount) — pin whenever Chow already placed a save, or hasCalls /
+  // determineCalleeSaves / isPhysRegModified says so.
+  auto PinFrameBoundCSRs = [&]() {
+    const TargetFrameLowering *TFI = MF.getSubtarget().getFrameLowering();
     SmallVector<Register, 4> FrameBound;
-    MF.getSubtarget().getFrameLowering()->getFrameBoundCalleeSaves(MF,
-                                                                    FrameBound);
-    if (!FrameBound.empty()) {
-      AuxGraphNode *EntryNode = AuxillaryCFG.getNode(Entry);
-      for (Register Reg : FrameBound) {
-        if (!Reg || !UsedCSRegs.test(Reg.id()))
-          continue;
-        for (auto &KV : CSRSave)
-          KV.second.reset(Reg.id());
-        for (auto &KV : CSRRestore)
-          KV.second.reset(Reg.id());
-        CSRSave[EntryNode].set(Reg.id());
-        for (MachineBasicBlock *RB : ReturnBlocks)
+    TFI->getFrameBoundCalleeSaves(MF, FrameBound);
+    if (FrameBound.empty())
+      return;
+
+    MachineBasicBlock *SFProlog = MFI.getProlog();
+    MachineBasicBlock *PinBlock = SFProlog ? SFProlog : Entry;
+    AuxGraphNode *PinNode = AuxillaryCFG.getNode(PinBlock);
+    const MachineRegisterInfo &MRI = MF.getRegInfo();
+    BitVector PinSavedRegs;
+    TFI->determineCalleeSaves(MF, PinSavedRegs, RS.get());
+    const bool HasCalls = MFI.hasCalls();
+
+    for (Register Reg : FrameBound) {
+      if (!Reg)
+        continue;
+      bool ShouldPin = HasCalls || PinSavedRegs.test(Reg.id()) ||
+                       UsedCSRegs.test(Reg.id()) ||
+                       MRI.isPhysRegModified(Reg);
+      if (!ShouldPin) {
+        for (const auto &[Node, Saves] : CSRSave) {
+          if (Saves.test(Reg.id())) {
+            ShouldPin = true;
+            break;
+          }
+        }
+      }
+      if (!ShouldPin)
+        continue;
+      for (auto &KV : CSRSave)
+        KV.second.reset(Reg.id());
+      for (auto &KV : CSRRestore)
+        KV.second.reset(Reg.id());
+      CSRSave[PinNode].set(Reg.id());
+      for (MachineBasicBlock *RB : ReturnBlocks) {
+        if (!SFProlog || MDT->dominates(SFProlog, RB))
           CSRRestore[AuxillaryCFG.getNode(RB)].set(Reg.id());
       }
     }
-  }
+  };
+
+  PinFrameBoundCSRs();
 
   // Drop restores on noreturn exits (no ld/CFI after throw/abort/exit — that
   // poisons FDE at the call RA). Rehome per-CSR only onto ReturnBlocks that
@@ -1592,26 +1800,6 @@ bool ShrinkWrappingImpl::run(MachineFunction &MF) {
     }
     return false;
   };
-
-  auto CollectReachableReturns =
-      [&](MachineBasicBlock *Start,
-          SmallPtrSetImpl<MachineBasicBlock *> &Out) {
-        SmallVector<MachineBasicBlock *, 16> Work;
-        SmallPtrSet<MachineBasicBlock *, 16> Visited;
-        Work.push_back(Start);
-        Visited.insert(Start);
-        while (!Work.empty()) {
-          MachineBasicBlock *BB = Work.pop_back_val();
-          if (BB->isReturnBlock() && !ContainsNoReturnCall(*BB))
-            Out.insert(BB);
-          // Paths past noreturn never return to the caller.
-          if (ContainsNoReturnCall(*BB))
-            continue;
-          for (MachineBasicBlock *Succ : BB->successors())
-            if (Visited.insert(Succ).second)
-              Work.push_back(Succ);
-        }
-      };
 
   CSRegSet ClearedRegs;
   for (auto &KV : CSRRestore) {
@@ -1650,7 +1838,12 @@ bool ShrinkWrappingImpl::run(MachineFunction &MF) {
       if (!SKV.second.test(Reg) || !SKV.first->MatchMBB)
         continue;
       AnySave = true;
-      CollectReachableReturns(SKV.first->MatchMBB, Targets);
+      // Dominates, not reachable — see path-sensitive restore comment below.
+      for (MachineBasicBlock *RB : ReturnBlocks) {
+        if (!ContainsNoReturnCall(*RB) &&
+            MDT->dominates(SKV.first->MatchMBB, RB))
+          Targets.insert(RB);
+      }
     }
     // No save recorded: keep ABI safe (e.g. frame-bound race) on all returns.
     if (!AnySave) {
@@ -1661,12 +1854,72 @@ bool ShrinkWrappingImpl::run(MachineFunction &MF) {
       CSRRestore[AuxillaryCFG.getNode(RB)].set(Reg);
   }
 
+  // Path-sensitive restores on *return blocks* only:
+  // Drop restore at return R when the single save does not dominate R
+  // (early-exit / diamond: ray Sphere::intersect bb.10). Skip frame-bound
+  // CSRs — they are re-pinned below.
+  {
+    SmallDenseSet<unsigned, 4> FrameBoundSet;
+    SmallVector<Register, 4> FrameBound;
+    MF.getSubtarget().getFrameLowering()->getFrameBoundCalleeSaves(MF,
+                                                                     FrameBound);
+    for (Register R : FrameBound)
+      if (R)
+        FrameBoundSet.insert(R.id());
+
+    for (unsigned Reg : UsedCSRegs) {
+      if (FrameBoundSet.count(Reg))
+        continue;
+      SmallVector<MachineBasicBlock *, 4> SaveBBs;
+      for (const auto &[Node, Saves] : CSRSave) {
+        if (!Saves.test(Reg) || !Node->MatchMBB)
+          continue;
+        SaveBBs.push_back(Node->MatchMBB);
+      }
+      if (SaveBBs.size() != 1)
+        continue;
+
+      MachineBasicBlock *S = SaveBBs[0];
+      for (auto &[Node, Restores] : CSRRestore) {
+        if (!Restores.test(Reg))
+          continue;
+        MachineBasicBlock *MBB = Node->MatchMBB;
+        if (!MBB || !MBB->isReturnBlock())
+          continue;
+        if (!MDT->dominates(S, MBB))
+          Restores.reset(Reg);
+      }
+    }
+  }
+
+  // Re-pin after path-sensitive / noreturn cleanup.
+  PinFrameBoundCSRs();
+
   if (setupCFG()) {
     // setupCFG() splits edges and creates new blocks; rebuild dominators for
     // any subsequent queries / verification.
     MDT->recalculate(MF);
     MPDT->recalculate(MF);
   }
+
+  // Clamp: when shrink-frame is active, all CSR save points must be in blocks
+  // dominated by Prolog. A save in a no-frame block would execute sd before
+  // addi sp — corrupting the stack.
+  if (MachineBasicBlock *SFP = MFI.getProlog()) {
+    for (const auto &[Node, Regs] : CSRSave) {
+      if (Regs.empty() || !Node->MatchMBB)
+        continue;
+      if (!MDT->dominates(SFP, Node->MatchMBB)) {
+        LLVM_DEBUG(dbgs() << "Clamp fail: CSR save in "
+                          << printMBBReference(*Node->MatchMBB)
+                          << " not dominated by Prolog "
+                          << printMBBReference(*SFP) << " — rolling back\n");
+        MFI.setProlog(nullptr);
+        break;
+      }
+    }
+  }
+
   verifySpillRestorePlacement();
 
   // Drop stack-use pollution from calculateSets(); Save/Restore lists must
@@ -1675,13 +1928,72 @@ bool ShrinkWrappingImpl::run(MachineFunction &MF) {
   RestoreBlocks.clear();
   setupSaveRestorePoints();
 
-  // GCC-like policy: do NOT shrink the stack frame (addi sp). PEI keeps
-  // Prolog/Epilog at entry/returns when enableCSRSaveRestorePointsSplit() is
-  // on. This pass only chooses multi-point CSR save/restore for non-frame-bound
-  // registers. Full frame layout (all CSR slots + locals) is finalized later
-  // in PEI before spills get concrete offsets.
-  Prolog = nullptr;
-  Epilog = nullptr;
+  // Final enforcement on concrete Save/Restore maps (after edge splits).
+  // Guarantees ra/FP cannot remain on a delayed save point (pr51933,
+  // consumer-lame scale_bitcount). Do NOT gate on hasCalls(): leaf functions
+  // may still allocate ra as a GPR scratch after a conditional sd ra; the
+  // shared epilogue then rets with a clobbered ra and no ld (jump to 0).
+  {
+    const TargetFrameLowering *TFI = MF.getSubtarget().getFrameLowering();
+    SmallVector<Register, 4> FrameBound;
+    TFI->getFrameBoundCalleeSaves(MF, FrameBound);
+    if (!FrameBound.empty()) {
+      MachineBasicBlock *PinBlock =
+          MFI.getProlog() ? MFI.getProlog() : Entry;
+      auto &SP = SavePoints.get();
+      auto &RP = RestorePoints.get();
+      BitVector PinSavedRegs;
+      TFI->determineCalleeSaves(MF, PinSavedRegs, RS.get());
+      const MachineRegisterInfo &MRI = MF.getRegInfo();
+
+      for (Register Reg : FrameBound) {
+        if (!Reg)
+          continue;
+
+        bool InSavePoints = false;
+        for (const auto &KV : SP) {
+          if (any_of(KV.second, [&](const CalleeSavedInfo &C) {
+                return C.getReg() == Reg.id();
+              })) {
+            InSavePoints = true;
+            break;
+          }
+        }
+        const bool ShouldPin =
+            InSavePoints || MFI.hasCalls() || PinSavedRegs.test(Reg.id()) ||
+            UsedCSRegs.test(Reg.id()) || MRI.isPhysRegModified(Reg);
+        if (!ShouldPin)
+          continue;
+
+        // Strip from every block, then pin to frame prolog + returns.
+        for (auto &KV : SP) {
+          auto &CSIs = KV.second;
+          llvm::erase_if(CSIs, [&](const CalleeSavedInfo &C) {
+            return C.getReg() == Reg.id();
+          });
+        }
+        for (auto &KV : RP) {
+          auto &CSIs = KV.second;
+          llvm::erase_if(CSIs, [&](const CalleeSavedInfo &C) {
+            return C.getReg() == Reg.id();
+          });
+        }
+        SavePoints.insertReg(Reg, PinBlock, &SaveBlocks);
+        for (MachineBasicBlock *RB : ReturnBlocks) {
+          if (!MFI.getProlog() || MDT->dominates(MFI.getProlog(), RB))
+            RestorePoints.insertReg(Reg, RB, &RestoreBlocks);
+        }
+      }
+    }
+  }
+
+  // When shrink-frame is not active, PEI keeps Prolog/Epilog at entry/returns.
+  // When shrink-frame placed a Prolog, preserve it for PEI.
+  MachineBasicBlock *ShrinkFrameProlog = MFI.getProlog();
+  if (!ShrinkFrameProlog) {
+    Prolog = nullptr;
+    Epilog = nullptr;
+  }
 
   if (SavePoints.areMultiple() || RestorePoints.areMultiple()) {
     ++NumFuncWithSplitting;
@@ -1695,7 +2007,8 @@ bool ShrinkWrappingImpl::run(MachineFunction &MF) {
   LLVM_DEBUG(dbgs() << "RestorePoints:\n");
   LLVM_DEBUG(RestorePoints.dump(TRI));
 
-  MFI.setProlog(nullptr);
+  if (!ShrinkFrameProlog)
+    MFI.setProlog(nullptr);
   MFI.setEpilog(nullptr);
   if (!SavePoints.get().empty() && !RestorePoints.get().empty()) {
     MFI.setSavePoints(SavePoints.get());

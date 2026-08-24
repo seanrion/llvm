@@ -3491,6 +3491,41 @@ verifyConvergenceControl(const MachineFunction &MF, MachineDominatorTree &DT,
 }
 
 void MachineVerifier::visitMachineFunctionAfter() {
+  // Verify shrink-frame invariants when Prolog is set.
+  if (MachineBasicBlock *Prolog = MF->getFrameInfo().getProlog()) {
+    if (Prolog == &MF->front())
+      report("Shrink-frame Prolog must not be the entry block", MF);
+
+    bool Found = false;
+    for (const MachineBasicBlock &MBB : *MF) {
+      if (&MBB == Prolog) {
+        Found = true;
+        break;
+      }
+    }
+    if (!Found)
+      report("Shrink-frame Prolog block not found in function", MF);
+
+    // No-frame blocks (not dominated by Prolog) must not contain frame indices.
+    if (Found) {
+      MachineDominatorTree SFDomTree(*const_cast<MachineFunction *>(MF));
+      for (const MachineBasicBlock &MBB : *MF) {
+        if (SFDomTree.dominates(Prolog, &MBB))
+          continue;
+        for (const MachineInstr &MI : MBB) {
+          if (MI.isDebugInstr())
+            continue;
+          for (const MachineOperand &MO : MI.operands()) {
+            if (MO.isFI()) {
+              report("Frame index used in block not dominated by Prolog", &MI);
+              break;
+            }
+          }
+        }
+      }
+    }
+  }
+
   auto FailureCB = [this](const Twine &Message) {
     report(Message.str().c_str(), MF);
   };

@@ -56,6 +56,7 @@
 //===----------------------------------------------------------------------===//
 #include "llvm/CodeGen/MachineOutliner.h"
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/CodeGen/MachineFrameInfo.h"
 #include "llvm/ADT/SmallSet.h"
 #include "llvm/ADT/Statistic.h"
 #include "llvm/ADT/Twine.h"
@@ -1270,6 +1271,13 @@ void MachineOutliner::populateMapper(InstructionMapper &Mapper, Module &M) {
     // Function.
     if (!MF) {
       LLVM_DEBUG(dbgs() << "SKIP: Function does not have a MachineFunction\n");
+      continue;
+    }
+
+    // Skip functions with shrink-frame active to avoid outlining across
+    // frame/no-frame boundaries.
+    if (MF->getFrameInfo().getProlog()) {
+      LLVM_DEBUG(dbgs() << "SKIP: Function has shrink-frame Prolog\n");
       continue;
     }
 

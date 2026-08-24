@@ -14,6 +14,7 @@
 
 #include "RISCVInstrInfo.h"
 #include "RISCVSubtarget.h"
+#include "llvm/CodeGen/MachineFrameInfo.h"
 
 using namespace llvm;
 
@@ -95,6 +96,9 @@ bool RISCVLateBranchOpt::runOnBasicBlock(MachineBasicBlock &MBB) const {
 
 bool RISCVLateBranchOpt::runOnMachineFunction(MachineFunction &Fn) {
   if (skipFunction(Fn.getFunction()))
+    return false;
+
+  if (Fn.getFrameInfo().getProlog())
     return false;
 
   auto &ST = Fn.getSubtarget<RISCVSubtarget>();

@@ -30,6 +30,7 @@
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/iterator_range.h"
 #include "llvm/CodeGen/MachineBasicBlock.h"
+#include "llvm/CodeGen/MachineFrameInfo.h"
 #include "llvm/CodeGen/MachineFunction.h"
 #include "llvm/CodeGen/MachineInstrBuilder.h"
 #include "llvm/CodeGen/Passes.h"
@@ -65,17 +66,19 @@ static bool isPrologueCFIInstruction(const MachineInstr &MI) {
          MI.getFlag(MachineInstr::FrameSetup);
 }
 
-/// Prologue end = last FrameSetup CFI in the entry block (GCC-like full frame
-/// at entry under data-flow shrink-wrapping).
+/// Prologue end = last FrameSetup CFI in the prologue block.
+/// When shrink-frame is active, the prologue block is MFI.getProlog();
+/// otherwise it is the entry block.
 static MachineBasicBlock *
-findEntryPrologueEnd(MachineFunction &MF,
-                     MachineBasicBlock::iterator &PrologueEnd) {
-  MachineBasicBlock &Entry = MF.front();
-  for (MachineInstr &MI : reverse(Entry.instrs())) {
+findPrologueEnd(MachineFunction &MF,
+                MachineBasicBlock::iterator &PrologueEnd) {
+  MachineFrameInfo &MFI = MF.getFrameInfo();
+  MachineBasicBlock &PrologBB = MFI.getProlog() ? *MFI.getProlog() : MF.front();
+  for (MachineInstr &MI : reverse(PrologBB.instrs())) {
     if (!isPrologueCFIInstruction(MI))
       continue;
     PrologueEnd = std::next(MI.getIterator());
-    return &Entry;
+    return &PrologBB;
   }
   return nullptr;
 }
@@ -207,7 +210,8 @@ fixupBlock(MachineBasicBlock &CurrBB, const BlockFlagsVector &BlockInfo,
 
 bool ShrinkWrapCFIFixup::runOnMachineFunction(MachineFunction &MF) {
   const TargetFrameLowering *TFL = MF.getSubtarget().getFrameLowering();
-  if (!TFL->enableCSRSaveRestorePointsSplit())
+  if (!TFL->enableCSRSaveRestorePointsSplit() &&
+      !MF.getFrameInfo().getProlog())
     return false;
   if (!MF.needsFrameMoves() ||
       MF.getTarget().getMCAsmInfo()->usesWindowsCFI())
@@ -216,7 +220,7 @@ bool ShrinkWrapCFIFixup::runOnMachineFunction(MachineFunction &MF) {
     return false;
 
   MachineBasicBlock::iterator PrologueEnd;
-  MachineBasicBlock *PrologueBlock = findEntryPrologueEnd(MF, PrologueEnd);
+  MachineBasicBlock *PrologueBlock = findPrologueEnd(MF, PrologueEnd);
   if (!PrologueBlock)
     return false;
 

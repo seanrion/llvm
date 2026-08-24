@@ -712,6 +712,7 @@ struct MachineFrameInfo {
   bool HasTailCall = false;
   bool IsCalleeSavedInfoValid = false;
   unsigned LocalFrameSize = 0;
+  StringValue Prolog;
   std::vector<SaveRestorePointEntry> SavePoints;
   std::vector<SaveRestorePointEntry> RestorePoints;
 
@@ -734,6 +735,7 @@ struct MachineFrameInfo {
            HasMustTailInVarArgFunc == Other.HasMustTailInVarArgFunc &&
            HasTailCall == Other.HasTailCall &&
            LocalFrameSize == Other.LocalFrameSize &&
+           Prolog == Other.Prolog &&
            SavePoints == Other.SavePoints &&
            RestorePoints == Other.RestorePoints &&
            IsCalleeSavedInfoValid == Other.IsCalleeSavedInfoValid;
@@ -767,6 +769,7 @@ template <> struct MappingTraits<MachineFrameInfo> {
     YamlIO.mapOptional("isCalleeSavedInfoValid", MFI.IsCalleeSavedInfoValid,
                        false);
     YamlIO.mapOptional("localFrameSize", MFI.LocalFrameSize, (unsigned)0);
+    YamlIO.mapOptional("prolog", MFI.Prolog, StringValue());
     YamlIO.mapOptional("savePoint", MFI.SavePoints);
     YamlIO.mapOptional("restorePoint", MFI.RestorePoints);
   }

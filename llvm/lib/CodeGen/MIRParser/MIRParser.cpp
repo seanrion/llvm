@@ -872,6 +872,12 @@ bool MIRParserImpl::initializeFrameInfo(PerFunctionMIParsingState &PFS,
   MFI.setHasTailCall(YamlMFI.HasTailCall);
   MFI.setCalleeSavedInfoValid(YamlMFI.IsCalleeSavedInfoValid);
   MFI.setLocalFrameSize(YamlMFI.LocalFrameSize);
+  if (!YamlMFI.Prolog.Value.empty()) {
+    MachineBasicBlock *PrologMBB = nullptr;
+    if (parseMBBReference(PFS, PrologMBB, YamlMFI.Prolog))
+      return true;
+    MFI.setProlog(PrologMBB);
+  }
   llvm::SaveRestorePoints SavePoints;
   if (initializeSaveRestorePoints(PFS, YamlMFI.SavePoints, SavePoints))
     return true;
