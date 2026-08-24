@@ -18,6 +18,7 @@
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/CodeGen/TargetInstrInfo.h"
+#include <memory>
 #include <utility>
 #include <vector>
 
@@ -28,6 +29,7 @@ template <typename Fn> class function_ref;
 class MBFIWrapper;
 class MachineBasicBlock;
 class MachineBranchProbabilityInfo;
+class MachineDominatorTree;
 class MachineFunction;
 class MachineInstr;
 class MachineModuleInfo;
@@ -48,6 +50,11 @@ class TailDuplicator {
   bool LayoutMode;
   unsigned TailDupSize;
 
+  /// Dominator tree for shrink-frame region guards. Null when no Prolog.
+  std::unique_ptr<MachineDominatorTree> SFDomTree;
+  /// Set when CFG changes invalidate SFDomTree; cleared by ensureSFDomTree().
+  bool SFDomTreeDirty = false;
+
   // A list of virtual registers for which to update SSA form.
   SmallVector<Register, 16> SSAUpdateVRs;
 
@@ -58,6 +65,9 @@ class TailDuplicator {
   DenseMap<Register, AvailableValsTy> SSAUpdateVals;
 
 public:
+  TailDuplicator() = default;
+  LLVM_ABI ~TailDuplicator();
+
   /// Prepare to run on a specific machine function.
   /// @param MF - Function that will be processed
   /// @param PreRegAlloc - true if used before register allocation
@@ -96,6 +106,13 @@ public:
 
 private:
   using RegSubRegPair = TargetInstrInfo::RegSubRegPair;
+
+  void ensureSFDomTree();
+  void markSFDomTreeDirty();
+  /// True if TailBB must not be duplicated / merged into PredBB under
+  /// shrink-frame (also rejects PredBB → TailBB.successors edges).
+  bool shrinkFrameRejectTailDup(MachineBasicBlock *TailBB,
+                                MachineBasicBlock *PredBB);
 
   void addSSAUpdateEntry(Register OrigReg, Register NewReg,
                          MachineBasicBlock *BB);

@@ -21,6 +21,7 @@
 #include "llvm/ADT/Statistic.h"
 #include "llvm/CodeGen/MachineBasicBlock.h"
 #include "llvm/CodeGen/MachineBranchProbabilityInfo.h"
+#include "llvm/CodeGen/MachineDominators.h"
 #include "llvm/CodeGen/MachineFunction.h"
 #include "llvm/CodeGen/MachineInstr.h"
 #include "llvm/CodeGen/MachineInstrBuilder.h"
@@ -28,6 +29,7 @@
 #include "llvm/CodeGen/MachineRegisterInfo.h"
 #include "llvm/CodeGen/MachineSSAUpdater.h"
 #include "llvm/CodeGen/MachineSizeOpts.h"
+#include "llvm/CodeGen/ShrinkFrameUtils.h"
 #include "llvm/CodeGen/TargetInstrInfo.h"
 #include "llvm/CodeGen/TargetRegisterInfo.h"
 #include "llvm/CodeGen/TargetSubtargetInfo.h"
@@ -54,6 +56,8 @@ STATISTIC(NumTailDupRemoved,
           "Number of instructions removed due to tail duplication");
 STATISTIC(NumDeadBlocks, "Number of dead blocks removed");
 STATISTIC(NumAddedPHIs, "Number of phis added");
+STATISTIC(NumTailDupBlockedByFrameBoundary,
+          "Number of tail duplications blocked by shrink-frame region boundary");
 
 // Heuristic for tail duplication.
 static cl::opt<unsigned> TailDuplicateSize(
@@ -87,6 +91,8 @@ static cl::opt<bool>
 static cl::opt<unsigned> TailDupLimit("tail-dup-limit", cl::init(~0U),
                                       cl::Hidden);
 
+TailDuplicator::~TailDuplicator() = default;
+
 void TailDuplicator::initMF(MachineFunction &MFin, bool PreRegAlloc,
                             const MachineBranchProbabilityInfo *MBPIin,
                             MBFIWrapper *MBFIin,
@@ -105,6 +111,36 @@ void TailDuplicator::initMF(MachineFunction &MFin, bool PreRegAlloc,
 
   LayoutMode = LayoutModeIn;
   this->PreRegAlloc = PreRegAlloc;
+
+  SFDomTree.reset();
+  SFDomTreeDirty = false;
+  if (hasShrinkFrame(*MF))
+    SFDomTree = std::make_unique<MachineDominatorTree>(*MF);
+}
+
+void TailDuplicator::ensureSFDomTree() {
+  if (!SFDomTree || !SFDomTreeDirty)
+    return;
+  SFDomTree->recalculate(*MF);
+  SFDomTreeDirty = false;
+}
+
+void TailDuplicator::markSFDomTreeDirty() {
+  if (SFDomTree)
+    SFDomTreeDirty = true;
+}
+
+bool TailDuplicator::shrinkFrameRejectTailDup(MachineBasicBlock *TailBB,
+                                              MachineBasicBlock *PredBB) {
+  ensureSFDomTree();
+  if (!SFDomTree)
+    return false;
+  if (shrinkFrameGuardRejectTailDuplicate(*MF, *TailBB, *PredBB, *SFDomTree))
+    return true;
+  for (MachineBasicBlock *Succ : TailBB->successors())
+    if (shrinkFrameGuardRejectEdge(*MF, *PredBB, *Succ, *SFDomTree))
+      return true;
+  return false;
 }
 
 static void VerifyPHIs(MachineFunction &MF, bool CheckExtra) {
@@ -195,6 +231,7 @@ bool TailDuplicator::tailDuplicateAndUpdate(
     NumTailDupRemoved += MBB->size();
     removeDeadBlock(MBB, RemovalCallback);
     ++NumDeadBlocks;
+    markSFDomTreeDirty();
   }
 
   // Update SSA form.
@@ -277,6 +314,13 @@ bool TailDuplicator::tailDuplicateAndUpdate(
 /// eliminate (dynamic) branches.
 bool TailDuplicator::tailDuplicateBlocks() {
   bool MadeChange = false;
+
+  // Refresh before scanning; also covers the next while() iteration after CFG
+  // edits in the previous call.
+  if (SFDomTree) {
+    SFDomTree->recalculate(*MF);
+    SFDomTreeDirty = false;
+  }
 
   if (PreRegAlloc && TailDupVerify) {
     LLVM_DEBUG(dbgs() << "\n*** Before tail-duplicating\n");
@@ -770,7 +814,13 @@ bool TailDuplicator::duplicateSimpleBB(
     if (TII->analyzeBranch(*PredBB, PredTBB, PredFBB, PredCond))
       continue;
 
+    if (shrinkFrameRejectTailDup(TailBB, PredBB)) {
+      ++NumTailDupBlockedByFrameBoundary;
+      continue;
+    }
+
     Changed = true;
+    markSFDomTreeDirty();
     LLVM_DEBUG(dbgs() << "\nTail-duplicating into PredBB: " << *PredBB
                       << "From simple Succ: " << *TailBB);
 
@@ -844,7 +894,8 @@ bool TailDuplicator::canTailDuplicate(MachineBasicBlock *TailBB,
   // the successor list in PredBB and predecessor list in TailBB.
   if (TailBB->isInlineAsmBrIndirectTarget())
     return false;
-  return true;
+
+  return !shrinkFrameRejectTailDup(TailBB, PredBB);
 }
 
 /// If it is profitable, duplicate TailBB's contents in each
@@ -907,6 +958,7 @@ bool TailDuplicator::tailDuplicate(bool IsSimple, MachineBasicBlock *TailBB,
                       << "From Succ: " << *TailBB);
 
     TDBBs.push_back(PredBB);
+    markSFDomTreeDirty();
 
     // Remove PredBB's unconditional branch.
     TII->removeBranch(*PredBB);
@@ -962,61 +1014,66 @@ bool TailDuplicator::tailDuplicate(bool IsSimple, MachineBasicBlock *TailBB,
       (!PriorTBB || PriorTBB == TailBB) &&
       TailBB->pred_size() == 1 &&
       !TailBB->hasAddressTaken()) {
-    LLVM_DEBUG(dbgs() << "\nMerging into block: " << *PrevBB
-                      << "From MBB: " << *TailBB);
-    // There may be a branch to the layout successor. This is unlikely but it
-    // happens. The correct thing to do is to remove the branch before
-    // duplicating the instructions in all cases.
-    bool RemovedBranches = TII->removeBranch(*PrevBB) != 0;
-
-    // If there are still tail instructions, abort the merge
-    if (PrevBB->getFirstTerminator() == PrevBB->end()) {
-      if (PreRegAlloc) {
-        DenseMap<Register, RegSubRegPair> LocalVRMap;
-        SmallVector<std::pair<Register, RegSubRegPair>, 4> CopyInfos;
-        MachineBasicBlock::iterator I = TailBB->begin();
-        // Process PHI instructions first.
-        while (I != TailBB->end() && I->isPHI()) {
-          // Replace the uses of the def of the PHI with the register coming
-          // from PredBB.
-          MachineInstr *MI = &*I++;
-          processPHI(MI, TailBB, PrevBB, LocalVRMap, CopyInfos, UsedByPhi,
-                     true);
-        }
-
-        // Now copy the non-PHI instructions.
-        while (I != TailBB->end()) {
-          // Replace def of virtual registers with new registers, and update
-          // uses with PHI source register or the new registers.
-          MachineInstr *MI = &*I++;
-          assert(!MI->isBundle() && "Not expecting bundles before regalloc!");
-          duplicateInstruction(MI, TailBB, PrevBB, LocalVRMap, UsedByPhi);
-          MI->eraseFromParent();
-        }
-        appendCopies(PrevBB, CopyInfos, Copies);
-      } else {
-        TII->removeBranch(*PrevBB);
-        // No PHIs to worry about, just splice the instructions over.
-        PrevBB->splice(PrevBB->end(), TailBB, TailBB->begin(), TailBB->end());
-      }
-      PrevBB->removeSuccessor(PrevBB->succ_begin());
-      assert(PrevBB->succ_empty());
-      PrevBB->transferSuccessors(TailBB);
-
-      // Update branches in PrevBB based on Tail's layout successor.
-      if (ShouldUpdateTerminators)
-        PrevBB->updateTerminator(TailBB->getNextNode());
-
-      TDBBs.push_back(PrevBB);
-      Changed = true;
+    if (shrinkFrameRejectTailDup(TailBB, PrevBB)) {
+      ++NumTailDupBlockedByFrameBoundary;
     } else {
-      LLVM_DEBUG(dbgs() << "Abort merging blocks, the predecessor still "
-                           "contains terminator instructions");
-      // Return early if no changes were made
-      if (!Changed)
-        return RemovedBranches;
+      LLVM_DEBUG(dbgs() << "\nMerging into block: " << *PrevBB
+                        << "From MBB: " << *TailBB);
+      // There may be a branch to the layout successor. This is unlikely but it
+      // happens. The correct thing to do is to remove the branch before
+      // duplicating the instructions in all cases.
+      bool RemovedBranches = TII->removeBranch(*PrevBB) != 0;
+
+      // If there are still tail instructions, abort the merge
+      if (PrevBB->getFirstTerminator() == PrevBB->end()) {
+        if (PreRegAlloc) {
+          DenseMap<Register, RegSubRegPair> LocalVRMap;
+          SmallVector<std::pair<Register, RegSubRegPair>, 4> CopyInfos;
+          MachineBasicBlock::iterator I = TailBB->begin();
+          // Process PHI instructions first.
+          while (I != TailBB->end() && I->isPHI()) {
+            // Replace the uses of the def of the PHI with the register coming
+            // from PredBB.
+            MachineInstr *MI = &*I++;
+            processPHI(MI, TailBB, PrevBB, LocalVRMap, CopyInfos, UsedByPhi,
+                       true);
+          }
+
+          // Now copy the non-PHI instructions.
+          while (I != TailBB->end()) {
+            // Replace def of virtual registers with new registers, and update
+            // uses with PHI source register or the new registers.
+            MachineInstr *MI = &*I++;
+            assert(!MI->isBundle() && "Not expecting bundles before regalloc!");
+            duplicateInstruction(MI, TailBB, PrevBB, LocalVRMap, UsedByPhi);
+            MI->eraseFromParent();
+          }
+          appendCopies(PrevBB, CopyInfos, Copies);
+        } else {
+          TII->removeBranch(*PrevBB);
+          // No PHIs to worry about, just splice the instructions over.
+          PrevBB->splice(PrevBB->end(), TailBB, TailBB->begin(), TailBB->end());
+        }
+        PrevBB->removeSuccessor(PrevBB->succ_begin());
+        assert(PrevBB->succ_empty());
+        PrevBB->transferSuccessors(TailBB);
+
+        // Update branches in PrevBB based on Tail's layout successor.
+        if (ShouldUpdateTerminators)
+          PrevBB->updateTerminator(TailBB->getNextNode());
+
+        TDBBs.push_back(PrevBB);
+        Changed = true;
+        markSFDomTreeDirty();
+      } else {
+        LLVM_DEBUG(dbgs() << "Abort merging blocks, the predecessor still "
+                             "contains terminator instructions");
+        // Return early if no changes were made
+        if (!Changed)
+          return RemovedBranches;
+      }
+      Changed |= RemovedBranches;
     }
-    Changed |= RemovedBranches;
   }
 
   // If this is after register allocation, there are no phis to fix.

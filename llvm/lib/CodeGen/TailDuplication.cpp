@@ -13,7 +13,6 @@
 //===----------------------------------------------------------------------===//
 
 #include "llvm/CodeGen/TailDuplication.h"
-#include "llvm/CodeGen/MachineFrameInfo.h"
 #include "llvm/Analysis/ProfileSummaryInfo.h"
 #include "llvm/CodeGen/LazyMachineBlockFrequencyInfo.h"
 #include "llvm/CodeGen/MBFIWrapper.h"
@@ -86,9 +85,6 @@ INITIALIZE_PASS(EarlyTailDuplicateLegacy, "early-tailduplication",
 
 bool TailDuplicateBaseLegacy::runOnMachineFunction(MachineFunction &MF) {
   if (skipFunction(MF.getFunction()))
-    return false;
-
-  if (MF.getFrameInfo().getProlog())
     return false;
 
   auto MBPI = &getAnalysis<MachineBranchProbabilityInfoWrapperPass>().getMBPI();
