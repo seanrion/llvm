@@ -1,0 +1,150 @@
+# RUN: llc -mtriple=riscv64 -run-pass=branch-folder -verify-machineinstrs \
+# RUN:     -tail-merge-size=3 -riscv-shrink-wrapping-dataflow=true %s -o - \
+# RUN:     | FileCheck %s
+#
+# BranchFolding may run with shrink-frame, but must not TailMerge across the
+# frame/no-frame boundary. bb.1 is no-frame; bb.2 is Prolog (in-frame). Their
+# common ADDI tails stay separate.
+
+---
+name:            reject_cross_region_tail_merge
+tracksRegLiveness: true
+frameInfo:
+  stackSize:       16
+  adjustsStack:    true
+  hasCalls:        true
+  prolog:          '%bb.2'
+body:             |
+  bb.0:
+    liveins: $x10
+    successors: %bb.1, %bb.2
+    BNE $x10, $x0, %bb.1
+    PseudoBR %bb.2
+
+  bb.1:
+    liveins: $x10
+    $x10 = ADDI $x10, 1
+    $x10 = ADDI $x10, 2
+    $x10 = ADDI $x10, 3
+    PseudoRET implicit $x10
+
+  bb.2:
+    liveins: $x10
+    $x2 = frame-setup ADDI $x2, -16
+    $x10 = ADDI $x10, 1
+    $x10 = ADDI $x10, 2
+    $x10 = ADDI $x10, 3
+    PseudoRET implicit $x10
+
+...
+
+# CHECK-LABEL: name: reject_cross_region_tail_merge
+# CHECK: bb.1:
+# CHECK: $x10 = ADDI $x10, 1
+# CHECK: $x10 = ADDI $x10, 2
+# CHECK: $x10 = ADDI $x10, 3
+# CHECK: PseudoRET
+# CHECK: bb.2:
+# CHECK: $x2 = frame-setup ADDI $x2, -16
+# CHECK: $x10 = ADDI $x10, 1
+# CHECK: $x10 = ADDI $x10, 2
+# CHECK: $x10 = ADDI $x10, 3
+# CHECK: PseudoRET
+
+---
+name:            allow_inframe_tail_merge
+tracksRegLiveness: true
+frameInfo:
+  stackSize:       16
+  adjustsStack:    true
+  hasCalls:        true
+  prolog:          '%bb.1'
+body:             |
+  bb.0:
+    liveins: $x10
+    successors: %bb.1
+    PseudoBR %bb.1
+
+  bb.1:
+    liveins: $x10
+    successors: %bb.2, %bb.3
+    $x2 = frame-setup ADDI $x2, -16
+    BNE $x10, $x0, %bb.3
+    PseudoBR %bb.2
+
+  bb.2:
+    liveins: $x10
+    $x11 = ADDI $x10, 7
+    $x10 = ADDI $x11, 2
+    $x10 = ADDI $x10, 3
+    $x10 = ADDI $x10, 4
+    $x2 = frame-destroy ADDI $x2, 16
+    PseudoRET implicit $x10
+
+  bb.3:
+    liveins: $x10
+    $x12 = ADDI $x10, 9
+    $x10 = ADDI $x12, 2
+    $x10 = ADDI $x10, 3
+    $x10 = ADDI $x10, 4
+    $x2 = frame-destroy ADDI $x2, 16
+    PseudoRET implicit $x10
+
+...
+
+# CHECK-LABEL: name: allow_inframe_tail_merge
+# In-frame common suffix should TailMerge: only one shared frame-destroy remains.
+# CHECK: frame-destroy ADDI $x2, 16
+# CHECK-NOT: frame-destroy ADDI $x2, 16
+
+---
+name:            subset_inframe_merge_keeps_noframe
+tracksRegLiveness: true
+frameInfo:
+  stackSize:       16
+  adjustsStack:    true
+  hasCalls:        true
+  prolog:          '%bb.2'
+body:             |
+  bb.0:
+    liveins: $x10
+    successors: %bb.1, %bb.2
+    BNE $x10, $x0, %bb.1
+    PseudoBR %bb.2
+
+  bb.1:
+    liveins: $x10
+    $x10 = ADDI $x10, 1
+    $x10 = ADDI $x10, 2
+    $x10 = ADDI $x10, 3
+    PseudoRET implicit $x10
+
+  bb.2:
+    liveins: $x10
+    successors: %bb.3, %bb.4
+    $x2 = frame-setup ADDI $x2, -16
+    BNE $x10, $x0, %bb.4
+    PseudoBR %bb.3
+
+  bb.3:
+    liveins: $x10
+    $x11 = ADDI $x10, 7
+    $x10 = ADDI $x10, 2
+    $x10 = ADDI $x10, 3
+    PseudoRET implicit $x10
+
+  bb.4:
+    liveins: $x10
+    $x12 = ADDI $x10, 9
+    $x10 = ADDI $x10, 2
+    $x10 = ADDI $x10, 3
+    PseudoRET implicit $x10
+
+...
+
+# CHECK-LABEL: name: subset_inframe_merge_keeps_noframe
+# Prefixes can be laid out before or after the no-frame return; do not assume
+# block order. No-frame unique add and both in-frame unique adds must remain.
+# CHECK-DAG: $x10 = ADDI $x10, 1
+# CHECK-DAG: $x11 = ADDI $x10, 7
+# CHECK-DAG: $x12 = ADDI $x10, 9
