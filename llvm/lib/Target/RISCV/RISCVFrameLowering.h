@@ -86,6 +86,11 @@ public:
   void getFrameBoundCalleeSaves(const MachineFunction &MF,
                                  SmallVectorImpl<Register> &Regs) const override;
 
+  bool isShrinkFrameEpiloguePattern(const MachineInstr &MI,
+                                    const MachineFunction &MF) const override;
+  bool isShrinkFrameFrameRelatedMI(const MachineInstr &MI,
+                                   const MachineFunction &MF) const override;
+
   /// CSR spills not handled by push/pop or save-restore libcalls.
   SmallVector<CalleeSavedInfo, 8>
   getUnmanagedCSI(const MachineFunction &MF,

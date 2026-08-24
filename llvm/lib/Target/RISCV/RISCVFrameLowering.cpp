@@ -22,6 +22,7 @@
 #include "llvm/CodeGen/MachineFunction.h"
 #include "llvm/CodeGen/MachineInstrBuilder.h"
 #include "llvm/CodeGen/MachineRegisterInfo.h"
+#include "llvm/CodeGen/TargetOpcodes.h"
 #include "llvm/CodeGen/ReachingDefAnalysis.h"
 #include "llvm/CodeGen/RegisterScavenging.h"
 #include "llvm/IR/DiagnosticInfo.h"
@@ -2530,6 +2531,49 @@ void RISCVFrameLowering::getFrameBoundCalleeSaves(
   Regs.push_back(RISCV::X1);
   if (hasFP(MF))
     Regs.push_back(RISCV::X8);
+}
+
+bool RISCVFrameLowering::isShrinkFrameEpiloguePattern(
+    const MachineInstr &MI, const MachineFunction &MF) const {
+  const TargetRegisterInfo *TRI = STI.getRegisterInfo();
+
+  if (MI.getOpcode() == TargetOpcode::CFI_INSTRUCTION &&
+      MI.getFlag(MachineInstr::FrameDestroy))
+    return true;
+
+  if (MI.getFlag(MachineInstr::FrameDestroy) &&
+      (MI.modifiesRegister(SPReg, TRI) || MI.readsRegister(SPReg, TRI)))
+    return true;
+
+  SmallVector<Register, 4> FrameBound;
+  getFrameBoundCalleeSaves(MF, FrameBound);
+  for (Register Reg : FrameBound)
+    if (MI.modifiesRegister(Reg, TRI))
+      return true;
+
+  return isPop(MI.getOpcode());
+}
+
+bool RISCVFrameLowering::isShrinkFrameFrameRelatedMI(
+    const MachineInstr &MI, const MachineFunction &MF) const {
+  const TargetRegisterInfo *TRI = STI.getRegisterInfo();
+
+  if (MI.getOpcode() == TargetOpcode::CFI_INSTRUCTION &&
+      (MI.getFlag(MachineInstr::FrameSetup) ||
+       MI.getFlag(MachineInstr::FrameDestroy)))
+    return true;
+
+  if (MI.modifiesRegister(SPReg, TRI) || MI.readsRegister(SPReg, TRI))
+    return true;
+
+  if (hasFP(MF) &&
+      (MI.modifiesRegister(FPReg, TRI) || MI.readsRegister(FPReg, TRI)))
+    return true;
+
+  if (MI.modifiesRegister(RAReg, TRI) || MI.readsRegister(RAReg, TRI))
+    return true;
+
+  return false;
 }
 
 bool RISCVFrameLowering::canUseAsPrologue(const MachineBasicBlock &MBB) const {

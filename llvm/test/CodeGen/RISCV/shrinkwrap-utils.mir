@@ -1,0 +1,32 @@
+# RUN: not --crash llc -mtriple=riscv64 -run-pass=branch-folder -verify-machineinstrs \
+# RUN:     -riscv-shrink-wrapping-dataflow=true %s -o %t 2>&1 | FileCheck %s
+#
+# Shrink-frame verifier: no-frame block may branch to Prolog, but not to any
+# other block that already contains an epilogue pattern.
+
+---
+name:            bad_noframe_to_epilogue
+tracksRegLiveness: true
+frameInfo:
+  stackSize:       16
+  adjustsStack:    true
+  hasCalls:        true
+  prolog:          '%bb.2'
+body:             |
+  bb.0:
+    successors: %bb.1, %bb.2
+    BNE $x10, $x0, %bb.1
+    PseudoBR %bb.2
+
+  bb.1:
+    $x1 = frame-destroy LD $x2, 8 :: (load (s64))
+    PseudoRET implicit $x10
+
+  bb.2:
+    $x2 = frame-setup ADDI $x2, -16
+    PseudoRET implicit $x10
+
+...
+
+# CHECK: *** Bad machine code: Shrink-frame: no-frame block branches to epilogue pattern block ***
+# CHECK: - basic block: %bb.0

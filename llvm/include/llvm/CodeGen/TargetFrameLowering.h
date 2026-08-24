@@ -26,6 +26,7 @@ namespace llvm {
   class BitVector;
   class CalleeSavedInfo;
   class MachineFunction;
+  class MachineInstr;
   class RegScavenger;
   class ReachingDefInfo;
 
@@ -211,6 +212,21 @@ public:
   virtual void
   getFrameBoundCalleeSaves(const MachineFunction &MF,
                             SmallVectorImpl<Register> &Regs) const {}
+
+  /// RISC-V shrink-frame (B v2): true if \p MI is part of an epilogue sequence
+  /// (FrameDestroy SP adjust, CSR restore, destroy CFI, Zcmp pop). Default
+  /// false — non-RISC-V targets have no shrink-frame epilogue patterns.
+  virtual bool isShrinkFrameEpiloguePattern(const MachineInstr &MI,
+                                            const MachineFunction &MF) const {
+    return false;
+  }
+
+  /// Extra machine-instr tests for shrink-frame CopyProp/guard (SP / ra / FP /
+  /// frame CFI). Generic FI operands are handled in ShrinkFrameUtils.
+  virtual bool isShrinkFrameFrameRelatedMI(const MachineInstr &MI,
+                                           const MachineFunction &MF) const {
+    return false;
+  }
 
   /// Returns true if the stack slot holes in the fixed and callee-save stack
   /// area should be used when allocating other stack locations to reduce stack
