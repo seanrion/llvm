@@ -56,7 +56,6 @@
 //===----------------------------------------------------------------------===//
 #include "llvm/CodeGen/MachineOutliner.h"
 #include "llvm/ADT/DenseMap.h"
-#include "llvm/CodeGen/MachineFrameInfo.h"
 #include "llvm/ADT/SmallSet.h"
 #include "llvm/ADT/Statistic.h"
 #include "llvm/ADT/Twine.h"
@@ -66,7 +65,10 @@
 #include "llvm/Analysis/ProfileSummaryInfo.h"
 #include "llvm/CGData/CodeGenDataReader.h"
 #include "llvm/CodeGen/LivePhysRegs.h"
+#include "llvm/CodeGen/MachineDominators.h"
+#include "llvm/CodeGen/MachineFrameInfo.h"
 #include "llvm/CodeGen/MachineModuleInfo.h"
+#include "llvm/CodeGen/ShrinkFrameUtils.h"
 #include "llvm/CodeGen/MachineOptimizationRemarkEmitter.h"
 #include "llvm/CodeGen/Passes.h"
 #include "llvm/CodeGen/TargetInstrInfo.h"
@@ -83,6 +85,7 @@
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Target/TargetMachine.h"
 #include "llvm/Transforms/Utils/ModuleUtils.h"
+#include <optional>
 #include <tuple>
 #include <vector>
 
@@ -1274,13 +1277,6 @@ void MachineOutliner::populateMapper(InstructionMapper &Mapper, Module &M) {
       continue;
     }
 
-    // Skip functions with shrink-frame active to avoid outlining across
-    // frame/no-frame boundaries.
-    if (MF->getFrameInfo().getProlog()) {
-      LLVM_DEBUG(dbgs() << "SKIP: Function has shrink-frame Prolog\n");
-      continue;
-    }
-
     const TargetInstrInfo *TII = MF->getSubtarget().getInstrInfo();
     BlockFrequencyInfo *BFI = nullptr;
     if (EnableProfileGuidedOutlining && F.hasProfileData())
@@ -1299,6 +1295,12 @@ void MachineOutliner::populateMapper(InstructionMapper &Mapper, Module &M) {
                         << ": unsafe to outline from\n");
       continue;
     }
+
+    // Shrink-frame: only map in-frame MBBs so call sites stay under framed SP
+    // and candidates cannot mix framed / no-frame occurrences.
+    std::optional<MachineDominatorTree> SFDomTree;
+    if (hasShrinkFrame(*MF))
+      SFDomTree.emplace(*MF);
 
     // We have a function suitable for outlining. Iterate over every
     // MachineBasicBlock in MF and try to map its instructions to a list of
@@ -1323,6 +1325,11 @@ void MachineOutliner::populateMapper(InstructionMapper &Mapper, Module &M) {
       // we don't want to outline from it.
       if (MBB.hasAddressTaken()) {
         LLVM_DEBUG(dbgs() << "    SKIP: MBB's address is taken\n");
+        continue;
+      }
+
+      if (SFDomTree && !isInFrameRegion(MBB, *SFDomTree)) {
+        LLVM_DEBUG(dbgs() << "    SKIP: MBB is outside shrink-frame region\n");
         continue;
       }
 

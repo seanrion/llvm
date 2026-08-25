@@ -23,6 +23,7 @@
 #include "llvm/CodeGen/MachineTraceMetrics.h"
 #include "llvm/CodeGen/PseudoSourceValue.h"
 #include "llvm/CodeGen/ScoreboardHazardRecognizer.h"
+#include "llvm/CodeGen/ShrinkFrameUtils.h"
 #include "llvm/CodeGen/StackMaps.h"
 #include "llvm/CodeGen/TargetFrameLowering.h"
 #include "llvm/CodeGen/TargetLowering.h"
@@ -2112,6 +2113,21 @@ TargetInstrInfo::getOutliningType(const MachineModuleInfo &MMI,
                                   unsigned Flags) const {
   MachineInstr &MI = *MIT;
 
+  // Shrink-frame only: keep FrameSetup / FrameDestroy (and tagged CFI) and
+  // target epilogue patterns in the parent. Do not apply this to ordinary
+  // functions — marking FrameDestroy illegal there splits epilogue+ret and
+  // changes tail-call outlining (see RISCV machine-outliner-call.ll).
+  if (hasShrinkFrame(*MI.getMF())) {
+    if (MI.getFlag(MachineInstr::FrameSetup) ||
+        MI.getFlag(MachineInstr::FrameDestroy))
+      return outliner::InstrType::Illegal;
+    if (MI.getMF()
+            ->getSubtarget()
+            .getFrameLowering()
+            ->isShrinkFrameEpiloguePattern(MI, *MI.getMF()))
+      return outliner::InstrType::Illegal;
+  }
+
   // NOTE: MI.isMetaInstruction() will match CFI_INSTRUCTION, but some targets
   // have support for outlining those. Special-case that here.
   if (MI.isCFIInstruction())
@@ -2211,6 +2227,51 @@ bool TargetInstrInfo::isMBBSafeToOutlineFrom(MachineBasicBlock &MBB,
       return false;
   }
   return true;
+}
+
+SmallVector<std::pair<MachineBasicBlock::iterator, MachineBasicBlock::iterator>>
+TargetInstrInfo::getOutlinableRanges(MachineBasicBlock &MBB,
+                                     unsigned &Flags) const {
+  // Default: the whole block is eligible.
+  if (!hasShrinkFrame(*MBB.getParent()))
+    return {std::make_pair(MBB.begin(), MBB.end())};
+
+  // Shrink-frame: isInFrameRegion is CFG-level (dom(Prolog)), but SP is only
+  // adjusted after FrameSetup and is restored at FrameDestroy. Only map the
+  // in-block phase where SP is actually framed so outlined callees see the
+  // same SP the sequence was compiled against.
+  //
+  // PrologBB starts unframed; other in-frame blocks start framed (Prolog
+  // dominates them). FrameSetup (including CSR save-point spills) keeps or
+  // enters framed; FrameDestroy leaves it.
+  SmallVector<std::pair<MachineBasicBlock::iterator, MachineBasicBlock::iterator>>
+      Ranges;
+  const bool StartFramed = &MBB != getShrinkFrameProlog(*MBB.getParent());
+  bool Framed = StartFramed;
+  MachineBasicBlock::iterator I = MBB.begin();
+  while (I != MBB.end()) {
+    if (I->getFlag(MachineInstr::FrameSetup)) {
+      Framed = true;
+      ++I;
+      continue;
+    }
+    if (I->getFlag(MachineInstr::FrameDestroy)) {
+      Framed = false;
+      ++I;
+      continue;
+    }
+    if (!Framed) {
+      ++I;
+      continue;
+    }
+    MachineBasicBlock::iterator Begin = I;
+    while (I != MBB.end() && !I->getFlag(MachineInstr::FrameSetup) &&
+           !I->getFlag(MachineInstr::FrameDestroy))
+      ++I;
+    if (Begin != I)
+      Ranges.emplace_back(Begin, I);
+  }
+  return Ranges;
 }
 
 bool TargetInstrInfo::isGlobalMemoryObject(const MachineInstr *MI) const {
