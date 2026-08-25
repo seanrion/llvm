@@ -1,0 +1,45 @@
+# RUN: llc -mtriple=riscv64 -mattr=+zcmp -run-pass=riscv-move-merge \
+# RUN:     -verify-machineinstrs -riscv-shrink-wrapping-dataflow=true %s -o - \
+# RUN:     | FileCheck %s
+#
+# Shrink-frame MoveMerge (scheme B): no whole-function getProlog() skip.
+# Body a0/a1 <-> s0-s7 copy pairs still merge to CM_MVA01S / CM_MVSA01.
+# FrameSetup / FrameDestroy sequences are left alone (not rewrite targets).
+
+--- |
+  define void @merge_moves_with_shrink_frame() {
+    ret void
+  }
+...
+---
+name:            merge_moves_with_shrink_frame
+tracksRegLiveness: true
+frameInfo:
+  stackSize:       16
+  adjustsStack:    true
+  hasCalls:        true
+  prolog:          '%bb.1'
+body:             |
+  bb.0:
+    successors: %bb.1
+    PseudoBR %bb.1
+
+  bb.1:
+    liveins: $x1, $x8, $x10, $x11
+    frame-setup CM_PUSH 5, 0, implicit-def $x2, implicit $x2, implicit $x1, implicit $x8
+    $x8 = ADDI $x11, 0
+    $x9 = ADDI $x10, 0
+    $x10 = ADDI killed $x9, 0
+    $x11 = ADDI $x8, 0
+    frame-destroy CM_POP 5, 0, implicit-def $x2, implicit $x2, implicit-def $x1, implicit-def $x8
+    PseudoRET
+
+...
+
+# CHECK-LABEL: name: merge_moves_with_shrink_frame
+# CHECK: frame-setup CM_PUSH 5, 0
+# CHECK: $x9, $x8 = CM_MVSA01
+# CHECK: CM_MVA01S
+# CHECK: frame-destroy CM_POP 5, 0
+# CHECK: PseudoRET
+# CHECK-NOT: ADDI
