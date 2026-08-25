@@ -13,7 +13,6 @@
 
 #include "RISCVInstrInfo.h"
 #include "RISCVMachineFunctionInfo.h"
-#include "llvm/CodeGen/MachineFrameInfo.h"
 #include "llvm/CodeGen/MachineInstr.h"
 
 using namespace llvm;
@@ -134,9 +133,6 @@ bool RISCVPushPopOpt::runOnMachineFunction(MachineFunction &Fn) {
   if (skipFunction(Fn.getFunction()))
     return false;
 
-  if (Fn.getFrameInfo().getProlog())
-    return false;
-
   // If Zcmp extension is not supported, abort.
   const RISCVSubtarget *Subtarget = &Fn.getSubtarget<RISCVSubtarget>();
   if (!Subtarget->hasStdExtZcmp() && !Subtarget->hasVendorXqccmp())
@@ -159,7 +155,8 @@ bool RISCVPushPopOpt::runOnMachineFunction(MachineFunction &Fn) {
         RetMBBI == MBB.begin())
       continue;
 
-    // The previous instruction should be a POP.
+    // The previous instruction should be a POP. FrameDestroy already confines
+    // this to epilogue sequences (shrink-frame: framed returns only).
     auto PopMBBI = prev_nodbg(RetMBBI, MBB.begin());
     if (isPop(PopMBBI->getOpcode()) &&
         PopMBBI->getFlag(MachineInstr::FrameDestroy))

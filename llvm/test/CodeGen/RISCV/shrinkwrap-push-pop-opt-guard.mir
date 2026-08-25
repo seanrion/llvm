@@ -1,0 +1,71 @@
+# RUN: llc -mtriple=riscv64 -mattr=+zcmp -run-pass=riscv-push-pop-opt \
+# RUN:     -verify-machineinstrs -riscv-shrink-wrapping-dataflow=true %s -o - \
+# RUN:     | FileCheck %s
+#
+# Shrink-frame PushPop (scheme B): no whole-function getProlog() skip.
+# FrameDestroy CM_POP immediately before PseudoRET still folds to CM_POPRET.
+#
+# CM_PUSH/CM_POP have no explicit def (sp is implicit-def only).
+# adjustRetVal recognizes a0:=0 via isCopyInstrImpl (ADDI $x0, 0), not bare COPY.
+
+--- |
+  define void @fold_pop_ret_with_shrink_frame() {
+    ret void
+  }
+
+  define i32 @fold_pop_retz_with_shrink_frame() {
+    ret i32 0
+  }
+...
+---
+name:            fold_pop_ret_with_shrink_frame
+tracksRegLiveness: true
+frameInfo:
+  stackSize:       16
+  adjustsStack:    true
+  hasCalls:        true
+  prolog:          '%bb.1'
+body:             |
+  bb.0:
+    successors: %bb.1
+    PseudoBR %bb.1
+
+  bb.1:
+    liveins: $x1, $x8
+    frame-setup CM_PUSH 5, 0, implicit-def $x2, implicit $x2, implicit $x1, implicit $x8
+    frame-destroy CM_POP 5, 0, implicit-def $x2, implicit $x2, implicit-def $x1, implicit-def $x8
+    PseudoRET
+
+...
+---
+name:            fold_pop_retz_with_shrink_frame
+tracksRegLiveness: true
+frameInfo:
+  stackSize:       16
+  adjustsStack:    true
+  hasCalls:        true
+  prolog:          '%bb.1'
+body:             |
+  bb.0:
+    successors: %bb.1
+    PseudoBR %bb.1
+
+  bb.1:
+    liveins: $x1, $x8
+    frame-setup CM_PUSH 5, 0, implicit-def $x2, implicit $x2, implicit $x1, implicit $x8
+    $x10 = ADDI $x0, 0
+    frame-destroy CM_POP 5, 0, implicit-def $x2, implicit $x2, implicit-def $x1, implicit-def $x8
+    PseudoRET implicit $x10
+
+...
+
+# CHECK-LABEL: name: fold_pop_ret_with_shrink_frame
+# CHECK: frame-setup CM_PUSH 5, 0
+# CHECK: frame-destroy CM_POPRET 5, 0
+# CHECK-NOT: PseudoRET
+
+# CHECK-LABEL: name: fold_pop_retz_with_shrink_frame
+# CHECK: frame-setup CM_PUSH 5, 0
+# CHECK-NOT: ADDI $x0, 0
+# CHECK: frame-destroy CM_POPRETZ 5, 0
+# CHECK-NOT: PseudoRET
