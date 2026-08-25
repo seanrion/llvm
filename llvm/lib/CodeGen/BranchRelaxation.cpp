@@ -779,9 +779,6 @@ BranchRelaxationPass::run(MachineFunction &MF,
 bool BranchRelaxation::run(MachineFunction &mf) {
   MF = &mf;
 
-  if (MF->getFrameInfo().getProlog())
-    return false;
-
   LLVM_DEBUG(dbgs() << "***** BranchRelaxation *****\n");
 
   const TargetSubtargetInfo &ST = MF->getSubtarget();
