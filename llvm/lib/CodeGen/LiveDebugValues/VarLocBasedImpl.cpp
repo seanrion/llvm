@@ -122,6 +122,7 @@
 #include "llvm/BinaryFormat/Dwarf.h"
 #include "llvm/CodeGen/LexicalScopes.h"
 #include "llvm/CodeGen/MachineBasicBlock.h"
+#include "llvm/CodeGen/MachineDominators.h"
 #include "llvm/CodeGen/MachineFunction.h"
 #include "llvm/CodeGen/MachineInstr.h"
 #include "llvm/CodeGen/MachineInstrBuilder.h"
@@ -129,6 +130,7 @@
 #include "llvm/CodeGen/MachineMemOperand.h"
 #include "llvm/CodeGen/MachineOperand.h"
 #include "llvm/CodeGen/PseudoSourceValue.h"
+#include "llvm/CodeGen/ShrinkFrameUtils.h"
 #include "llvm/CodeGen/TargetFrameLowering.h"
 #include "llvm/CodeGen/TargetInstrInfo.h"
 #include "llvm/CodeGen/TargetLowering.h"
@@ -284,6 +286,8 @@ private:
   const TargetRegisterInfo *TRI;
   const TargetInstrInfo *TII;
   const TargetFrameLowering *TFI;
+  const MachineDominatorTree *DT = nullptr;
+  bool ProtectShrinkFrame = false;
   bool ShouldEmitDebugEntryValues;
   BitVector CalleeSavedRegs;
   LexicalScopes LS;
@@ -1044,6 +1048,12 @@ private:
                           RegDefToInstMap &RegSetInstrs);
   void transferSpillOrRestoreInst(MachineInstr &MI, OpenRangesSet &OpenRanges,
                                   VarLocMap &VarLocIDs, TransferMap &Transfers);
+  /// Shrink-frame: drop SpillLocs / SP-FP register locs after FrameDestroy.
+  void transferShrinkFrameDestroy(MachineInstr &MI, OpenRangesSet &OpenRanges,
+                                  VarLocMap &VarLocIDs, TransferMap &Transfers);
+  /// True if VL is a spill or is described by SP / (optional) FP.
+  bool isShrinkFrameInvalidOutsideFrame(const VarLoc &VL,
+                                        const MachineFunction &MF) const;
   void cleanupEntryValueTransfers(const MachineInstr *MI,
                                   OpenRangesSet &OpenRanges,
                                   VarLocMap &VarLocIDs, const VarLoc &EntryVL,
@@ -2015,6 +2025,74 @@ void VarLocBasedLDV::process(MachineInstr &MI, OpenRangesSet &OpenRanges,
   transferWasmDef(MI, OpenRanges, VarLocIDs);
   transferRegisterCopy(MI, OpenRanges, VarLocIDs, Transfers);
   transferSpillOrRestoreInst(MI, OpenRanges, VarLocIDs, Transfers);
+  transferShrinkFrameDestroy(MI, OpenRanges, VarLocIDs, Transfers);
+}
+
+bool VarLocBasedLDV::isShrinkFrameInvalidOutsideFrame(
+    const VarLoc &VL, const MachineFunction &MF) const {
+  if (VL.containsSpillLocs())
+    return true;
+
+  const TargetLowering *TLI = MF.getSubtarget().getTargetLowering();
+  Register SP = TLI->getStackPointerRegisterToSaveRestore();
+  Register FP =
+      TFI->hasFP(MF) ? TRI->getFrameRegister(MF) : Register();
+
+  SmallVector<uint32_t, 4> Regs;
+  if (!VL.getDescribingRegs(Regs))
+    return false;
+  for (uint32_t Reg : Regs) {
+    if (Register(Reg) == SP)
+      return true;
+    if (FP && Register(Reg) == FP)
+      return true;
+  }
+  return false;
+}
+
+void VarLocBasedLDV::transferShrinkFrameDestroy(MachineInstr &MI,
+                                                OpenRangesSet &OpenRanges,
+                                                VarLocMap &VarLocIDs,
+                                                TransferMap &Transfers) {
+  if (!ProtectShrinkFrame || !MI.getFlag(MachineInstr::FrameDestroy))
+    return;
+
+  MachineFunction &MF = *MI.getMF();
+  auto emitUndef = [&](const VarLoc &VL) {
+    if (VL.Locs.empty())
+      return;
+    VarLoc UndefVL = VarLoc::CreateCopyLoc(VL, VL.Locs.front(), 0);
+    LocIndices UndefLocIDs = VarLocIDs.insert(UndefVL);
+    Transfers.push_back({&MI, UndefLocIDs.back()});
+  };
+
+  // SpillLocs: indices are in the spill location bucket.
+  VarLocsInRange SpillKill;
+  for (uint64_t ID : OpenRanges.getSpillVarLocs()) {
+    LocIndex Idx = LocIndex::fromRawInteger(ID);
+    const VarLoc &VL = VarLocIDs[Idx];
+    SpillKill.insert(Idx.Index);
+    emitUndef(VL);
+  }
+  if (!SpillKill.empty())
+    OpenRanges.erase(SpillKill, VarLocIDs, LocIndex::kSpillLocation);
+
+  // SP / FP register locations: collectIDsForRegs yields universal indices.
+  const TargetLowering *TLI = MF.getSubtarget().getTargetLowering();
+  Register SP = TLI->getStackPointerRegisterToSaveRestore();
+  DefinedRegsSet DeadRegs;
+  DeadRegs.insert(SP);
+  if (TFI->hasFP(MF))
+    DeadRegs.insert(TRI->getFrameRegister(MF));
+  VarLocsInRange RegKill;
+  collectIDsForRegs(RegKill, DeadRegs, OpenRanges.getVarLocs(), VarLocIDs);
+  for (LocIndex::u32_index_t Index : RegKill) {
+    const VarLoc &VL =
+        VarLocIDs[LocIndex(LocIndex::kUniversalLocation, Index)];
+    emitUndef(VL);
+  }
+  if (!RegKill.empty())
+    OpenRanges.erase(RegKill, VarLocIDs, LocIndex::kUniversalLocation);
 }
 
 /// This routine joins the analysis results of all incoming edges in @MBB by
@@ -2085,6 +2163,19 @@ bool VarLocBasedLDV::join(
     }
   }
   InLocsT.intersectWithComplement(KillSet);
+
+  // Shrink-frame: SpillLocs and SP/FP register locations are only valid in
+  // framed regions. Kill them when joining into a no-frame block.
+  if (ProtectShrinkFrame && DT && !isInFrameRegion(MBB, *DT)) {
+    const MachineFunction &MF = *MBB.getParent();
+    VarLocSet SpillKill(Alloc);
+    for (uint64_t ID : InLocsT) {
+      LocIndex Idx = LocIndex::fromRawInteger(ID);
+      if (isShrinkFrameInvalidOutsideFrame(VarLocIDs[Idx], MF))
+        SpillKill.set(ID);
+    }
+    InLocsT.intersectWithComplement(SpillKill);
+  }
 
   // As we are processing blocks in reverse post-order we
   // should have processed at least one predecessor, unless it
@@ -2214,7 +2305,6 @@ bool VarLocBasedLDV::ExtendRanges(MachineFunction &MF,
                                   bool ShouldEmitDebugEntryValues,
                                   unsigned InputBBLimit,
                                   unsigned InputDbgValLimit) {
-  (void)DomTree;
   LLVM_DEBUG(dbgs() << "\nDebug Range Extension: " << MF.getName() << "\n");
 
   if (!MF.getFunction().getSubprogram())
@@ -2231,6 +2321,10 @@ bool VarLocBasedLDV::ExtendRanges(MachineFunction &MF,
   TFI = MF.getSubtarget().getFrameLowering();
   TFI->getCalleeSaves(MF, CalleeSavedRegs);
   this->ShouldEmitDebugEntryValues = ShouldEmitDebugEntryValues;
+  ProtectShrinkFrame = hasShrinkFrame(MF);
+  DT = DomTree;
+  assert((!ProtectShrinkFrame || DT) &&
+         "shrink-frame LiveDebugValues requires a dominator tree");
 
   LS.scanFunction(MF);
 
