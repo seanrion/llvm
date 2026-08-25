@@ -648,9 +648,6 @@ public:
     if (skipFunction(MF.getFunction()))
       return false;
 
-    if (MF.getFrameInfo().getProlog())
-      return false;
-
     auto *MBPI =
         &getAnalysis<MachineBranchProbabilityInfoWrapperPass>().getMBPI();
     auto MBFI = std::make_unique<MBFIWrapper>(

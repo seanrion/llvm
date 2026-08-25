@@ -616,6 +616,10 @@ bool TailDuplicator::shouldTailDuplicate(bool IsSimple,
   if (TailBB.isSuccessor(&TailBB))
     return false;
 
+  // Prolog must stay the unique FrameSetup site; never a duplication source.
+  if (hasShrinkFrame(*MF) && &TailBB == getShrinkFrameProlog(*MF))
+    return false;
+
   // Set the limit on the cost to duplicate. When optimizing for size,
   // duplicate only one, because one branch instruction can be eliminated to
   // compensate for the duplication.

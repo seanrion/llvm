@@ -1,0 +1,91 @@
+# RUN: llc -mtriple=riscv64 -run-pass=block-placement -verify-machineinstrs \
+# RUN:     -tail-dup-size=8 -riscv-shrink-wrapping-dataflow=true %s -o %t
+# RUN: FileCheck %s < %t
+# RUN: FileCheck %s --check-prefix=ONCE < %t
+#
+# MachineBlockPlacement may run with shrink-frame: layout reordering is
+# allowed. Embedded TailDup must not copy Prolog into a no-frame predecessor.
+
+---
+name:            allow_layout_reorder
+tracksRegLiveness: true
+frameInfo:
+  stackSize:       16
+  adjustsStack:    true
+  hasCalls:        true
+  prolog:          '%bb.1'
+body:             |
+  bb.0:
+    liveins: $x10
+    successors: %bb.1(0x00800000), %bb.2(0x7f800000)
+    BNE $x10, $x0, %bb.1
+    PseudoBR %bb.2
+
+  bb.1:
+    liveins: $x10
+    $x2 = frame-setup ADDI $x2, -16
+    $x10 = ADDI $x10, 5
+    PseudoRET implicit $x10
+
+  bb.2:
+    liveins: $x10
+    $x11 = ADDI $x10, 7
+    PseudoRET implicit $x10
+
+...
+
+# CHECK-LABEL: name: allow_layout_reorder
+# Skip would keep Prolog as the layout successor of bb.0. Placement should
+# put the hot no-frame return next instead.
+# CHECK: bb.0:
+# CHECK: BNE $x10, $x0, %bb.1
+# CHECK: bb.{{[0-9]+}}:
+# CHECK-NOT: frame-setup
+# CHECK: $x11 = ADDI $x10, 7
+# ONCE-LABEL: name: allow_layout_reorder
+# ONCE: frame-setup
+# ONCE-NOT: frame-setup
+
+---
+name:            reject_prolog_taildup_during_placement
+tracksRegLiveness: true
+frameInfo:
+  stackSize:       16
+  adjustsStack:    true
+  hasCalls:        true
+  prolog:          '%bb.3'
+body:             |
+  bb.0:
+    liveins: $x10
+    successors: %bb.1, %bb.2
+    BNE $x10, $x0, %bb.1
+    PseudoBR %bb.2
+
+  bb.1:
+    liveins: $x10
+    successors: %bb.3
+    $x11 = ADDI $x10, 1
+    PseudoBR %bb.3
+
+  bb.2:
+    liveins: $x10
+    successors: %bb.3
+    $x12 = ADDI $x10, 2
+    PseudoBR %bb.3
+
+  bb.3:
+    liveins: $x10
+    $x2 = frame-setup ADDI $x2, -16
+    $x10 = ADDI $x10, 5
+    PseudoRET implicit $x10
+
+...
+
+# CHECK-LABEL: name: reject_prolog_taildup_during_placement
+# Unique no-frame insns and Prolog may be laid out in any order.
+# CHECK-DAG: $x11 = ADDI $x10, 1
+# CHECK-DAG: $x12 = ADDI $x10, 2
+# CHECK-DAG: $x2 = frame-setup ADDI $x2, -16
+# ONCE-LABEL: name: reject_prolog_taildup_during_placement
+# ONCE: frame-setup
+# ONCE-NOT: frame-setup
