@@ -67,9 +67,9 @@
 
 #include "RISCV.h"
 #include "RISCVSubtarget.h"
-#include "llvm/CodeGen/MachineFrameInfo.h"
 #include "llvm/CodeGen/Passes.h"
 #include "llvm/CodeGen/RegisterScavenging.h"
+#include "llvm/CodeGen/ShrinkFrameUtils.h"
 #include "llvm/MC/TargetRegistry.h"
 #include "llvm/Support/Debug.h"
 
@@ -342,6 +342,19 @@ static bool isXqciloLdSt(const MachineInstr &MI) {
   }
 }
 
+/// When shrink-frame is active, freeze only PEI-marked FrameSetup / FrameDestroy
+/// MIs. Do not use isFrameRelatedForGuard here: that RISC-V hook treats every
+/// SP/FP/ra access as frame-related and would kill MakeCompressible's main
+/// size win (SP + large offset → scavenged base). Matches MachineCopyPropagation
+/// for non-COPY MIs (MCP additionally freezes frame-related COPYs only).
+static bool isShrinkFrameProtectedMI(const MachineInstr &MI,
+                                     bool ProtectShrinkFrame) {
+  if (!ProtectShrinkFrame)
+    return false;
+  return MI.getFlag(MachineInstr::FrameSetup) ||
+         MI.getFlag(MachineInstr::FrameDestroy);
+}
+
 // Check all uses after FirstMI of the given register, keeping a vector of
 // instructions that would be compressible if the given register (and offset if
 // applicable) were compressible.
@@ -350,7 +363,8 @@ static bool isXqciloLdSt(const MachineInstr &MI) {
 // compressed register is available, return that compressed register.
 static Register analyzeCompressibleUses(MachineInstr &FirstMI,
                                         RegImmPair RegImm,
-                                        SmallVectorImpl<MachineInstr *> &MIs) {
+                                        SmallVectorImpl<MachineInstr *> &MIs,
+                                        bool ProtectShrinkFrame) {
   MachineBasicBlock &MBB = *FirstMI.getParent();
   const TargetRegisterInfo *TRI =
       MBB.getParent()->getSubtarget().getRegisterInfo();
@@ -362,10 +376,11 @@ static Register analyzeCompressibleUses(MachineInstr &FirstMI,
     MachineInstr &MI = *I;
 
     // Determine if this is an instruction which would benefit from using the
-    // new register.
+    // new register. Skip PEI FrameSetup/Destroy so frame sequences stay intact.
     RegImmPair CandidateRegImm = getRegImmPairPreventingCompression(MI);
     if (CandidateRegImm.Reg == RegImm.Reg &&
-        CandidateRegImm.Imm == RegImm.Imm) {
+        CandidateRegImm.Imm == RegImm.Imm &&
+        !isShrinkFrameProtectedMI(MI, ProtectShrinkFrame)) {
       XqciloLdSt |= isXqciloLdSt(MI);
       MIs.push_back(&MI);
     }
@@ -474,9 +489,6 @@ bool RISCVMakeCompressibleOpt::runOnMachineFunction(MachineFunction &Fn) {
   if (skipFunction(Fn.getFunction()) || !Fn.getFunction().hasMinSize())
     return false;
 
-  if (Fn.getFrameInfo().getProlog())
-    return false;
-
   const RISCVSubtarget &STI = Fn.getSubtarget<RISCVSubtarget>();
   const RISCVInstrInfo &TII = *STI.getInstrInfo();
 
@@ -484,9 +496,17 @@ bool RISCVMakeCompressibleOpt::runOnMachineFunction(MachineFunction &Fn) {
   if (!STI.hasStdExtZca())
     return false;
 
+  // Shrink-frame: run on the whole function; only FrameSetup / FrameDestroy
+  // are protected (PEI-marked frame sequences). Body loads/stores, including
+  // SP-based ones, still participate.
+  const bool ProtectShrinkFrame = hasShrinkFrame(Fn);
+
   for (MachineBasicBlock &MBB : Fn) {
     LLVM_DEBUG(dbgs() << "MBB: " << MBB.getName() << "\n");
     for (MachineInstr &MI : MBB) {
+      if (isShrinkFrameProtectedMI(MI, ProtectShrinkFrame))
+        continue;
+
       // Determine if this instruction would otherwise be compressed if not for
       // an incompressible register or offset.
       RegImmPair RegImm = getRegImmPairPreventingCompression(MI);
@@ -497,7 +517,8 @@ bool RISCVMakeCompressibleOpt::runOnMachineFunction(MachineFunction &Fn) {
       // register with a compressed register (and compressible offset if
       // applicable) is possible and will allow compression.
       SmallVector<MachineInstr *, 8> MIs;
-      Register NewReg = analyzeCompressibleUses(MI, RegImm, MIs);
+      Register NewReg =
+          analyzeCompressibleUses(MI, RegImm, MIs, ProtectShrinkFrame);
       if (!NewReg)
         continue;
 

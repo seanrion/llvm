@@ -1,0 +1,129 @@
+# RUN: llc -mtriple=riscv64 -mattr=+c -run-pass=riscv-make-compressible \
+# RUN:     -verify-machineinstrs -riscv-shrink-wrapping-dataflow=true %s -o - \
+# RUN:     | FileCheck %s
+#
+# With shrink-frame, RISCVMakeCompressible runs on the whole function. Only
+# FrameSetup / FrameDestroy MIs are skipped. Ordinary body stores (including
+# SP + large offset) still get rewritten.
+
+--- |
+  define void @allow_body_compress_keeps_frame_seq(ptr %a, ptr %b, ptr %c) #0 {
+    ret void
+  }
+
+  define void @allow_body_sp_large_offset() #0 {
+    ret void
+  }
+
+  define void @keep_frame_setup_sp_stores() #0 {
+    ret void
+  }
+
+  attributes #0 = { minsize }
+...
+---
+name:            allow_body_compress_keeps_frame_seq
+tracksRegLiveness: true
+frameInfo:
+  stackSize:       16
+  adjustsStack:    true
+  hasCalls:        true
+  prolog:          '%bb.1'
+body:             |
+  bb.0:
+    liveins: $x10, $x11, $x12
+    successors: %bb.1
+    PseudoBR %bb.1
+
+  bb.1:
+    liveins: $x10, $x11, $x12
+    $x2 = frame-setup ADDI $x2, -16
+    ; Three stores of zero: should become ADDI + SW of a compressed reg.
+    SW $x0, killed renamable $x10, 0
+    SW $x0, killed renamable $x11, 0
+    SW $x0, killed renamable $x12, 0
+    $x2 = frame-destroy ADDI $x2, 16
+    PseudoRET
+
+...
+
+# CHECK-LABEL: name: allow_body_compress_keeps_frame_seq
+# CHECK: $x2 = frame-setup ADDI $x2, -16
+# CHECK: ${{x[0-9]+}} = ADDI $x0, 0
+# CHECK: SW
+# CHECK: SW
+# CHECK: SW
+# CHECK: $x2 = frame-destroy ADDI $x2, 16
+# CHECK-NOT: frame-setup
+# CHECK-NOT: frame-destroy
+
+---
+name:            allow_body_sp_large_offset
+tracksRegLiveness: true
+frameInfo:
+  stackSize:       1024
+  adjustsStack:    true
+  hasCalls:        true
+  prolog:          '%bb.1'
+body:             |
+  bb.0:
+    liveins: $x10, $x11, $x12
+    successors: %bb.1
+    PseudoBR %bb.1
+
+  bb.1:
+    liveins: $x10, $x11, $x12
+    ; ADDI imm must fit simm12 [-2048, 2047]; ±4096 is illegal.
+    $x2 = frame-setup ADDI $x2, -1024
+    ; Body SP + large offset (not FrameSetup): must still be rewritten.
+    ; 1024 is outside c.sdsp's uimm6 range, so MakeCompressible adjusts base.
+    SD killed renamable $x10, $x2, 1024
+    SD killed renamable $x11, $x2, 1024
+    SD killed renamable $x12, $x2, 1024
+    $x2 = frame-destroy ADDI $x2, 1024
+    PseudoRET
+
+...
+
+# CHECK-LABEL: name: allow_body_sp_large_offset
+# CHECK: $x2 = frame-setup ADDI $x2, -1024
+# Scavenged compressed base = SP + adjust; offsets become compressible.
+# CHECK: ${{x[0-9]+}} = ADDI $x2,
+# CHECK-NOT: SD {{.*}}, $x2, 1024
+# CHECK: SD
+# CHECK: SD
+# CHECK: SD
+# CHECK: $x2 = frame-destroy ADDI $x2, 1024
+
+---
+name:            keep_frame_setup_sp_stores
+tracksRegLiveness: true
+frameInfo:
+  stackSize:       1024
+  adjustsStack:    true
+  hasCalls:        true
+  prolog:          '%bb.1'
+body:             |
+  bb.0:
+    liveins: $x1, $x8, $x9
+    successors: %bb.1
+    PseudoBR %bb.1
+
+  bb.1:
+    liveins: $x1, $x8, $x9
+    $x2 = frame-setup ADDI $x2, -1024
+    ; Same shape as allow_body_sp_large_offset, but FrameSetup — must not rewrite.
+    frame-setup SD $x1, $x2, 1024
+    frame-setup SD $x8, $x2, 1024
+    frame-setup SD $x9, $x2, 1024
+    $x2 = frame-destroy ADDI $x2, 1024
+    PseudoRET
+
+...
+
+# CHECK-LABEL: name: keep_frame_setup_sp_stores
+# CHECK: $x2 = frame-setup ADDI $x2, -1024
+# CHECK-NEXT: frame-setup SD $x1, $x2, 1024
+# CHECK-NEXT: frame-setup SD $x8, $x2, 1024
+# CHECK-NEXT: frame-setup SD $x9, $x2, 1024
+# CHECK-NEXT: $x2 = frame-destroy ADDI $x2, 1024
