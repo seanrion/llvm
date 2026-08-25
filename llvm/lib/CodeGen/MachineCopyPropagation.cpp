@@ -63,6 +63,7 @@
 #include "llvm/CodeGen/MachineInstr.h"
 #include "llvm/CodeGen/MachineOperand.h"
 #include "llvm/CodeGen/MachineRegisterInfo.h"
+#include "llvm/CodeGen/ShrinkFrameUtils.h"
 #include "llvm/CodeGen/TargetInstrInfo.h"
 #include "llvm/CodeGen/TargetRegisterInfo.h"
 #include "llvm/CodeGen/TargetSubtargetInfo.h"
@@ -85,6 +86,8 @@ STATISTIC(NumCopyForwards, "Number of copy uses forwarded");
 STATISTIC(NumCopyBackwardPropagated, "Number of copy defs backward propagated");
 STATISTIC(SpillageChainsLength, "Length of spillage chains");
 STATISTIC(NumSpillageChains, "Number of spillage chains");
+STATISTIC(NumMCPBlockedByFrameBoundary,
+          "Number of instructions treated as barriers by shrink-frame MCP guard");
 DEBUG_COUNTER(FwdCounter, "machine-cp-fwd",
               "Controls which register COPYs are forwarded");
 
@@ -455,9 +458,14 @@ class MachineCopyPropagation {
   const TargetRegisterInfo *TRI = nullptr;
   const TargetInstrInfo *TII = nullptr;
   const MachineRegisterInfo *MRI = nullptr;
+  const MachineFunction *MFPtr = nullptr;
 
   // Return true if this is a copy instruction and false otherwise.
   bool UseCopyInstr;
+
+  /// When shrink-frame is active, PEI frame sequences and frame-related COPYs
+  /// are opaque barriers (still update the tracker, never rewrite/delete).
+  bool ProtectShrinkFrame = false;
 
 public:
   MachineCopyPropagation(bool CopyInstr = false)
@@ -486,6 +494,11 @@ private:
                                  const MachineOperand &MODef, Register Def);
   bool canUpdateSrcUsers(const MachineInstr &Copy,
                          const MachineOperand &CopySrc);
+
+  /// True if \p MI must not be rewritten or deleted under shrink-frame.
+  bool isShrinkFrameProtectedMI(const MachineInstr &MI) const;
+  /// Update tracker around a protected MI without mutating it.
+  void observeShrinkFrameProtectedMI(MachineInstr &MI, bool Backward);
 
   /// Candidates for deletion.
   SmallSetVector<MachineInstr *, 8> MaybeDeadCopies;
@@ -527,6 +540,42 @@ char &llvm::MachineCopyPropagationID = MachineCopyPropagationLegacy::ID;
 
 INITIALIZE_PASS(MachineCopyPropagationLegacy, DEBUG_TYPE,
                 "Machine Copy Propagation Pass", false, false)
+
+bool MachineCopyPropagation::isShrinkFrameProtectedMI(
+    const MachineInstr &MI) const {
+  if (!ProtectShrinkFrame)
+    return false;
+  // Freeze PEI-marked frame sequences only. Do not use
+  // isShrinkFrameEpiloguePattern here: even after tightening, MCP should not
+  // freeze an entire call (or other non-frame MI) as a rewrite barrier.
+  if (MI.getFlag(MachineInstr::FrameSetup) ||
+      MI.getFlag(MachineInstr::FrameDestroy))
+    return true;
+  assert(MFPtr && "MF required when ProtectShrinkFrame is set");
+  // Frame-related COPYs (FI / SP / FP / ra via target hook) must stay.
+  if (isCopyInstr(MI, *TII, UseCopyInstr) &&
+      isFrameRelatedForGuard(MI, *MFPtr))
+    return true;
+  return false;
+}
+
+void MachineCopyPropagation::observeShrinkFrameProtectedMI(MachineInstr &MI,
+                                                           bool Backward) {
+  ++NumMCPBlockedByFrameBoundary;
+  for (const MachineOperand &MO : MI.operands()) {
+    if (!MO.isReg() || !MO.getReg())
+      continue;
+    MCRegister Reg = MO.getReg().asMCReg();
+    if (Backward) {
+      Tracker.invalidateRegister(Reg, *TRI, *TII, UseCopyInstr);
+      continue;
+    }
+    if (MO.isDef())
+      Tracker.clobberRegister(Reg, *TRI, *TII, UseCopyInstr);
+    else if (MO.readsReg())
+      ReadRegister(Reg, MI, MO.isDebug() ? DebugUse : RegularUse);
+  }
+}
 
 void MachineCopyPropagation::ReadRegister(MCRegister Reg, MachineInstr &Reader,
                                           DebugType DT) {
@@ -880,6 +929,11 @@ void MachineCopyPropagation::ForwardCopyPropagateBlock(MachineBasicBlock &MBB) {
                     << "\n");
 
   for (MachineInstr &MI : llvm::make_early_inc_range(MBB)) {
+    if (isShrinkFrameProtectedMI(MI)) {
+      observeShrinkFrameProtectedMI(MI, /*Backward=*/false);
+      continue;
+    }
+
     // Analyze copies (which don't overlap themselves).
     std::optional<DestSourcePair> CopyOperands =
         isCopyInstr(MI, *TII, UseCopyInstr);
@@ -1167,6 +1221,11 @@ void MachineCopyPropagation::BackwardCopyPropagateBlock(
                     << "\n");
 
   for (MachineInstr &MI : llvm::make_early_inc_range(llvm::reverse(MBB))) {
+    if (isShrinkFrameProtectedMI(MI)) {
+      observeShrinkFrameProtectedMI(MI, /*Backward=*/true);
+      continue;
+    }
+
     // Ignore non-trivial COPYs.
     std::optional<DestSourcePair> CopyOperands =
         isCopyInstr(MI, *TII, UseCopyInstr);
@@ -1423,6 +1482,29 @@ void MachineCopyPropagation::EliminateSpillageCopies(MachineBasicBlock &MBB) {
   };
 
   for (MachineInstr &MI : llvm::make_early_inc_range(MBB)) {
+    if (isShrinkFrameProtectedMI(MI)) {
+      // Opaque barrier: same tracking as a non-copy that clobbers/uses regs.
+      SmallSet<Register, 8> RegsToClobber;
+      for (const MachineOperand &MO : MI.operands()) {
+        if (!MO.isReg())
+          continue;
+        Register Reg = MO.getReg();
+        if (!Reg)
+          continue;
+        MachineInstr *LastUseCopy =
+            Tracker.findLastSeenUseInCopy(Reg.asMCReg(), *TRI);
+        if (LastUseCopy)
+          CopySourceInvalid.insert(LastUseCopy);
+        if (Tracker.findLastSeenDefInCopy(MI, Reg.asMCReg(), *TRI, *TII,
+                                          UseCopyInstr))
+          RegsToClobber.insert(Reg);
+      }
+      for (Register Reg : RegsToClobber)
+        Tracker.clobberRegister(Reg, *TRI, *TII, UseCopyInstr);
+      ++NumMCPBlockedByFrameBoundary;
+      continue;
+    }
+
     std::optional<DestSourcePair> CopyOperands =
         isCopyInstr(MI, *TII, UseCopyInstr);
 
@@ -1573,9 +1655,6 @@ bool MachineCopyPropagationLegacy::runOnMachineFunction(MachineFunction &MF) {
   if (skipFunction(MF.getFunction()))
     return false;
 
-  if (MF.getFrameInfo().getProlog())
-    return false;
-
   return MachineCopyPropagation(UseCopyInstr).run(MF);
 }
 
@@ -1610,6 +1689,8 @@ bool MachineCopyPropagation::run(MachineFunction &MF) {
   TRI = MF.getSubtarget().getRegisterInfo();
   TII = MF.getSubtarget().getInstrInfo();
   MRI = &MF.getRegInfo();
+  MFPtr = &MF;
+  ProtectShrinkFrame = hasShrinkFrame(MF);
 
   for (MachineBasicBlock &MBB : MF) {
     if (isSpillageCopyElimEnabled)
@@ -1617,6 +1698,9 @@ bool MachineCopyPropagation::run(MachineFunction &MF) {
     BackwardCopyPropagateBlock(MBB);
     ForwardCopyPropagateBlock(MBB);
   }
+
+  MFPtr = nullptr;
+  ProtectShrinkFrame = false;
 
   return Changed;
 }

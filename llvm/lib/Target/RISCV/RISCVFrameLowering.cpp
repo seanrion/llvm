@@ -2545,11 +2545,16 @@ bool RISCVFrameLowering::isShrinkFrameEpiloguePattern(
       (MI.modifiesRegister(SPReg, TRI) || MI.readsRegister(SPReg, TRI)))
     return true;
 
-  SmallVector<Register, 4> FrameBound;
-  getFrameBoundCalleeSaves(MF, FrameBound);
-  for (Register Reg : FrameBound)
-    if (MI.modifiesRegister(Reg, TRI))
-      return true;
+  // Frame-bound restores (ra / FP) must be FrameDestroy-tagged. Do not treat
+  // plain defs of ra (e.g. calls) as epilogue — that would poison any BB with
+  // a call for blockHasEpiloguePattern / MCP barriers.
+  if (MI.getFlag(MachineInstr::FrameDestroy)) {
+    SmallVector<Register, 4> FrameBound;
+    getFrameBoundCalleeSaves(MF, FrameBound);
+    for (Register Reg : FrameBound)
+      if (MI.modifiesRegister(Reg, TRI))
+        return true;
+  }
 
   return isPop(MI.getOpcode());
 }

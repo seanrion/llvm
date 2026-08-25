@@ -1,0 +1,124 @@
+# RUN: llc -mtriple=riscv64 -run-pass=machine-cp -verify-machineinstrs \
+# RUN:     -riscv-shrink-wrapping-dataflow=true %s -o - | FileCheck %s
+#
+# With shrink-frame, MachineCopyPropagation runs on all blocks. Only
+# FrameSetup / FrameDestroy and frame-related COPYs are barriers; ordinary
+# body COPYs still propagate. Calls are not frozen (they must take the normal
+# regmask clobber path).
+
+--- |
+  declare void @ext()
+
+  define void @allow_body_cp_keeps_frame_seq() {
+    ret void
+  }
+
+  define void @keep_frame_related_ra_copy() {
+    ret void
+  }
+
+  define void @call_uses_normal_regmask_path() {
+    ret void
+  }
+...
+---
+name:            allow_body_cp_keeps_frame_seq
+tracksRegLiveness: true
+frameInfo:
+  stackSize:       16
+  adjustsStack:    true
+  hasCalls:        true
+  prolog:          '%bb.1'
+body:             |
+  bb.0:
+    liveins: $x10, $x11
+    successors: %bb.1
+    PseudoBR %bb.1
+
+  bb.1:
+    liveins: $x10, $x11
+    $x2 = frame-setup ADDI $x2, -16
+    ; Redundant round-trip COPY in the body; second COPY is a NOP and must go.
+    renamable $x12 = COPY renamable $x11
+    renamable $x11 = COPY renamable $x12
+    $x10 = ADD $x10, killed renamable $x12
+    $x2 = frame-destroy ADDI $x2, 16
+    PseudoRET implicit $x10
+
+...
+
+# CHECK-LABEL: name: allow_body_cp_keeps_frame_seq
+# Body COPYs are fully propagated; frame sequence stays intact.
+# CHECK: $x2 = frame-setup ADDI $x2, -16
+# CHECK-NOT: COPY
+# CHECK: $x10 = ADD $x10, $x11
+# CHECK: $x2 = frame-destroy ADDI $x2, 16
+# CHECK-NOT: frame-setup
+# CHECK-NOT: frame-destroy
+
+---
+name:            keep_frame_related_ra_copy
+tracksRegLiveness: true
+frameInfo:
+  stackSize:       16
+  adjustsStack:    true
+  hasCalls:        true
+  prolog:          '%bb.1'
+body:             |
+  bb.0:
+    liveins: $x10, $x1
+    successors: %bb.1
+    PseudoBR %bb.1
+
+  bb.1:
+    liveins: $x10, $x1
+    $x2 = frame-setup ADDI $x2, -16
+    ; COPY of ra is frame-related; must not be deleted as a dead copy.
+    renamable $x12 = COPY $x1
+    $x2 = frame-destroy ADDI $x2, 16
+    PseudoRET implicit $x10
+
+...
+
+# CHECK-LABEL: name: keep_frame_related_ra_copy
+# CHECK: $x2 = frame-setup ADDI $x2, -16
+# CHECK: renamable $x12 = COPY $x1
+# CHECK: $x2 = frame-destroy ADDI $x2, 16
+
+---
+name:            call_uses_normal_regmask_path
+tracksRegLiveness: true
+frameInfo:
+  stackSize:       16
+  adjustsStack:    true
+  hasCalls:        true
+  prolog:          '%bb.1'
+body:             |
+  bb.0:
+    liveins: $x11
+    successors: %bb.1
+    PseudoBR %bb.1
+
+  bb.1:
+    liveins: $x11
+    $x2 = frame-setup ADDI $x2, -16
+    ; x9 is callee-saved so the value survives the call's csr regmask.
+    renamable $x9 = COPY renamable $x11
+    PseudoCALL target-flags(riscv-call) @ext, csr_ilp32_lp64, implicit-def dead $x1, implicit-def $x2
+    ; NOP round-trip after the call must still be optimized.
+    renamable $x13 = COPY renamable $x9
+    renamable $x9 = COPY renamable $x13
+    $x10 = ADDI killed renamable $x13, 0
+    $x2 = frame-destroy ADDI $x2, 16
+    PseudoRET implicit $x10
+
+...
+
+# CHECK-LABEL: name: call_uses_normal_regmask_path
+# Call is not a shrink-frame MCP barrier: post-call COPYs still propagate.
+# CHECK: $x2 = frame-setup ADDI $x2, -16
+# CHECK: renamable $x9 = COPY renamable $x11
+# CHECK: PseudoCALL
+# CHECK-NOT: COPY
+# CHECK: $x10 = ADDI $x9, 0
+# CHECK: $x2 = frame-destroy ADDI $x2, 16
