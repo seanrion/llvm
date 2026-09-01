@@ -19,6 +19,7 @@
 #include "llvm/CodeGen/MachineDomTreeUpdater.h"
 #include "llvm/CodeGen/MachineDominators.h"
 #include "llvm/CodeGen/MachineFunction.h"
+#include "llvm/CodeGen/MachineFrameInfo.h"
 #include "llvm/CodeGen/MachineInstrBuilder.h"
 #include "llvm/CodeGen/MachineJumpTableInfo.h"
 #include "llvm/CodeGen/MachineLoopInfo.h"
@@ -141,8 +142,11 @@ void ilist_callback_traits<MachineBasicBlock>::addNodeToList(
 
 void ilist_callback_traits<MachineBasicBlock>::removeNodeFromList(
     MachineBasicBlock *N) {
-  N->getParent()->removeFromMBBNumbering(N->Number);
+  MachineFunction *MF = N->getParent();
+  MF->removeFromMBBNumbering(N->Number);
   N->Number = -1;
+  // Drop shrink-frame original/clone registration before the block is gone.
+  MF->getFrameInfo().unregisterShrinkFrameClone(N);
 }
 
 /// When we add an instruction to a basic block list, we update its parent

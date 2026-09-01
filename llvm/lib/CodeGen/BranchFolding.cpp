@@ -1080,6 +1080,24 @@ bool BranchFolder::TryTailMergeBlocks(MachineBasicBlock *SuccBB,
       continue;
     }
 
+    // Never TailMerge a shrink-frame original or frameless clone. Filter them
+    // out before picking a destination so this holds even when SFDomTree is
+    // unset (e.g. Prolog cleared but pairs not yet abandoned).
+    {
+      MachineFunction &MF = *SameTails.front().getBlock()->getParent();
+      if (MF.getFrameInfo().hasShrinkFrameClones()) {
+        llvm::erase_if(SameTails, [&](const SameTailElt &E) {
+          return MF.getFrameInfo().getShrinkFrameClonePartner(E.getBlock()) !=
+                 nullptr;
+        });
+        if (SameTails.size() < 2) {
+          ++NumTailMergeBlockedByFrameBoundary;
+          RemoveBlocksWithHash(CurHash, SuccBB, PredBB, BranchDL);
+          continue;
+        }
+      }
+    }
+
     // If one of the blocks is the entire common tail (and is not the entry
     // block/an EH pad, which we can't jump to), we can treat all blocks with
     // this same tail at once.  Use PredBB if that is one of the possibilities,
@@ -1551,6 +1569,10 @@ ReoptimizeBlock:
   // optimized away.
   if (IsEmptyBlock(MBB) && !MBB->isEHPad() && !MBB->hasAddressTaken() &&
       SameEHScope) {
+    // Keep shrink-frame original/clone pair blocks (even if emptied).
+    if (MF.getFrameInfo().getShrinkFrameClonePartner(MBB))
+      return MadeChange;
+
     salvageDebugInfoFromEmptyBlock(TII, *MBB);
     // Dead block?  Leave for cleanup later.
     if (MBB->pred_empty()) return MadeChange;
@@ -1834,10 +1856,15 @@ ReoptimizeBlock:
       // falls through into MBB and we can't understand the prior block's branch
       // condition.
       if (MBB->empty()) {
-        // Shrink-frame: never delete Prolog. Forward only predecessors that
-        // can legally target CurTBB.
+        // Shrink-frame: never delete Prolog or a registered original/clone.
+        // Forward only predecessors that can legally target CurTBB.
         if (SFDomTree && MBB == getShrinkFrameProlog(MF)) {
           ++NumBranchOptsBlockedByFrameBoundary;
+          TII->insertBranch(*MBB, CurTBB, nullptr, CurCond, Dl);
+          return MadeChange;
+        }
+        if (MF.getFrameInfo().getShrinkFrameClonePartner(MBB) ||
+            MF.getFrameInfo().getShrinkFrameClonePartner(CurTBB)) {
           TII->insertBranch(*MBB, CurTBB, nullptr, CurCond, Dl);
           return MadeChange;
         }

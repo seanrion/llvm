@@ -1,0 +1,242 @@
+# RUN: llc -mtriple=riscv64 -run-pass=shrink-wrapping -verify-machineinstrs -riscv-shrink-wrapping-dataflow=true %s -o - | FileCheck %s --check-prefixes=CHECK-DUP,CHECK-PCREL
+# RUN: llc -mtriple=riscv64 -run-pass=shrink-wrapping -riscv-shrink-wrapping-dataflow=true -disable-riscv-shrink-frame-dup %s -o - | FileCheck %s --check-prefixes=CHECK-OFF
+# RUN: llc -mtriple=riscv64 -run-pass=shrink-wrapping -riscv-shrink-wrapping-dataflow=true -max-dup-insns=0 %s -o - | FileCheck %s --check-prefixes=CHECK-OFF
+# RUN: llc -mtriple=riscv64 -run-pass=shrink-wrapping,branch-folder -verify-machineinstrs \
+# RUN:     -tail-merge-size=2 -riscv-shrink-wrapping-dataflow=true %s -o - \
+# RUN:     | FileCheck %s --check-prefixes=CHECK-MERGE
+#
+# Shared return diamond: frameless early exit and framed call path join on one
+# PseudoRET. Shrink-frame may clone the return so Prolog can sit on the
+# call block (dup defaults on). Disable via -disable-riscv-shrink-frame-dup
+# or -max-dup-insns=0 to match no-dup bail behavior. BranchFolder must not
+# TailMerge the original/clone pair back together. Cloned AUIPC/%pcrel_lo
+# pairs must get fresh pre-instr-symbol labels (no duplicate .Lpcrel_hiN).
+#
+# CFG:
+#   bb.0 ─┬─ bb.1 (frameless) ──┐
+#         └─ bb.2 (call) ───────┴─ bb.3 (shared RET)
+
+--- |
+  declare void @extern_func(i64)
+  @g = external global i64
+
+  define i64 @shared_return_diamond(i64 %x) {
+    ret i64 0
+  }
+
+  define i64 @shared_return_pcrel(i64 %x) {
+    ret i64 0
+  }
+
+  define i64 @mixed_nonreturn_join(i64 %x) {
+    ret i64 0
+  }
+
+  define i64 @off_prolog_save_clone_restore(i64 %x) {
+    ret i64 0
+  }
+...
+---
+name:            shared_return_diamond
+tracksRegLiveness: true
+body:             |
+  bb.0:
+    liveins: $x10
+    successors: %bb.1, %bb.2
+
+    BNE $x10, $x0, %bb.2
+    PseudoBR %bb.1
+
+  bb.1:
+    liveins: $x10
+    successors: %bb.3
+    $x10 = ADDI $x0, 1
+    PseudoBR %bb.3
+
+  bb.2:
+    liveins: $x10
+    successors: %bb.3
+    ADJCALLSTACKDOWN 0, 0, implicit-def $x2, implicit $x2
+    PseudoCALL target-flags(riscv-call) @extern_func, implicit-def $x1, implicit $x10, implicit-def $x10
+    ADJCALLSTACKUP 0, 0, implicit-def $x2, implicit $x2
+    PseudoBR %bb.3
+
+  bb.3:
+    liveins: $x10
+    $x10 = ADDI $x10, 0
+    PseudoRET implicit $x10
+
+...
+
+# CHECK-DUP-LABEL: name: shared_return_diamond
+# CHECK-DUP:       prolog: '%bb.2'
+# Frameless early-exit should target a cloned return (not the framed original).
+# CHECK-DUP:       bb.1:
+# CHECK-DUP:         successors:{{.*}}%bb.{{[0-9]+}}
+# CHECK-DUP:         PseudoBR %bb.{{[0-9]+}}
+# CHECK-DUP:       bb.2:
+# CHECK-DUP:         successors:{{.*}}%bb.3
+# CHECK-DUP:       bb.3:
+# CHECK-DUP:         PseudoRET
+# CHECK-DUP:       bb.{{[0-9]+}}:
+# CHECK-DUP:         PseudoRET
+# CSR restores must not target the frameless clone (inserted as %bb.4 after %bb.3).
+# CHECK-DUP-NOT:      point:           '%bb.4'
+
+# After branch-folder, Prolog and both return clones must still exist (not merged).
+# CHECK-MERGE-LABEL: name: shared_return_diamond
+# CHECK-MERGE:       prolog: '%bb.2'
+# CHECK-MERGE:       PseudoRET
+# CHECK-MERGE:       PseudoRET
+
+# CHECK-OFF-LABEL: name: shared_return_diamond
+# CHECK-OFF-NOT:   prolog: '%bb.
+
+---
+name:            shared_return_pcrel
+tracksRegLiveness: true
+body:             |
+  bb.0:
+    liveins: $x10
+    successors: %bb.1, %bb.2
+
+    BNE $x10, $x0, %bb.2
+    PseudoBR %bb.1
+
+  bb.1:
+    liveins: $x10
+    successors: %bb.3
+    $x10 = ADDI $x0, 1
+    PseudoBR %bb.3
+
+  bb.2:
+    liveins: $x10
+    successors: %bb.3
+    ADJCALLSTACKDOWN 0, 0, implicit-def $x2, implicit $x2
+    PseudoCALL target-flags(riscv-call) @extern_func, implicit-def $x1, implicit $x10, implicit-def $x10
+    ADJCALLSTACKUP 0, 0, implicit-def $x2, implicit $x2
+    PseudoBR %bb.3
+
+  bb.3:
+    liveins: $x10
+    $x11 = AUIPC target-flags(riscv-pcrel-hi) @g, pre-instr-symbol <mcsymbol .Lpcrel_hi0>
+    $x10 = ADDI $x11, target-flags(riscv-pcrel-lo) <mcsymbol .Lpcrel_hi0>
+    PseudoRET implicit $x10
+
+...
+
+# CHECK-PCREL-LABEL: name: shared_return_pcrel
+# CHECK-PCREL:       prolog: '%bb.2'
+# Original keeps .Lpcrel_hi0; clone must use a different temp label.
+# CHECK-PCREL:       pre-instr-symbol <mcsymbol .Lpcrel_hi0>
+# CHECK-PCREL:       target-flags(riscv-pcrel-lo) <mcsymbol .Lpcrel_hi0>
+# CHECK-PCREL-NOT:   pre-instr-symbol <mcsymbol .Lpcrel_hi0>
+# CHECK-PCREL:       pre-instr-symbol <mcsymbol .Lpcrel_hi{{[0-9]+}}>
+# CHECK-PCREL-NOT:   target-flags(riscv-pcrel-lo) <mcsymbol .Lpcrel_hi0>
+
+# CHECK-OFF-LABEL: name: shared_return_pcrel
+# CHECK-OFF-NOT:   prolog: '%bb.
+
+---
+name:            mixed_nonreturn_join
+tracksRegLiveness: true
+body:             |
+  bb.0:
+    liveins: $x10
+    successors: %bb.1, %bb.2
+
+    BNE $x10, $x0, %bb.2
+    PseudoBR %bb.1
+
+  bb.1:
+    liveins: $x10
+    successors: %bb.3
+    $x10 = ADDI $x0, 1
+    PseudoBR %bb.3
+
+  bb.2:
+    liveins: $x10
+    successors: %bb.3
+    ADJCALLSTACKDOWN 0, 0, implicit-def $x2, implicit $x2
+    PseudoCALL target-flags(riscv-call) @extern_func, implicit-def $x1, implicit $x10, implicit-def $x10
+    ADJCALLSTACKUP 0, 0, implicit-def $x2, implicit $x2
+    PseudoBR %bb.3
+
+  bb.3:
+    liveins: $x10
+    successors: %bb.4
+    $x10 = ADDI $x10, 1
+    PseudoBR %bb.4
+
+  bb.4:
+    liveins: $x10
+    PseudoRET implicit $x10
+
+...
+
+# Intermediate non-return join: return cloning alone cannot enable shrink-frame.
+# CHECK-DUP-LABEL: name: mixed_nonreturn_join
+# CHECK-DUP-NOT:   prolog: '%bb.
+
+# CHECK-OFF-LABEL: name: mixed_nonreturn_join
+# CHECK-OFF-NOT:   prolog: '%bb.
+
+---
+name:            off_prolog_save_clone_restore
+tracksRegLiveness: true
+body:             |
+  bb.0:
+    liveins: $x10, $x9, $x18
+    successors: %bb.1, %bb.2
+
+    BNE $x10, $x0, %bb.2
+    PseudoBR %bb.1
+
+  bb.1:
+    liveins: $x10, $x9, $x18
+    successors: %bb.3
+
+    $x9 = ADDI $x9, 1
+    $x18 = ADDI $x18, 1
+    PseudoBR %bb.3
+
+  bb.2:
+    liveins: $x10, $x9, $x18
+    successors: %bb.3
+
+    ADJCALLSTACKDOWN 0, 0, implicit-def $x2, implicit $x2
+    PseudoCALL target-flags(riscv-call) @extern_func, implicit-def $x1, implicit $x10, implicit-def $x10
+    ADJCALLSTACKUP 0, 0, implicit-def $x2, implicit $x2
+    PseudoBR %bb.3
+
+  bb.3:
+    liveins: $x10, $x9, $x18
+
+    PseudoRET implicit $x10
+
+...
+
+# Off-Prolog CSR on frameless early-exit with shared return: prologue hoisting
+# forces abandoning clones in ShrinkWrapping; without dup, mixed return preds
+# bail shrink-frame and use entry-full multi-point CSR placement.
+# Early-exit bb.1 must still reach shared return bb.3 (no clone split).
+# CHECK-DUP-LABEL: name: off_prolog_save_clone_restore
+# CHECK-DUP:       prolog: ''
+# CHECK-DUP-NOT:   prolog: '%bb.2'
+# CHECK-DUP:       savePoint:
+# CHECK-DUP:         - point: {{'%bb.[0-9]+'}}
+# CHECK-DUP:       restorePoint:
+# CHECK-DUP:         - point: {{'%bb.[0-9]+'}}
+# CHECK-DUP:       bb.1:
+# CHECK-DUP:         successors:{{.*}}%bb.3
+# CHECK-DUP:         PseudoBR %bb.3
+# CHECK-DUP:       bb.3:
+# CHECK-DUP:         PseudoRET
+
+# CHECK-OFF-LABEL: name: off_prolog_save_clone_restore
+# CHECK-OFF:       prolog: ''
+# CHECK-OFF-NOT:   prolog: '%bb.
+# CHECK-OFF:       savePoint:
+# CHECK-OFF:         - point: {{'%bb.[0-9]+'}}
+# CHECK-OFF:       bb.1:
+# CHECK-OFF:         successors:{{.*}}%bb.3
