@@ -36,6 +36,7 @@ add_llvm_target(RISCVCodeGen
   RISCVCodeGenPrepare.cpp
   RISCVConstantPoolValue.cpp
   RISCVDeadRegisterDefinitions.cpp
+  RISCVFramelessRAAnalysis.cpp
   RISCVExpandAtomicPseudoInsts.cpp
   RISCVExpandPseudoInsts.cpp
   RISCVFoldMemOffset.cpp

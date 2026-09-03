@@ -393,6 +393,7 @@ void RAGreedy::LRE_WillShrinkVirtReg(Register VirtReg) {
 
 void RAGreedy::LRE_DidCloneVirtReg(Register New, Register Old) {
   ExtraInfo->LRE_DidCloneVirtReg(New, Old);
+  TRI->propagateRegAllocSplitMetadata(Old, New, *MF);
 }
 
 void RAGreedy::ExtraRegInfo::LRE_DidCloneVirtReg(Register New, Register Old) {
@@ -2350,11 +2351,16 @@ MCRegister RAGreedy::selectOrSplit(const LiveInterval &VirtReg,
 MCRegister RAGreedy::tryAssignCSRFirstTime(
     const LiveInterval &VirtReg, AllocationOrder &Order, MCRegister PhysReg,
     uint8_t &CostPerUseLimit, SmallVectorImpl<Register> &NewVRegs) {
+  BlockFrequency VirtCSRCost = CSRCost;
+  if (unsigned Extra =
+          TRI->getExtraCSRFirstUseCostForVReg(VirtReg.reg(), *MF))
+    VirtCSRCost += BlockFrequency(Extra);
+
   if (ExtraInfo->getStage(VirtReg) == RS_Spill && VirtReg.isSpillable()) {
     // We choose spill over using the CSR for the first time if the spill cost
     // is lower than CSRCost.
     SA->analyze(&VirtReg);
-    if (calcSpillCost() >= CSRCost)
+    if (calcSpillCost() >= VirtCSRCost)
       return PhysReg;
 
     // We are going to spill, set CostPerUseLimit to 1 to make sure that
@@ -2367,7 +2373,7 @@ MCRegister RAGreedy::tryAssignCSRFirstTime(
     // the cost of splitting is lower than CSRCost.
     SA->analyze(&VirtReg);
     unsigned NumCands = 0;
-    BlockFrequency BestCost = CSRCost; // Don't modify CSRCost.
+    BlockFrequency BestCost = VirtCSRCost; // Don't modify CSRCost.
     unsigned BestCand = calculateRegionSplitCost(VirtReg, Order, BestCost,
                                                  NumCands, true /*IgnoreCSR*/);
     if (BestCand == NoCand)

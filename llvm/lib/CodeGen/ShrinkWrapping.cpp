@@ -464,9 +464,9 @@
     MachineBasicBlock *splitEdge(MachineBasicBlock *Pred,
                                 MachineBasicBlock *Succ);
 
-    /// Split edges for save/restore points that need their own block. Returns
-    /// true if any new block was created, in which case the dominator trees are
-    /// stale and must be recomputed.
+    /// Materialize edge save/restore points. CSRSave on the unique edge into
+    /// Prolog is folded onto Prolog (no trampoline); other save/restore edges
+    /// are split. Returns true if any new block was created (MDT/MPDT stale).
     bool setupCFG();
 
     void setupSaveRestorePoints();
@@ -1561,36 +1561,7 @@
   }
 
   bool ShrinkWrappingImpl::blockNeedsFrame(const MachineBasicBlock &MBB) const {
-    const TargetInstrInfo *TII = MachineFunc->getSubtarget().getInstrInfo();
-    const TargetRegisterInfo *TRI = MachineFunc->getSubtarget().getRegisterInfo();
-    Register StackPtr =
-        MachineFunc->getSubtarget().getTargetLowering()
-            ->getStackPointerRegisterToSaveRestore();
-    Register FramePtr = TRI->getFrameRegister(*MachineFunc);
-
-    for (const MachineInstr &MI : MBB) {
-      if (MI.isDebugInstr())
-        continue;
-
-      for (const MachineOperand &MO : MI.operands()) {
-        if (MO.isFI())
-          return true;
-      }
-
-      if (MI.isCall() && !TII->isTailCall(MI))
-        return true;
-
-      if (StackPtr && MI.modifiesRegister(StackPtr, TRI))
-        return true;
-      if (FramePtr && MI.modifiesRegister(FramePtr, TRI))
-        return true;
-
-      if (MI.getOpcode() == TargetOpcode::STATEPOINT ||
-          MI.getOpcode() == TargetOpcode::STACKMAP ||
-          MI.getOpcode() == TargetOpcode::PATCHPOINT)
-        return true;
-    }
-    return false;
+    return llvm::blockNeedsFrame(*MachineFunc, MBB);
   }
 
   bool ShrinkWrappingImpl::isReachableFrom(MachineBasicBlock *From,
@@ -2666,14 +2637,34 @@
 
   bool ShrinkWrappingImpl::setupCFG() {
     bool SplitAnyEdge = false;
+    MachineBasicBlock *Prolog = MachineFunc->getFrameInfo().getProlog();
+
     for (auto &[Node, Regs] : CSRSave) {
       if (!Regs.empty() && !Node->MatchMBB) {
         assert(Node->pred_size() == 1 &&
               "Auxillary node can have only one predecessor!");
         assert(Node->succ_size() == 1 &&
               "Auxillary node can have only one successor!");
-        MachineBasicBlock *NewBB = splitEdge((*Node->pred_begin())->MatchMBB,
-                                            (*Node->succ_begin())->MatchMBB);
+        MachineBasicBlock *Pred = (*Node->pred_begin())->MatchMBB;
+        MachineBasicBlock *Succ = (*Node->succ_begin())->MatchMBB;
+        assert(Pred && Succ && "Edge node endpoints must map to real MBBs");
+
+        // When CSR save is on the unique edge into Prolog, attach it to Prolog
+        // instead of splitting an empty trampoline. A trampoline before Prolog
+        // is never dominated by Prolog, so mustHoist would hoist/demote and
+        // undo a valid delayed frame. Only fold Succ==Prolog with that unique
+        // predecessor; restores and other saves (e.g. into grow) still split.
+        if (Prolog && Succ == Prolog && Prolog->pred_size() == 1 &&
+            *Prolog->pred_begin() == Pred) {
+          LLVM_DEBUG(dbgs() << "setupCFG: fold CSRSave edge "
+                            << printMBBReference(*Pred) << " -> "
+                            << printMBBReference(*Succ)
+                            << " onto Prolog (no trampoline)\n");
+          Node->MatchMBB = Prolog;
+          continue;
+        }
+
+        MachineBasicBlock *NewBB = splitEdge(Pred, Succ);
         Node->MatchMBB = NewBB;
         SplitAnyEdge = true;
       }
@@ -2685,6 +2676,8 @@
               "Auxillary node can have only one predecessor!");
         assert(Node->succ_size() == 1 &&
               "Auxillary node can have only one successor!");
+        // Never fold restore edges into Prolog/Epilog: a trampoline after the
+        // framed region (or before a shared return) is required for PEI order.
         MachineBasicBlock *NewBB = splitEdge((*Node->pred_begin())->MatchMBB,
                                             (*Node->succ_begin())->MatchMBB);
         Node->MatchMBB = NewBB;

@@ -41,7 +41,7 @@ static cl::opt<std::string> UserDefinedUncondPrologCSRs(
   cl::desc("Comma-separated list of registerst that have to be saved / restored in prolog / epilog. Used for testing only"), cl::init(""),
   cl::Hidden);
 
-static cl::opt<bool> RISCVShrinkWrappingDataflow(
+cl::opt<bool> RISCVShrinkWrappingDataflow(
     "riscv-shrink-wrapping-dataflow", cl::init(false), cl::Hidden,
     cl::desc("Enable data-flow based multi-point CSR shrink-wrapping for "
              "RISC-V (mutually exclusive with -riscv-save-csrs-early)"));
