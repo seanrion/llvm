@@ -1003,7 +1003,40 @@ void RISCVFrameLowering::emitPrologue(MachineFunction &MF,
   if (SplitPoints && NeedsDwarfCFI && !UseZilsd)
     ScalarDistance *= 2;
   int VectorDistance = getRVVCalleeSavedInfo(MF, CSI).size();
-  MBBI = std::prev(MBBI, VectorDistance + ScalarDistance);
+
+  if (SplitPoints) {
+    // Multi-point CSR save/restore: emit the stack-pointer adjustment before
+    // the first frame-index callee-saved spill in this block. getSaveCSInfo()
+    // may list only frame-bound registers (e.g. ra) while PrologEpilogInserter
+    // already spilled other CSRs here; CSI-sized walk-back would place those
+    // stores before addi sp. Keep CSI walk-back when !SplitPoints (PUSH/SCS).
+    MachineBasicBlock::iterator FirstSpill = MBBI;
+    for (MachineBasicBlock::iterator I = MBB.begin(); I != MBBI; ++I) {
+      if (!I->getFlag(MachineInstr::FrameSetup) || isPush(I->getOpcode()))
+        continue;
+      if (!any_of(I->operands(),
+                  [](const MachineOperand &MO) { return MO.isFI(); }))
+        continue;
+      FirstSpill = I;
+      break;
+    }
+    if (FirstSpill != MBBI) {
+      MBBI = FirstSpill;
+      // Advance-after-allocateStack must skip the whole spill(+cfi) run.
+      ScalarDistance = 0;
+      for (MachineBasicBlock::iterator I = MBBI;
+           I != MBB.end() && I->getFlag(MachineInstr::FrameSetup); ++I) {
+        if (isPush(I->getOpcode()))
+          break;
+        ++ScalarDistance;
+      }
+      VectorDistance = 0;
+    } else {
+      MBBI = std::prev(MBBI, VectorDistance + ScalarDistance);
+    }
+  } else {
+    MBBI = std::prev(MBBI, VectorDistance + ScalarDistance);
+  }
   CFIInstBuilder CFIBuilder(MBB, MBBI, MachineInstr::FrameSetup);
 
   // If libcalls are used to spill and restore callee-saved registers, the frame

@@ -13,6 +13,7 @@
 #ifndef LLVM_CODEGEN_MACHINEFRAMEINFO_H
 #define LLVM_CODEGEN_MACHINEFRAMEINFO_H
 
+#include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/CodeGen/Register.h"
 #include "llvm/CodeGen/TargetFrameLowering.h"
@@ -351,6 +352,11 @@ private:
   /// Not null, if shrink-wrapping found a better place for the epilogue
   /// (stack deallocation).
   MachineBasicBlock *Epilog = nullptr;
+
+  /// Frameless clones of shared return blocks created for shrink-frame.
+  /// Maps original (framed) -> clone (frameless) and the reverse.
+  DenseMap<MachineBasicBlock *, MachineBasicBlock *> ShrinkFrameClones;
+  DenseMap<MachineBasicBlock *, MachineBasicBlock *> ShrinkFrameCloneOriginals;
 
   /// Not empty, if shrink-wrapping found better place(s) for saving CSRs.
   /// With enableCSRSaveRestorePointsSplit, each entry lists the CSRs saved
@@ -923,6 +929,60 @@ public:
   void setProlog(MachineBasicBlock *BB) { Prolog = BB; }
   MachineBasicBlock *getEpilog() const { return Epilog; }
   void setEpilog(MachineBasicBlock *BB) { Epilog = BB; }
+
+  /// Register a frameless clone of shared-return block \p Orig.
+  void registerShrinkFrameClone(MachineBasicBlock *Orig,
+                                MachineBasicBlock *Clone) {
+    assert(Orig && Clone && Orig != Clone);
+    ShrinkFrameClones[Orig] = Clone;
+    ShrinkFrameCloneOriginals[Clone] = Orig;
+  }
+
+  /// Drop the original/clone pair that involves \p BB, if any. Called when a
+  /// block is removed from the function so MachineVerifier never sees a stale
+  /// pair (erased blocks have Number == -1 and DomTree treats them as
+  /// dominated by everything).
+  void unregisterShrinkFrameClone(MachineBasicBlock *BB) {
+    if (!BB)
+      return;
+    if (auto I = ShrinkFrameClones.find(BB); I != ShrinkFrameClones.end()) {
+      ShrinkFrameCloneOriginals.erase(I->second);
+      ShrinkFrameClones.erase(I);
+      return;
+    }
+    if (auto I = ShrinkFrameCloneOriginals.find(BB);
+        I != ShrinkFrameCloneOriginals.end()) {
+      ShrinkFrameClones.erase(I->second);
+      ShrinkFrameCloneOriginals.erase(I);
+    }
+  }
+
+  void clearShrinkFrameClones() {
+    ShrinkFrameClones.clear();
+    ShrinkFrameCloneOriginals.clear();
+  }
+
+  bool hasShrinkFrameClones() const { return !ShrinkFrameClones.empty(); }
+
+  bool isShrinkFrameClone(const MachineBasicBlock *BB) const {
+    return ShrinkFrameCloneOriginals.contains(BB);
+  }
+
+  /// Return the paired block (original or clone), or nullptr.
+  MachineBasicBlock *
+  getShrinkFrameClonePartner(const MachineBasicBlock *BB) const {
+    if (auto I = ShrinkFrameClones.find(BB); I != ShrinkFrameClones.end())
+      return I->second;
+    if (auto I = ShrinkFrameCloneOriginals.find(BB);
+        I != ShrinkFrameCloneOriginals.end())
+      return I->second;
+    return nullptr;
+  }
+
+  const DenseMap<MachineBasicBlock *, MachineBasicBlock *> &
+  getShrinkFrameClones() const {
+    return ShrinkFrameClones;
+  }
 
   void clearSavePoints() { SavePoints.clear(); }
   void clearRestorePoints() { RestorePoints.clear(); }

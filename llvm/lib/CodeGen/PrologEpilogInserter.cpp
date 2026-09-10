@@ -17,6 +17,7 @@
 
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/BitVector.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SetVector.h"
 #include "llvm/ADT/SmallPtrSet.h"
@@ -37,6 +38,7 @@
 #include "llvm/CodeGen/MachineRegisterInfo.h"
 #include "llvm/CodeGen/PEI.h"
 #include "llvm/CodeGen/RegisterScavenging.h"
+#include "llvm/CodeGen/ShrinkFrameUtils.h"
 #include "llvm/CodeGen/TargetFrameLowering.h"
 #include "llvm/CodeGen/TargetInstrInfo.h"
 #include "llvm/CodeGen/TargetOpcodes.h"
@@ -75,6 +77,8 @@ using MBBVector = SmallVector<MachineBasicBlock *, 4>;
 STATISTIC(NumLeafFuncWithSpills, "Number of leaf functions with CSRs");
 STATISTIC(NumFuncSeen, "Number of functions seen in PEI");
 
+static void mergeCSIUnique(std::vector<CalleeSavedInfo> &DST,
+                           const CalleeSavedInfo &CS);
 
 namespace {
 
@@ -429,29 +433,122 @@ void PEIImpl::calculateCallFrameInfo(MachineFunction &MF) {
 /// Compute blocks for placing prolog and epilog (stack allocation) code.
 void PEIImpl::calculatePrologEpilogBlocks(MachineFunction &MF) {
   const TargetFrameLowering *TFI = MF.getSubtarget().getFrameLowering();
-  const MachineFrameInfo &MFI = MF.getFrameInfo();
+  MachineFrameInfo &MFI = MF.getFrameInfo();
 
   // If shrink-frame has placed a Prolog, honor it regardless of split mode.
+  // Frame-bound CSRs (ra / FP) travel with the main prologue (GCC policy).
+  // When a delayed Prolog is unsafe (mixed frame/frameless return, CSR save or
+  // stack touch before P0, frame-bound clobber before P0), hoist Prolog to
+  // Entry and pin frame-bound spills there — keep s* multi-point delay.
   if (MFI.getProlog()) {
-    PrologBlocks.push_back(MFI.getProlog());
-    // Epilog = return blocks dominated by Prolog. Use a local domtree.
     MachineDominatorTree DT(MF);
-    for (MachineBasicBlock &MBB : MF) {
-      if (MBB.isReturnBlock() && DT.dominates(MFI.getProlog(), &MBB))
-        EpilogBlocks.push_back(&MBB);
+    MachineBasicBlock *Prolog = MFI.getProlog();
+    MachineBasicBlock *Entry = &MF.front();
+    SmallVector<Register, 4> FrameBound;
+    TFI->getFrameBoundCalleeSaves(MF, FrameBound);
+
+    auto PinFrameBoundToEntry = [&]() {
+      if (FrameBound.empty())
+        return;
+      if (!MFI.getSavePoints().empty()) {
+        SaveRestorePoints NewSP = MFI.getSavePoints();
+        SmallDenseSet<unsigned, 4> FB;
+        for (Register R : FrameBound)
+          if (R)
+            FB.insert(R.id());
+        std::vector<CalleeSavedInfo> Moved;
+        SmallVector<MachineBasicBlock *, 4> Empty;
+        for (auto &KV : NewSP) {
+          if (KV.first == Entry)
+            continue;
+          std::vector<CalleeSavedInfo> Keep;
+          for (const CalleeSavedInfo &CS : KV.second) {
+            if (FB.contains(CS.getReg()))
+              Moved.push_back(CS);
+            else
+              Keep.push_back(CS);
+          }
+          KV.second = std::move(Keep);
+          if (KV.second.empty())
+            Empty.push_back(KV.first);
+        }
+        for (MachineBasicBlock *BB : Empty)
+          NewSP.erase(BB);
+        for (const CalleeSavedInfo &CS : Moved)
+          mergeCSIUnique(NewSP[Entry], CS);
+        MFI.setSavePoints(std::move(NewSP));
+      }
+      if (!MFI.getRestorePoints().empty()) {
+        SaveRestorePoints NewRP = MFI.getRestorePoints();
+        SmallDenseSet<unsigned, 4> FB;
+        for (Register R : FrameBound)
+          if (R)
+            FB.insert(R.id());
+        std::vector<CalleeSavedInfo> FBCSIs;
+        for (auto &KV : NewRP) {
+          for (const CalleeSavedInfo &CS : KV.second)
+            if (FB.contains(CS.getReg()))
+              mergeCSIUnique(FBCSIs, CS);
+          llvm::erase_if(KV.second, [&](const CalleeSavedInfo &CS) {
+            return FB.contains(CS.getReg());
+          });
+        }
+        if (!FBCSIs.empty()) {
+          for (MachineBasicBlock &MBB : MF) {
+            if (!MBB.isReturnBlock())
+              continue;
+            for (const CalleeSavedInfo &CS : FBCSIs)
+              mergeCSIUnique(NewRP[&MBB], CS);
+          }
+        }
+        SmallVector<MachineBasicBlock *, 4> Empty;
+        for (auto &KV : NewRP)
+          if (KV.second.empty())
+            Empty.push_back(KV.first);
+        for (MachineBasicBlock *BB : Empty)
+          NewRP.erase(BB);
+        MFI.setRestorePoints(std::move(NewRP));
+      }
+    };
+
+    if (Prolog != Entry && mustHoistShrinkFramePrologToEntry(MF, Prolog, DT)) {
+      // ShrinkWrapping abandons clones when mustHoist&&clones. PEI must not
+      // undo clones while keeping stale RestorePoints. If clones remain, do not
+      // hoist to Entry (would dominate frameless clones).
+      if (MFI.hasShrinkFrameClones()) {
+        LLVM_DEBUG(dbgs() << "PEI: mustHoist with clones still present "
+                             "(ShrinkWrapping should have undone them) — "
+                             "skip hoist\n");
+      } else {
+        LLVM_DEBUG(
+            dbgs() << "PEI: hoist Prolog from " << printMBBReference(*Prolog)
+                   << " to Entry (main prologue before stack/returns)\n");
+        MFI.setProlog(Entry);
+        Prolog = Entry;
+        PinFrameBoundToEntry();
+      }
     }
-    // Belt-and-suspenders: framed path with no dominated return would emit
-    // addi/sd ra and then ret without ld (infinite loop at post-call). Clear
-    // shrink-frame rather than generating that code.
-    if (EpilogBlocks.empty()) {
-      LLVM_DEBUG(dbgs() << "PEI: shrink-frame Prolog "
-                        << printMBBReference(*MFI.getProlog())
-                        << " dominates no return — ignoring Prolog\n");
-      PrologBlocks.clear();
-      MF.getFrameInfo().setProlog(nullptr);
-      // Fall through to non-shrink-frame placement below.
-    } else {
-      return;
+
+    if (MFI.getProlog()) {
+      Prolog = MFI.getProlog();
+      PrologBlocks.push_back(Prolog);
+      for (MachineBasicBlock &MBB : MF) {
+        if (MBB.isReturnBlock() && DT.dominates(Prolog, &MBB) &&
+            !MFI.isShrinkFrameClone(&MBB))
+          EpilogBlocks.push_back(&MBB);
+      }
+      // Shrink-frame clones must not run emitEpilogue(); CSR ld only via
+      // appendShrinkFrameCloneRestorePoints.
+      if (EpilogBlocks.empty()) {
+        LLVM_DEBUG(dbgs() << "PEI: shrink-frame Prolog "
+                          << printMBBReference(*Prolog)
+                          << " dominates no return — ignoring Prolog\n");
+        PrologBlocks.clear();
+        abandonShrinkFrame(MF);
+        // Fall through to non-shrink-frame placement below.
+      } else {
+        return;
+      }
     }
   }
 
@@ -948,6 +1045,48 @@ static void insertCSRRestores(MachineBasicBlock &RestoreBlock,
   }
 }
 
+/// Insert CSR restores on frameless shared-return clone blocks. The save may
+/// be on an ancestor of the frameless predecessor (not necessarily on the pred
+/// itself). Only clone returns are targeted — never all non-epilog returns.
+static void appendShrinkFrameCloneRestorePoints(
+    MachineFunction &MF, MachineFrameInfo &MFI,
+    DenseMap<MCRegister, CalleeSavedInfo *> &RegToInfo,
+    SaveRestorePoints &Inner) {
+  if (!MFI.hasShrinkFrameClones())
+    return;
+
+  MachineBasicBlock *SFProlog = MFI.getProlog();
+  MachineDominatorTree DT(MF);
+
+  for (const auto &KV : MFI.getShrinkFrameClones()) {
+    MachineBasicBlock *Clone = KV.second;
+    if (!Clone->isReturnBlock() || blockHasNoReturnCall(*Clone))
+      continue;
+
+    for (MachineBasicBlock *Pred : Clone->predecessors()) {
+      if (SFProlog && DT.dominates(SFProlog, Pred))
+        continue;
+
+      for (const auto &[SaveBB, SaveRegs] : MFI.getSavePoints()) {
+        if (SFProlog && DT.dominates(SFProlog, SaveBB))
+          continue;
+        if (SaveBB != Pred && !DT.dominates(SaveBB, Pred))
+          continue;
+
+        for (const CalleeSavedInfo &S : SaveRegs) {
+          if (!isLegalOffPrologCSRSaveForCloneRestore(MF, SFProlog, SaveBB,
+                                                      S.getReg(), DT))
+            continue;
+          auto It = RegToInfo.find(S.getReg());
+          if (It == RegToInfo.end())
+            continue;
+          mergeCSIUnique(Inner[Clone], *It->second);
+        }
+      }
+    }
+  }
+}
+
 /// Fill per-BB CalleeSavedInfo vectors for multi-point save/restore maps.
 /// Registers listed in SavePoints/RestorePoints are resolved against
 /// \p RegToInfo. Any CSR missing from those lists is spilled/restored in
@@ -974,7 +1113,9 @@ static void fillCSInfoPerBB(MachineFrameInfo &MFI,
       // Drop restores on returns not dominated by any save of this CSR.
       // Never drop frame-bound CSRs (ra/FP): they are pinned to the frame
       // prolog and must be restored on returns (GCC separate policy / pr51933).
-      if (!IsSave && BB->isReturnBlock()) {
+      // Clone returns get non-frame-bound restores from
+      // appendShrinkFrameCloneRestorePoints below.
+      if (!IsSave && BB->isReturnBlock() && !MFI.isShrinkFrameClone(BB)) {
         bool DominatedBySave = false;
         unsigned NumSaves = 0;
         for (const auto &[SaveBB, SaveRegs] : MFI.getSavePoints()) {
@@ -1033,10 +1174,38 @@ static void fillCSInfoPerBB(MachineFrameInfo &MFI,
           AnySave = true;
           collectDominatedEpilogs(SaveBB, PrologEpilogBlocks, DT, Dominated);
         }
-        if (!AnySave)
+        if (!AnySave) {
           Targets.assign(PrologEpilogBlocks.begin(), PrologEpilogBlocks.end());
-        else
+        } else if (!Dominated.empty()) {
           Targets.assign(Dominated.begin(), Dominated.end());
+        } else {
+          // Shared-return diamond (pr78622): restore was listed on a join
+          // return that is not dominated by the save, so it was dropped above.
+          // No epilog is dominated either. Restore on each predecessor of a
+          // return that lies on the save side (insertCSRRestores places ld
+          // before the terminator — after the hot-path work, before the join).
+          //
+          // Only Pred with a unique successor == Epilog: a multi-exit Pred
+          // would restore on non-return paths too.
+          SmallPtrSet<MachineBasicBlock *, 8> PredTargets;
+          for (MachineBasicBlock *Epilog : PrologEpilogBlocks) {
+            if (!Epilog->isReturnBlock() || blockHasNoReturnCall(*Epilog))
+              continue;
+            for (MachineBasicBlock *Pred : Epilog->predecessors()) {
+              if (Pred->succ_size() != 1 || *Pred->succ_begin() != Epilog)
+                continue;
+              for (const auto &[SaveBB, SaveRegs] : MFI.getSavePoints()) {
+                if (!any_of(SaveRegs, [&](const CalleeSavedInfo &S) {
+                      return S.getReg() == RTI.first;
+                    }))
+                  continue;
+                if (Pred == SaveBB || DT.dominates(SaveBB, Pred))
+                  PredTargets.insert(Pred);
+              }
+            }
+          }
+          Targets.assign(PredTargets.begin(), PredTargets.end());
+        }
       }
 
       for (MachineBasicBlock *BB : Targets) {
@@ -1051,6 +1220,18 @@ static void fillCSInfoPerBB(MachineFrameInfo &MFI,
         Inner.try_emplace(BB, std::vector<CalleeSavedInfo>{*RTI.second});
       }
     }
+  }
+
+  if (!IsSave && MFI.hasShrinkFrameClones()) {
+    MachineFunction *MFF = nullptr;
+    if (!PrologEpilogBlocks.empty())
+      MFF = PrologEpilogBlocks.front()->getParent();
+    else if (!MFI.getSavePoints().empty())
+      MFF = MFI.getSavePoints().begin()->first->getParent();
+    else if (!MFI.getShrinkFrameClones().empty())
+      MFF = MFI.getShrinkFrameClones().begin()->second->getParent();
+    if (MFF)
+      appendShrinkFrameCloneRestorePoints(*MFF, MFI, RegToInfo, Inner);
   }
 
   if (IsSave)
@@ -1097,6 +1278,92 @@ void PEIImpl::spillCalleeSavedRegs(MachineFunction &MF) {
 
       if (!MFI.getSavePoints().empty()) {
         fillCSInfoPerBB(MFI, RegToInfo, PrologBlocks, /*IsSave=*/true);
+
+        // SP-relative CSR spills must not run before addi sp (bc_modulo /
+        // pr78622):
+        //   sd s1, 0x18(sp); ...; addi sp, -N; sd ra...
+        // writes into the caller's frame. Fallthrough-merge (save -> prolog) is
+        // not enough when the save is earlier on the path. Hoist the frame
+        // prolog to dominate those saves, and move CSR saves onto it.
+        if (!PrologBlocks.empty()) {
+          MachineFunction &MFRef = *PrologBlocks.front()->getParent();
+          MachineDominatorTree DT(MFRef);
+          MachineBasicBlock *CurProlog = PrologBlocks.front();
+          MachineBasicBlock *NewProlog = CurProlog;
+          for (const auto &KV : MFI.getSavePoints()) {
+            MachineBasicBlock *SaveBB = KV.first;
+            if (SaveBB == NewProlog || DT.dominates(NewProlog, SaveBB))
+              continue;
+            // Save is not after the current prolog. If SaveBB dominates the
+            // prolog (linear prefix) or they share an NCD, hoist there.
+            MachineBasicBlock *Cand =
+                DT.findNearestCommonDominator(SaveBB, NewProlog);
+            if (Cand)
+              NewProlog = Cand;
+          }
+          if (NewProlog != CurProlog) {
+            LLVM_DEBUG(dbgs() << "PEI: hoist prolog from "
+                              << printMBBReference(*CurProlog) << " to "
+                              << printMBBReference(*NewProlog)
+                              << " to cover early CSR saves\n");
+            PrologBlocks.clear();
+            PrologBlocks.push_back(NewProlog);
+            if (MFI.getProlog() == CurProlog)
+              MFI.setProlog(NewProlog);
+
+            // Move CSR saves that are not dominated by the new prolog onto it
+            // (they would otherwise run before addi sp). Saves already after
+            // NewProlog stay (legal delayed CSR).
+            SmallVector<MachineBasicBlock *, 4> Erase;
+            SaveRestorePoints NewSP = MFI.getSavePoints();
+            for (const auto &KV : MFI.getSavePoints()) {
+              MachineBasicBlock *BB = KV.first;
+              if (BB == NewProlog || DT.dominates(NewProlog, BB))
+                continue;
+              Erase.push_back(BB);
+            }
+            for (MachineBasicBlock *BB : Erase) {
+              auto It = NewSP.find(BB);
+              if (It == NewSP.end())
+                continue;
+              auto &Dest = NewSP[NewProlog];
+              for (const CalleeSavedInfo &CS : It->second)
+                mergeCSIUnique(Dest, CS);
+              NewSP.erase(It);
+            }
+            MFI.setSavePoints(std::move(NewSP));
+          } else {
+            // Same prolog BB: still merge immediate fallthrough save preds
+            // (pr78622 diamond edge).
+            SmallVector<std::pair<MachineBasicBlock *, MachineBasicBlock *>, 4>
+                Moves;
+            for (const auto &KV : MFI.getSavePoints()) {
+              MachineBasicBlock *BB = KV.first;
+              if (is_contained(PrologBlocks, BB))
+                continue;
+              if (BB->succ_size() != 1)
+                continue;
+              MachineBasicBlock *Succ = *BB->succ_begin();
+              if (!is_contained(PrologBlocks, Succ))
+                continue;
+              Moves.emplace_back(BB, Succ);
+            }
+            if (!Moves.empty()) {
+              SaveRestorePoints NewSP = MFI.getSavePoints();
+              for (auto [From, To] : Moves) {
+                auto It = NewSP.find(From);
+                if (It == NewSP.end())
+                  continue;
+                auto &Dest = NewSP[To];
+                for (const CalleeSavedInfo &CS : It->second)
+                  mergeCSIUnique(Dest, CS);
+                NewSP.erase(It);
+              }
+              MFI.setSavePoints(std::move(NewSP));
+            }
+          }
+        }
+
         fillCSInfoPerBB(MFI, RegToInfo, EpilogBlocks, /*IsSave=*/false);
       } else {
         SaveRestorePoints SavePts;

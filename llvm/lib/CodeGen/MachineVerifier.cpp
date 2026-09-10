@@ -3519,11 +3519,14 @@ verifyConvergenceControl(const MachineFunction &MF, MachineDominatorTree &DT,
 }
 
 void MachineVerifier::visitMachineFunctionAfter() {
-  // Verify shrink-frame invariants when Prolog is set.
-  if (MachineBasicBlock *Prolog = MF->getFrameInfo().getProlog()) {
-    if (Prolog == &MF->front())
-      report("Shrink-frame Prolog must not be the entry block", MF);
+  const MachineFrameInfo &MFI = MF->getFrameInfo();
 
+  // Orphan frameless shared-return clones without a Prolog are forbidden.
+  if (!MFI.getProlog() && MFI.hasShrinkFrameClones())
+    report("Shrink-frame: clone pairs present without Prolog", MF);
+
+  // Verify shrink-frame invariants when Prolog is set.
+  if (MachineBasicBlock *Prolog = MFI.getProlog()) {
     bool Found = false;
     for (const MachineBasicBlock &MBB : *MF) {
       if (&MBB == Prolog) {
@@ -3537,6 +3540,26 @@ void MachineVerifier::visitMachineFunctionAfter() {
     // No-frame blocks (not dominated by Prolog) must not contain frame indices.
     if (Found) {
       MachineDominatorTree SFDomTree(*const_cast<MachineFunction *>(MF));
+
+      for (const auto &KV : MFI.getShrinkFrameClones()) {
+        MachineBasicBlock *Orig = KV.first;
+        MachineBasicBlock *Clone = KV.second;
+        // Erased MBBs keep getParent() but Number == -1; DomTree then treats
+        // them as unreachable and "dominated by anything".
+        auto StillInFunction = [&](const MachineBasicBlock *BB) {
+          return BB && BB->getParent() == MF && BB->getNumber() >= 0 &&
+                 SFDomTree.getNode(BB);
+        };
+        if (!StillInFunction(Orig) || !StillInFunction(Clone)) {
+          report("Shrink-frame: dangling clone pair", MF);
+          continue;
+        }
+        if (!SFDomTree.dominates(Prolog, Orig))
+          report("Shrink-frame: original return not dominated by Prolog", Orig);
+        if (SFDomTree.dominates(Prolog, Clone))
+          report("Shrink-frame: frameless clone dominated by Prolog", Clone);
+      }
+
       for (const MachineBasicBlock &MBB : *MF) {
         const bool InFrame = SFDomTree.dominates(Prolog, &MBB);
 

@@ -48,9 +48,11 @@
 #include "llvm/ADT/Statistic.h"
 #include "llvm/Analysis/CFG.h"
 #include "llvm/Analysis/ValueTracking.h"
+#include "llvm/CodeGen/LivePhysRegs.h"
 #include "llvm/CodeGen/MachineBlockFrequencyInfo.h"
 #include "llvm/CodeGen/MachineDominators.h"
 #include "llvm/CodeGen/MachineFrameInfo.h"
+#include "llvm/CodeGen/MachineFunction.h"
 #include "llvm/CodeGen/MachineInstr.h"
 #include "llvm/CodeGen/MachineJumpTableInfo.h"
 #include "llvm/CodeGen/MachineLoopInfo.h"
@@ -58,6 +60,7 @@
 #include "llvm/CodeGen/MachineRegisterInfo.h"
 #include "llvm/CodeGen/RegisterClassInfo.h"
 #include "llvm/CodeGen/RegisterScavenging.h"
+#include "llvm/CodeGen/ShrinkFrameUtils.h"
 #include "llvm/CodeGen/TargetFrameLowering.h"
 #include "llvm/CodeGen/TargetInstrInfo.h"
 #include "llvm/CodeGen/TargetLowering.h"
@@ -67,6 +70,8 @@
 #include "llvm/IR/Function.h"
 #include "llvm/InitializePasses.h"
 #include "llvm/MC/MCAsmInfo.h"
+#include "llvm/MC/MCContext.h"
+#include "llvm/MC/MCSymbol.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/Compiler.h"
 #include "llvm/Support/Debug.h"
@@ -78,6 +83,8 @@ using namespace llvm;
 STATISTIC(numSRReduced, "Number of CSR spills+restores reduced.");
 STATISTIC(NumFunc, "Number of functions");
 STATISTIC(NumShrinkFrame, "Number of functions with frame shrunk to non-entry");
+STATISTIC(NumShrinkFrameDup,
+          "Number of return blocks duplicated for shrink-frame");
 STATISTIC(NumNotSaveOrRestore,
           "Number of cases, in which one of the sets are empty.");
 STATISTIC(NumCandidates, "Number of shrink-wrapping candidates");
@@ -95,6 +102,15 @@ static cl::opt<bool> EnableShrinkWrappingSplitOpt(
 static cl::opt<bool> DisableShrinkFrame(
     "disable-shrink-frame", cl::init(false), cl::Hidden,
     cl::desc("Disable moving stack frame setup from entry to a later block"));
+
+static cl::opt<bool> DisableShrinkFrameDup(
+    "disable-riscv-shrink-frame-dup", cl::init(false), cl::Hidden,
+    cl::desc("Disable BB duplication for shrink-frame on shared returns"));
+
+static cl::opt<unsigned> ShrinkFrameMaxDupInsns(
+    "max-dup-insns", cl::init(16), cl::Hidden,
+    cl::desc("Max instructions to duplicate for shrink-frame shared returns "
+             "(0 disables duplication)"));
 
 // Debugging level for shrink wrapping.
 enum ShrinkWrappingDebugLevel { Disabled, BasicInfo, Iterations, Details };
@@ -179,6 +195,27 @@ struct AuxGraph {
     if (It != Nodes.end())
       return *It;
     return nullptr;
+  }
+
+  /// Edge node Pred -> Succ (MatchMBB == nullptr), or nullptr.
+  AuxGraphNode *getEdgeNode(MachineBasicBlock *Pred, MachineBasicBlock *Succ) {
+    AuxGraphNode *PN = getNode(Pred);
+    AuxGraphNode *SN = getNode(Succ);
+    if (!PN || !SN)
+      return nullptr;
+    for (AuxGraphNode *Edge : PN->Successors) {
+      if (!Edge->MatchMBB && Edge->succ_size() == 1 &&
+          *Edge->succ_begin() == SN)
+        return Edge;
+    }
+    return nullptr;
+  }
+
+  void clear() {
+    for (AuxGraphNode *N : Nodes)
+      delete N;
+    Nodes.clear();
+    Entry = nullptr;
   }
 };
 
@@ -340,7 +377,9 @@ class ShrinkWrappingImpl {
   MachineBasicBlock *Prolog = nullptr;
   MachineBasicBlock *Epilog = nullptr;
 
-  // Entry and return blocks of the current function.
+  // Entry and return blocks of the current function (includes frameless
+  // shared-return clones --needed for choke/exit dominance). CSR restore
+  // placement must filter clones separately via allowCSRRestoreOn().
   SmallVector<MachineBasicBlock *, 4> ReturnBlocks;
 
   /// Hold the loop information. Used to determine if Save and Restore
@@ -445,7 +484,34 @@ class ShrinkWrappingImpl {
 
   /// Move frame setup from entry to the nearest common dominator of all
   /// frame-requiring blocks. Returns true if a non-entry Prolog was chosen.
-  bool runShrinkFrame(MachineFunction &MF);
+  /// \p AllowDup enables shared-return block duplication for shrink-frame.
+  bool runShrinkFrame(MachineFunction &MF, bool AllowDup);
+
+  /// Frameless shared-return clones are real exits for dominance/choke
+  /// analysis but must never receive CSR restores (no frame on that path).
+  bool allowCSRRestoreOn(const MachineBasicBlock *BB) const {
+    return BB && !MachineFunc->getFrameInfo().isShrinkFrameClone(BB);
+  }
+
+  /// Helpers for duplicating shared returns to enable shrink-frame.
+  bool isReachableFrom(MachineBasicBlock *From, MachineBasicBlock *To) const;
+  bool isPureFramedPred(MachineBasicBlock *Pred, MachineBasicBlock *P0) const;
+  bool isPureFramelessPred(MachineBasicBlock *Pred,
+                           MachineBasicBlock *P0) const;
+  bool hasNonReturnMixedJoin(MachineBasicBlock *P0) const;
+  MachineBasicBlock *liftOutOfLoops(MachineBasicBlock *P) const;
+  unsigned countDupInsns(const MachineBasicBlock &MBB) const;
+  bool canDupSharedReturn(MachineBasicBlock &J, MachineBasicBlock *P0) const;
+  bool cloneSharedReturn(MachineBasicBlock &Orig, MachineBasicBlock *P0);
+  void undoAllShrinkFrameClones(MachineFunction &MF);
+  /// Undo shared-return clones, clear Prolog/Epilog and MFI CSR half-state.
+  /// Call instead of bare setProlog(nullptr) whenever shrink-frame must fully
+  /// roll back.
+  void rollbackShrinkFrame(MachineFunction &MF);
+  /// Undo clones then retry shrink-frame without duplication. Prefer over
+  /// rollbackShrinkFrame when Clamp rejects an off-Prolog save but shrink-frame
+  /// without dup may still succeed.
+  bool demoteShrinkFrameCToB(MachineFunction &MF);
 
   void findFastExitPath();
 
@@ -1181,6 +1247,8 @@ bool ShrinkWrappingImpl::calculateSets(
   // MachineLoopInfo &LI = getAnalysis<MachineLoopInfo>();
   // MachineDominatorTree &DT = getAnalysis<MachineDominatorTree>();
 
+  ReturnBlocks.clear();
+  CSRUsed.clear();
   for (MachineFunction::iterator MBB = MF.begin(), E = MF.end(); MBB != E;
        ++MBB)
     if (MBB->isReturnBlock())
@@ -1356,7 +1424,8 @@ bool ShrinkWrappingImpl::calcSpillPlacements(
   if (!CSRSave[Node].empty()) {
     if (Node == AuxillaryCFG.getNode(Entry)) {
       for (unsigned ri = 0, re = ReturnBlocks.size(); ri != re; ++ri)
-        CSRRestore[AuxillaryCFG.getNode(ReturnBlocks[ri])] |= CSRSave[Node];
+        if (allowCSRRestoreOn(ReturnBlocks[ri]))
+          CSRRestore[AuxillaryCFG.getNode(ReturnBlocks[ri])] |= CSRSave[Node];
     } else {
       // Reset all regs spilled in MBB that are also spilled in EntryBlock.
       if (CSRSave[AuxillaryCFG.getNode(Entry)].intersects(CSRSave[Node])) {
@@ -1405,13 +1474,15 @@ bool ShrinkWrappingImpl::calcRestorePlacements(
       SUCC = successors[i];
       availOutSucc &= (UsedCSRegs - AvailOut[SUCC]);
     }
-  } else if (Node->MatchMBB && Node->MatchMBB->isReturnBlock()) {
+  } else if (Node->MatchMBB && Node->MatchMBB->isReturnBlock() &&
+             allowCSRRestoreOn(Node->MatchMBB)) {
     // Leaf return blocks: place restores (DFA assumes exits have no uses).
     // Do NOT treat noreturn exits (e.g. call __cxa_throw + barrier) as
-    // returns — restore+CFI after noreturn poisons FDE at the call RA
+    // returns --restore+CFI after noreturn poisons FDE at the call RA
     // (libunwind uses pc after the call). Unwind recovers CSRs via save
     // CFI instead. Matches GCC separate shrink-wrap: epi only on paths
     // that leave the framed region toward a normal EXIT.
+    // Frameless shared-return clones are skipped (no frame on that path).
     CSRegSet Used = CSRUsed[Node->MatchMBB];
     if (!Used.empty() || !AvailOut[Node].empty())
       availOutSucc = UsedCSRegs;
@@ -1529,7 +1600,277 @@ bool ShrinkWrappingImpl::blockNeedsFrame(const MachineBasicBlock &MBB) const {
   return false;
 }
 
-bool ShrinkWrappingImpl::runShrinkFrame(MachineFunction &MF) {
+bool ShrinkWrappingImpl::isReachableFrom(MachineBasicBlock *From,
+                                         MachineBasicBlock *To) const {
+  for (auto DI = df_begin(From), DE = df_end(From); DI != DE; ++DI)
+    if (*DI == To)
+      return true;
+  return false;
+}
+
+bool ShrinkWrappingImpl::isPureFramedPred(MachineBasicBlock *Pred,
+                                          MachineBasicBlock *P0) const {
+  return MDT->dominates(P0, Pred);
+}
+
+bool ShrinkWrappingImpl::isPureFramelessPred(MachineBasicBlock *Pred,
+                                             MachineBasicBlock *P0) const {
+  return !MDT->dominates(P0, Pred) && !isReachableFrom(P0, Pred);
+}
+
+bool ShrinkWrappingImpl::hasNonReturnMixedJoin(MachineBasicBlock *P0) const {
+  for (MachineBasicBlock &MBB : *MachineFunc) {
+    if (MBB.isReturnBlock())
+      continue;
+    if (MDT->dominates(P0, &MBB))
+      continue;
+    if (isReachableFrom(P0, &MBB))
+      return true;
+  }
+  return false;
+}
+
+MachineBasicBlock *
+ShrinkWrappingImpl::liftOutOfLoops(MachineBasicBlock *P) const {
+  while (MachineLoop *L = MLI->getLoopFor(P)) {
+    MachineBasicBlock *PH = L->getLoopPreheader();
+    if (!PH)
+      return nullptr;
+    P = PH;
+  }
+  return P;
+}
+
+unsigned ShrinkWrappingImpl::countDupInsns(const MachineBasicBlock &MBB) const {
+  unsigned N = 0;
+  for (const MachineInstr &MI : MBB)
+    if (!MI.isMetaInstruction())
+      ++N;
+  return N;
+}
+
+bool ShrinkWrappingImpl::canDupSharedReturn(MachineBasicBlock &J,
+                                            MachineBasicBlock *P0) const {
+  if (!J.isReturnBlock() || blockNeedsFrame(J) || J.isEHPad())
+    return false;
+  if (MLI->getLoopFor(&J))
+    return false;
+
+  const TargetInstrInfo *TII = MachineFunc->getSubtarget().getInstrInfo();
+  bool SawReturn = false;
+  for (const MachineInstr &MI : J.terminators()) {
+    if (MI.isMetaInstruction())
+      continue;
+    if (MI.isBundle())
+      return false;
+    if (TII->isTailCall(MI) || !MI.isReturn())
+      return false;
+    SawReturn = true;
+  }
+  if (!SawReturn)
+    return false;
+
+  bool HasFramed = false;
+  bool HasFrameless = false;
+  for (MachineBasicBlock *Pred : J.predecessors()) {
+    if (isPureFramedPred(Pred, P0)) {
+      HasFramed = true;
+    } else if (isPureFramelessPred(Pred, P0)) {
+      HasFrameless = true;
+      MachineBasicBlock *TBB = nullptr, *FBB = nullptr;
+      SmallVector<MachineOperand, 4> Cond;
+      if (TII->analyzeBranch(*Pred, TBB, FBB, Cond))
+        return false;
+    } else {
+      // Mixed / ambiguous predecessor --caller gives up C.
+      return false;
+    }
+  }
+  return HasFramed && HasFrameless;
+}
+
+bool ShrinkWrappingImpl::cloneSharedReturn(MachineBasicBlock &Orig,
+                                           MachineBasicBlock *P0) {
+  MachineFunction &MF = *MachineFunc;
+  MachineFrameInfo &MFI = MF.getFrameInfo();
+  const TargetInstrInfo *TII = MF.getSubtarget().getInstrInfo();
+
+  MachineBasicBlock *Clone = MF.CreateMachineBasicBlock(Orig.getBasicBlock());
+  Clone->setCallFrameSize(Orig.getCallFrameSize());
+  MF.insert(std::next(MachineFunction::iterator(&Orig)), Clone);
+
+  // CloneMachineInstr copies Pre/PostInstrSymbol pointers. Emitting the same
+  // temp label twice (e.g. .Lpcrel_hiN for AUIPC/%pcrel_lo) fails the
+  // assembler. Remap labels defined in this block and MCSymbol operands that
+  // refer to them.
+  DenseMap<MCSymbol *, MCSymbol *> SymbolMap;
+  for (const MachineInstr &MI : Orig) {
+    auto NoteDef = [&](MCSymbol *S) {
+      if (!S || SymbolMap.contains(S))
+        return;
+      SymbolMap[S] = MF.getContext().createNamedTempSymbol("pcrel_hi");
+    };
+    NoteDef(MI.getPreInstrSymbol());
+    NoteDef(MI.getPostInstrSymbol());
+  }
+
+  for (MachineInstr &MI : Orig) {
+    MachineInstr *NewMI = MF.CloneMachineInstr(&MI);
+    NewMI->clearKillInfo();
+    if (MCSymbol *S = NewMI->getPreInstrSymbol()) {
+      auto It = SymbolMap.find(S);
+      assert(It != SymbolMap.end());
+      NewMI->setPreInstrSymbol(MF, It->second);
+    }
+    if (MCSymbol *S = NewMI->getPostInstrSymbol()) {
+      auto It = SymbolMap.find(S);
+      assert(It != SymbolMap.end());
+      NewMI->setPostInstrSymbol(MF, It->second);
+    }
+    if (!SymbolMap.empty()) {
+      for (MachineOperand &MO : NewMI->operands()) {
+        if (!MO.isMCSymbol())
+          continue;
+        auto It = SymbolMap.find(MO.getMCSymbol());
+        if (It != SymbolMap.end())
+          MO.ChangeToMCSymbol(It->second, MO.getTargetFlags());
+      }
+    }
+    Clone->push_back(NewMI);
+  }
+
+  for (auto SI = Orig.succ_begin(), SE = Orig.succ_end(); SI != SE; ++SI)
+    Clone->copySuccessor(&Orig, SI);
+
+  // Redirect frameless preds; on failure restore already-moved edges and erase
+  // the unregistered clone (pair map is updated only on success).
+  SmallVector<MachineBasicBlock *, 4> Redirected;
+  auto FailAndCleanup = [&]() {
+    for (MachineBasicBlock *Pred : Redirected) {
+      MachineBasicBlock *PrevFT = Pred->getNextNode();
+      const bool WasCloneFT = PrevFT == Clone;
+      Pred->ReplaceUsesOfBlockWith(Clone, &Orig);
+      MachineBasicBlock *TBB = nullptr, *FBB = nullptr;
+      SmallVector<MachineOperand, 4> Cond;
+      if (!TII->analyzeBranch(*Pred, TBB, FBB, Cond))
+        Pred->updateTerminator(WasCloneFT ? &Orig : PrevFT);
+    }
+    Clone->eraseFromParent();
+    return false;
+  };
+
+  SmallVector<MachineBasicBlock *, 4> Preds(Orig.pred_begin(), Orig.pred_end());
+  for (MachineBasicBlock *Pred : Preds) {
+    if (!isPureFramelessPred(Pred, P0))
+      continue;
+    MachineBasicBlock *TBB = nullptr, *FBB = nullptr;
+    SmallVector<MachineOperand, 4> Cond;
+    if (TII->analyzeBranch(*Pred, TBB, FBB, Cond))
+      return FailAndCleanup();
+
+    MachineBasicBlock *PrevFT = Pred->getNextNode();
+    const bool WasOrigFallthrough = PrevFT == &Orig;
+    Pred->ReplaceUsesOfBlockWith(&Orig, Clone);
+    Redirected.push_back(Pred);
+    Pred->updateTerminator(WasOrigFallthrough ? Clone : PrevFT);
+  }
+
+  if (Redirected.empty())
+    return FailAndCleanup();
+
+  // Only mutate Orig kills after redirects succeed.
+  for (MachineInstr &MI : Orig)
+    MI.clearKillInfo();
+
+  if (MF.getRegInfo().tracksLiveness()) {
+    MachineBasicBlock *Blocks[] = {&Orig, Clone};
+    fullyRecomputeLiveIns(Blocks);
+  }
+
+  MFI.registerShrinkFrameClone(&Orig, Clone);
+  ++NumShrinkFrameDup;
+  LLVM_DEBUG(dbgs() << "Shrink-frame: cloned " << printMBBReference(Orig)
+                    << " -> " << printMBBReference(*Clone) << "\n");
+  return true;
+}
+
+void ShrinkWrappingImpl::undoAllShrinkFrameClones(MachineFunction &MF) {
+  MachineFrameInfo &MFI = MF.getFrameInfo();
+  if (!MFI.hasShrinkFrameClones())
+    return;
+
+  // Scrub CSR / return bookkeeping before blocks disappear.
+  for (const auto &KV : MFI.getShrinkFrameClones()) {
+    MachineBasicBlock *Clone = KV.second;
+    if (AuxGraphNode *N = AuxillaryCFG.getNode(Clone)) {
+      CSRSave.erase(N);
+      CSRRestore.erase(N);
+      N->MatchMBB = nullptr;
+    }
+    llvm::erase(ReturnBlocks, Clone);
+  }
+
+  undoShrinkFrameClones(MF);
+}
+
+void ShrinkWrappingImpl::rollbackShrinkFrame(MachineFunction &MF) {
+  LLVM_DEBUG(dbgs() << "Shrink-frame rollback for " << MF.getName() << "\n");
+  MachineFrameInfo &MFI = MF.getFrameInfo();
+  const bool HadClones = MFI.hasShrinkFrameClones();
+  // Scrub CSR maps that reference clones, then abandon Prolog + pairs.
+  // Caller must recompute CSRSave/CSRRestore on the restored CFG (see Clamp
+  // path in run()) — these in-memory maps are left stale on purpose here.
+  undoAllShrinkFrameClones(MF);
+  MFI.setProlog(nullptr);
+  MFI.setEpilog(nullptr);
+  MFI.clearSavePoints();
+  MFI.clearRestorePoints();
+  if (HadClones) {
+    MDT->recalculate(MF);
+    MPDT->recalculate(MF);
+    MLI->calculate(*MDT);
+  }
+}
+
+/// Undo shared-return clones, then retry shrink-frame without duplication.
+/// Returns true if a non-entry Prolog was placed. Used when Clamp rejects an
+/// off-Prolog CSR save so we retry without dup instead of abandoning
+/// shrink-frame entirely.
+bool ShrinkWrappingImpl::demoteShrinkFrameCToB(MachineFunction &MF) {
+  MachineFrameInfo &MFI = MF.getFrameInfo();
+  LLVM_DEBUG(dbgs() << "Shrink-frame: retry without shared-return dup for "
+                    << MF.getName() << "\n");
+  undoAllShrinkFrameClones(MF);
+  MFI.setProlog(nullptr);
+  MFI.setEpilog(nullptr);
+  MFI.clearSavePoints();
+  MFI.clearRestorePoints();
+  MDT->recalculate(MF);
+  MPDT->recalculate(MF);
+  MLI->calculate(*MDT);
+  return runShrinkFrame(MF, /*AllowDup=*/false);
+}
+
+/// True if any CFG edge illegally enters the prospective frame region (only
+/// Pred -> P0 is allowed when crossing into the framed set).
+static bool hasIllegalFrameEntryEdge(MachineFunction &MF, MachineBasicBlock *P0,
+                                     MachineDominatorTree &DT) {
+  for (MachineBasicBlock &Pred : MF) {
+    const bool PredFramed = DT.dominates(P0, &Pred);
+    for (MachineBasicBlock *Succ : Pred.successors()) {
+      const bool SuccFramed = DT.dominates(P0, Succ);
+      if (PredFramed == SuccFramed)
+        continue;
+      if (!PredFramed && SuccFramed && Succ != P0)
+        return true;
+      if (PredFramed && !SuccFramed)
+        return true;
+    }
+  }
+  return false;
+}
+
+bool ShrinkWrappingImpl::runShrinkFrame(MachineFunction &MF, bool AllowDup) {
   if (DisableShrinkFrame)
     return false;
 
@@ -1571,59 +1912,168 @@ bool ShrinkWrappingImpl::runShrinkFrame(MachineFunction &MF) {
     return false;
 
   // Compute NCD (nearest common dominator) of all frame-needing blocks.
-  MachineBasicBlock *P = FrameBlocks[0];
+  MachineBasicBlock *P0 = FrameBlocks[0];
   for (unsigned I = 1, E = FrameBlocks.size(); I < E; ++I) {
-    P = MDT->findNearestCommonDominator(P, FrameBlocks[I]);
-    if (!P)
+    P0 = MDT->findNearestCommonDominator(P0, FrameBlocks[I]);
+    if (!P0)
       break;
   }
 
-  if (!P || P == Entry)
+  if (!P0 || P0 == Entry)
     return false;
 
-  // Prolog must not be inside a loop — lift to preheader, repeating for nested
-  // loops until P is outside every loop (a single lift can leave P inside an
-  // outer loop's body).
-  while (MachineLoop *L = MLI->getLoopFor(P)) {
-    MachineBasicBlock *PH = L->getLoopPreheader();
-    if (!PH || PH == Entry)
-      return false;
-    P = PH;
-    if (P == Entry)
-      return false;
+  P0 = liftOutOfLoops(P0);
+  if (!P0 || P0 == Entry)
+    return false;
+
+  auto RebuildCFGAnalyses = [&]() {
+    MDT->recalculate(MF);
+    MPDT->recalculate(MF);
+    MLI->calculate(*MDT);
+  };
+
+  auto CollectMixedReturns = [&](MachineBasicBlock *P,
+                                 SmallVectorImpl<MachineBasicBlock *> &Out) {
+    Out.clear();
+    for (MachineBasicBlock &MBB : MF) {
+      if (!MBB.isReturnBlock())
+        continue;
+      if (MDT->dominates(P, &MBB))
+        continue;
+      if (isReachableFrom(P, &MBB))
+        Out.push_back(&MBB);
+    }
+  };
+
+  auto GiveUpDup = [&]() {
+    if (MFI.hasShrinkFrameClones()) {
+      undoAllShrinkFrameClones(MF);
+      RebuildCFGAnalyses();
+    }
+    return false;
+  };
+
+  // Non-return mixed join: only return duplication cannot fix this.
+  if (hasNonReturnMixedJoin(P0)) {
+    LLVM_DEBUG(dbgs() << "Shrink-frame bail: non-return mixed join from "
+                      << printMBBReference(*P0) << "\n");
+    return false;
   }
 
-  // Verify no "mixed SP" convergence: a return reachable from Prolog but not
-  // dominated by it means a framed path shares a frameless epilogue (no ld ra /
-  // addi). Classic symptom: call clobbers ra, ret jumps to the post-call insn
-  // → infinite loop (502.gcc is_gimple_invariant_address). Checking only
-  // "P dominates a predecessor of the return" misses joins where the
-  // immediate predecessor is itself a merge of framed and frameless paths.
-  for (MachineBasicBlock &MBB : MF) {
-    if (!MBB.isReturnBlock())
-      continue;
-    if (MDT->dominates(P, &MBB))
-      continue;
-    // Frameless return: must not be reachable from P.
-    for (auto DI = df_begin(P), DE = df_end(P); DI != DE; ++DI) {
-      if (*DI == &MBB) {
-        LLVM_DEBUG(dbgs() << "Shrink-frame bail: return "
-                          << printMBBReference(MBB) << " reachable from Prolog "
-                          << printMBBReference(*P)
-                          << " but not dominated by it\n");
-        return false;
+  SmallVector<MachineBasicBlock *, 4> MixedReturns;
+  CollectMixedReturns(P0, MixedReturns);
+
+  if (!MixedReturns.empty()) {
+    if (!AllowDup)
+      return false;
+
+    unsigned Budget = ShrinkFrameMaxDupInsns;
+    unsigned LiftAttempts = 0;
+    constexpr unsigned MaxLift = 2;
+
+    while (!MixedReturns.empty()) {
+      // Prefer smaller blocks first.
+      llvm::sort(MixedReturns, [&](MachineBasicBlock *A, MachineBasicBlock *B) {
+        return countDupInsns(*A) < countDupInsns(*B);
+      });
+
+      for (MachineBasicBlock *J : MixedReturns) {
+        // Ambiguous preds: hard give-up.
+        bool Ambiguous = false;
+        for (MachineBasicBlock *Pred : J->predecessors()) {
+          if (!isPureFramedPred(Pred, P0) && !isPureFramelessPred(Pred, P0)) {
+            Ambiguous = true;
+            break;
+          }
+        }
+        if (Ambiguous) {
+          LLVM_DEBUG(dbgs() << "Shrink-frame giveUp: ambiguous pred of "
+                            << printMBBReference(*J) << "\n");
+          return GiveUpDup();
+        }
+
+        unsigned Cost = countDupInsns(*J);
+        if (Cost > Budget || !canDupSharedReturn(*J, P0))
+          continue;
+
+        if (!cloneSharedReturn(*J, P0))
+          return GiveUpDup();
+        Budget -= Cost;
+        RebuildCFGAnalyses();
+
+        if (hasNonReturnMixedJoin(P0) || hasIllegalFrameEntryEdge(MF, P0, *MDT))
+          return GiveUpDup();
       }
+
+      CollectMixedReturns(P0, MixedReturns);
+      if (MixedReturns.empty())
+        break;
+
+      // Still mixed: undo this round's clones (if any) and lift P0 to idom,
+      // even when no block was cloned (lift alone may dominate remaining
+      // returns).
+      if (LiftAttempts >= MaxLift) {
+        LLVM_DEBUG(dbgs() << "Shrink-frame giveUp: still mixed after dup\n");
+        return GiveUpDup();
+      }
+
+      undoAllShrinkFrameClones(MF);
+      Budget = ShrinkFrameMaxDupInsns;
+      RebuildCFGAnalyses();
+
+      MachineDomTreeNode *PN = MDT->getNode(P0);
+      if (!PN || !PN->getIDom())
+        return GiveUpDup();
+      MachineBasicBlock *Next = PN->getIDom()->getBlock();
+      Next = liftOutOfLoops(Next);
+      if (!Next || Next == Entry || Next == P0)
+        return GiveUpDup();
+      P0 = Next;
+      ++LiftAttempts;
+
+      if (hasNonReturnMixedJoin(P0))
+        return GiveUpDup();
+      CollectMixedReturns(P0, MixedReturns);
     }
   }
 
+  // Pre-setProlog recheck: no mixed returns; every original R dominated by P0.
+  CollectMixedReturns(P0, MixedReturns);
+  if (!MixedReturns.empty())
+    return GiveUpDup();
+
+  for (const auto &KV : MFI.getShrinkFrameClones()) {
+    MachineBasicBlock *Orig = KV.first;
+    MachineBasicBlock *Clone = KV.second;
+    if (!MDT->dominates(P0, Orig) || MDT->dominates(P0, Clone)) {
+      LLVM_DEBUG(dbgs() << "Shrink-frame giveUp: bad domination for pair "
+                        << printMBBReference(*Orig) << " / "
+                        << printMBBReference(*Clone) << "\n");
+      return GiveUpDup();
+    }
+  }
+
+  if (hasIllegalFrameEntryEdge(MF, P0, *MDT))
+    return GiveUpDup();
+
   // Check canUseAsPrologue (target hook).
-  if (!TFI->canUseAsPrologue(*P))
-    return false;
+  if (!TFI->canUseAsPrologue(*P0))
+    return GiveUpDup();
+
+  // Delayed Prolog cannot be used when entry/frameless paths touch the stack,
+  // CSR saves sit before the candidate Prolog, or a shared return merges
+  // framed+frameless preds. PEI has a matching hoist guard; bail here so we
+  // do not leave broken shared-return clones.
+  if (mustHoistShrinkFramePrologToEntry(MF, P0, *MDT)) {
+    LLVM_DEBUG(dbgs() << "Shrink-frame bail: Prolog " << printMBBReference(*P0)
+                      << " must be at Entry for correctness\n");
+    return GiveUpDup();
+  }
 
   LLVM_DEBUG(dbgs() << "Shrink-frame: setting Prolog to "
-                    << printMBBReference(*P) << "\n");
+                    << printMBBReference(*P0) << "\n");
 
-  MFI.setProlog(P);
+  MFI.setProlog(P0);
   ++NumShrinkFrame;
   return true;
 }
@@ -1679,7 +2129,8 @@ bool ShrinkWrappingImpl::run(MachineFunction &MF) {
 
   // Attempt to shrink the stack frame setup to a later block.
   // This must run before calculateSets/Chow since it sets the Prolog.
-  runShrinkFrame(MF);
+  const bool AllowDup = !DisableShrinkFrameDup && ShrinkFrameMaxDupInsns != 0;
+  runShrinkFrame(MF, AllowDup);
 
   createAuxillaryCFG();
 
@@ -1692,7 +2143,7 @@ bool ShrinkWrappingImpl::run(MachineFunction &MF) {
   if (!HasCandidates) {
     // If shrink-frame placed a Prolog but Chow found no CSR candidates,
     // check if there are delayed (non-frame-bound) CSRs. If so, PEI would
-    // place saves in entry (no frame) → rollback.
+    // place saves in entry (no frame) --rollback.
     if (MFI.getProlog()) {
       SmallVector<Register, 4> FrameBound;
       MF.getSubtarget().getFrameLowering()->getFrameBoundCalleeSaves(
@@ -1712,7 +2163,10 @@ bool ShrinkWrappingImpl::run(MachineFunction &MF) {
       if (HasDelayedCSR) {
         LLVM_DEBUG(dbgs() << "Shrink-frame rollback: Chow failed with "
                              "delayed CSRs present\n");
-        MFI.setProlog(nullptr);
+        if (MFI.hasShrinkFrameClones())
+          demoteShrinkFrameCToB(MF);
+        else
+          rollbackShrinkFrame(MF);
       }
     }
     return MFI.getProlog() != nullptr;
@@ -1721,12 +2175,20 @@ bool ShrinkWrappingImpl::run(MachineFunction &MF) {
   placeSpillsAndRestores(MF);
 
   // Frame-bound CSRs (ra / hard FP on RISC-V): never delay as separate
-  // components — match GCC TARGET_SHRINK_WRAP_GET_SEPARATE_COMPONENTS.
-  // Important: MRI.isPhysRegModified(ra) can be false around calls because the
-  // ABI regmask treats ra as preserved; PEI still spills ra when hasCalls.
-  // Leaf functions may still use ra as a scratch GPR after a conditional save
-  // (scale_bitcount) — pin whenever Chow already placed a save, or hasCalls /
-  // determineCalleeSaves / isPhysRegModified says so.
+  // components — match GCC TARGET_SHRINK_WRAP_GET_SEPARATE_COMPONENTS
+  // (bitmap_clear_bit RETURN_ADDR / hard FP). They always travel with the
+  // main shrink-frame Prolog (addi sp + sd ra), while ordinary s* may still
+  // be multi-point.
+  //
+  // If RA already clobbers a frame-bound reg on a path that does not go
+  // through the delayed Prolog (`mv ra, a1` then early ret), hoist Prolog to
+  // Entry so sd ra still precedes that use. Keep CSR maps / clones — only the
+  // frame root moves (yacr2 Maze2Mech).
+  //
+  // MRI.isPhysRegModified(ra) can be false around calls (ABI regmask); PEI
+  // still spills ra when hasCalls. Leaf functions may use ra as scratch after
+  // a conditional save (scale_bitcount) — pin whenever Chow placed a save,
+  // or hasCalls / determineCalleeSaves / isPhysRegModified says so.
   auto PinFrameBoundCSRs = [&]() {
     const TargetFrameLowering *TFI = MF.getSubtarget().getFrameLowering();
     SmallVector<Register, 4> FrameBound;
@@ -1735,6 +2197,14 @@ bool ShrinkWrappingImpl::run(MachineFunction &MF) {
       return;
 
     MachineBasicBlock *SFProlog = MFI.getProlog();
+    if (SFProlog && SFProlog != Entry &&
+        mustHoistShrinkFramePrologToEntry(MF, SFProlog, *MDT) &&
+        !MFI.hasShrinkFrameClones()) {
+      LLVM_DEBUG(dbgs() << "ShrinkWrap: hoist Prolog to Entry (main prologue "
+                           "before stack/returns)\n");
+      MFI.setProlog(Entry);
+      SFProlog = Entry;
+    }
     MachineBasicBlock *PinBlock = SFProlog ? SFProlog : Entry;
     AuxGraphNode *PinNode = AuxillaryCFG.getNode(PinBlock);
     const MachineRegisterInfo &MRI = MF.getRegInfo();
@@ -1763,6 +2233,8 @@ bool ShrinkWrappingImpl::run(MachineFunction &MF) {
         KV.second.reset(Reg.id());
       CSRSave[PinNode].set(Reg.id());
       for (MachineBasicBlock *RB : ReturnBlocks) {
+        if (!allowCSRRestoreOn(RB))
+          continue;
         if (!SFProlog || MDT->dominates(SFProlog, RB))
           CSRRestore[AuxillaryCFG.getNode(RB)].set(Reg.id());
       }
@@ -1771,7 +2243,7 @@ bool ShrinkWrappingImpl::run(MachineFunction &MF) {
 
   PinFrameBoundCSRs();
 
-  // Drop restores on noreturn exits (no ld/CFI after throw/abort/exit — that
+  // Drop restores on noreturn exits (no ld/CFI after throw/abort/exit -- that
   // poisons FDE at the call RA). Rehome per-CSR only onto ReturnBlocks that
   // are reachable from a Save of that CSR. Broadcasting to *all* returns
   // causes early-exit paths that never spilled to execute ld of garbage
@@ -1797,64 +2269,72 @@ bool ShrinkWrappingImpl::run(MachineFunction &MF) {
     return false;
   };
 
-  CSRegSet ClearedRegs;
-  for (auto &KV : CSRRestore) {
-    MachineBasicBlock *MBB = KV.first->MatchMBB;
-    if (!MBB || KV.second.empty())
-      continue;
+  auto ScrubNoreturnRestores = [&]() {
+    CSRegSet ClearedRegs;
+    for (auto &KV : CSRRestore) {
+      MachineBasicBlock *MBB = KV.first->MatchMBB;
+      if (!MBB || KV.second.empty())
+        continue;
 
-    const bool HasNoReturnCall = ContainsNoReturnCall(*MBB);
-    // Pure return blocks without noreturn keep their restores.
-    if (MBB->isReturnBlock() && !HasNoReturnCall)
-      continue;
+      const bool HasNoReturnCall = ContainsNoReturnCall(*MBB);
+      // Pure return blocks without noreturn keep their restores.
+      if (MBB->isReturnBlock() && !HasNoReturnCall)
+        continue;
 
-    bool CanReachReturn = false;
-    if (!HasNoReturnCall) {
-      for (df_iterator<MachineBasicBlock *> DI = df_begin(MBB),
-                                            DE = df_end(MBB);
-           DI != DE; ++DI) {
-        if ((*DI)->isReturnBlock()) {
-          CanReachReturn = true;
-          break;
+      bool CanReachReturn = false;
+      if (!HasNoReturnCall) {
+        for (df_iterator<MachineBasicBlock *> DI = df_begin(MBB),
+                                              DE = df_end(MBB);
+             DI != DE; ++DI) {
+          if ((*DI)->isReturnBlock()) {
+            CanReachReturn = true;
+            break;
+          }
         }
       }
-    }
-    if (!CanReachReturn || HasNoReturnCall) {
-      LLVM_DEBUG(dbgs() << "Clear RESTORE on noreturn/non-returning path "
-                        << printMBBReference(*MBB) << "\n");
-      ClearedRegs |= KV.second;
-      KV.second.clear();
-    }
-  }
-
-  for (unsigned Reg : ClearedRegs) {
-    SmallPtrSet<MachineBasicBlock *, 8> Targets;
-    bool AnySave = false;
-    for (const auto &SKV : CSRSave) {
-      if (!SKV.second.test(Reg) || !SKV.first->MatchMBB)
-        continue;
-      AnySave = true;
-      // Dominates, not reachable — see path-sensitive restore comment below.
-      for (MachineBasicBlock *RB : ReturnBlocks) {
-        if (!ContainsNoReturnCall(*RB) &&
-            MDT->dominates(SKV.first->MatchMBB, RB))
-          Targets.insert(RB);
+      if (!CanReachReturn || HasNoReturnCall) {
+        LLVM_DEBUG(dbgs() << "Clear RESTORE on noreturn/non-returning path "
+                          << printMBBReference(*MBB) << "\n");
+        ClearedRegs |= KV.second;
+        KV.second.clear();
       }
     }
-    // No save recorded: keep ABI safe (e.g. frame-bound race) on all returns.
-    if (!AnySave) {
-      for (MachineBasicBlock *RB : ReturnBlocks)
-        Targets.insert(RB);
+
+    for (unsigned Reg : ClearedRegs) {
+      SmallPtrSet<MachineBasicBlock *, 8> Targets;
+      bool AnySave = false;
+      for (const auto &SKV : CSRSave) {
+        if (!SKV.second.test(Reg) || !SKV.first->MatchMBB)
+          continue;
+        AnySave = true;
+        // Dominates, not reachable -- see path-sensitive restore below.
+        for (MachineBasicBlock *RB : ReturnBlocks) {
+          if (!allowCSRRestoreOn(RB))
+            continue;
+          if (!ContainsNoReturnCall(*RB) &&
+              MDT->dominates(SKV.first->MatchMBB, RB))
+            Targets.insert(RB);
+        }
+      }
+      // No save recorded: keep ABI safe (e.g. frame-bound race) on all returns.
+      if (!AnySave) {
+        for (MachineBasicBlock *RB : ReturnBlocks)
+          if (allowCSRRestoreOn(RB))
+            Targets.insert(RB);
+      }
+      for (MachineBasicBlock *RB : Targets)
+        CSRRestore[AuxillaryCFG.getNode(RB)].set(Reg);
     }
-    for (MachineBasicBlock *RB : Targets)
-      CSRRestore[AuxillaryCFG.getNode(RB)].set(Reg);
-  }
+  };
 
   // Path-sensitive restores on *return blocks* only:
-  // Drop restore at return R when the single save does not dominate R
-  // (early-exit / diamond: ray Sphere::intersect bb.10). Skip frame-bound
-  // CSRs — they are re-pinned below.
-  {
+  // Drop restore at return R when no save dominates R (early-exit / diamond:
+  // ray Sphere::intersect bb.10). Skip frame-bound CSRs -- re-pinned below.
+  //
+  // When dropping from a shared return, rehome onto Pred->R edges where Pred
+  // is on the save side so the hot path still restores after setupCFG splits
+  // that edge (pr78622). PEI has a matching fallback if maps still miss.
+  auto RehomePathSensitiveRestores = [&]() {
     SmallDenseSet<unsigned, 4> FrameBoundSet;
     SmallVector<Register, 4> FrameBound;
     MF.getSubtarget().getFrameLowering()->getFrameBoundCalleeSaves(MF,
@@ -1872,24 +2352,91 @@ bool ShrinkWrappingImpl::run(MachineFunction &MF) {
           continue;
         SaveBBs.push_back(Node->MatchMBB);
       }
-      if (SaveBBs.size() != 1)
+      if (SaveBBs.empty())
         continue;
 
-      MachineBasicBlock *S = SaveBBs[0];
       for (auto &[Node, Restores] : CSRRestore) {
         if (!Restores.test(Reg))
           continue;
         MachineBasicBlock *MBB = Node->MatchMBB;
         if (!MBB || !MBB->isReturnBlock())
           continue;
-        if (!MDT->dominates(S, MBB))
-          Restores.reset(Reg);
+        if (MFI.isShrinkFrameClone(MBB))
+          continue;
+        if (any_of(SaveBBs, [&](MachineBasicBlock *S) {
+              return MDT->dominates(S, MBB);
+            }))
+          continue;
+        Restores.reset(Reg);
+        for (MachineBasicBlock *Pred : MBB->predecessors()) {
+          if (!any_of(SaveBBs, [&](MachineBasicBlock *S) {
+                return Pred == S || MDT->dominates(S, Pred);
+              }))
+            continue;
+          if (AuxGraphNode *Edge = AuxillaryCFG.getEdgeNode(Pred, MBB))
+            CSRRestore[Edge].set(Reg);
+          else
+            LLVM_DEBUG(dbgs() << "Path-sensitive rehome: no edge node "
+                              << printMBBReference(*Pred) << " -> "
+                              << printMBBReference(*MBB) << "\n");
+        }
+      }
+    }
+  };
+
+  auto FinalizeCSRMaps = [&]() {
+    ScrubNoreturnRestores();
+    RehomePathSensitiveRestores();
+    // Re-pin after path-sensitive / noreturn cleanup.
+    PinFrameBoundCSRs();
+  };
+
+  FinalizeCSRMaps();
+
+  // Clamp BEFORE setupCFG mutates the MachineFunction. If a CSR save sits
+  // outside the shrink-frame region, abandon Prolog/clones and recompute CSR
+  // placement on the restored CFG -- otherwise Save/Restore maps from the
+  // cloned world are left applied to a shared return (save w/o restore).
+  auto RebuildCSRAfterShrinkFrameAbort = [&]() {
+    LLVM_DEBUG(dbgs() << "Recomputing CSR placement after shrink-frame "
+                         "rollback\n");
+    AuxillaryCFG.clear();
+    CSRSave.clear();
+    CSRRestore.clear();
+    createAuxillaryCFG();
+    ReversePostOrderTraversal<MachineBasicBlock *> NewRPOT(&*MF.begin());
+    StackAddressUsedBlockInfo.clear();
+    StackAddressUsedBlockInfo.resize(MF.getNumBlockIDs(), true);
+    (void)calculateSets(MF, NewRPOT, RS.get());
+    StackAddressUsedBlockInfo.clear();
+    placeSpillsAndRestores(MF);
+    PinFrameBoundCSRs();
+    FinalizeCSRMaps();
+  };
+
+  if (MachineBasicBlock *SFP = MFI.getProlog()) {
+    for (const auto &[Node, Regs] : CSRSave) {
+      if (Regs.empty() || !Node->MatchMBB)
+        continue;
+      SmallVector<MCRegister, 4> SaveRegList;
+      for (unsigned Reg : Regs)
+        SaveRegList.emplace_back(Reg);
+      if (!isLegalOffPrologCSRSavePoint(MF, SFP, Node->MatchMBB, SaveRegList,
+                                        *MDT)) {
+        LLVM_DEBUG(dbgs() << "Clamp fail: CSR save in "
+                          << printMBBReference(*Node->MatchMBB)
+                          << " not dominated by Prolog "
+                          << printMBBReference(*SFP)
+                          << " — retry without shared-return dup\n");
+        if (MFI.hasShrinkFrameClones())
+          demoteShrinkFrameCToB(MF);
+        else
+          rollbackShrinkFrame(MF);
+        RebuildCSRAfterShrinkFrameAbort();
+        break;
       }
     }
   }
-
-  // Re-pin after path-sensitive / noreturn cleanup.
-  PinFrameBoundCSRs();
 
   if (setupCFG()) {
     // setupCFG() splits edges and creates new blocks; rebuild dominators for
@@ -1898,21 +2445,12 @@ bool ShrinkWrappingImpl::run(MachineFunction &MF) {
     MPDT->recalculate(MF);
   }
 
-  // Clamp: when shrink-frame is active, all CSR save points must be in blocks
-  // dominated by Prolog. A save in a no-frame block would execute sd before
-  // addi sp — corrupting the stack.
-  if (MachineBasicBlock *SFP = MFI.getProlog()) {
-    for (const auto &[Node, Regs] : CSRSave) {
-      if (Regs.empty() || !Node->MatchMBB)
-        continue;
-      if (!MDT->dominates(SFP, Node->MatchMBB)) {
-        LLVM_DEBUG(dbgs() << "Clamp fail: CSR save in "
-                          << printMBBReference(*Node->MatchMBB)
-                          << " not dominated by Prolog "
-                          << printMBBReference(*SFP) << " — rolling back\n");
-        MFI.setProlog(nullptr);
-        break;
-      }
+  // Strip any CSR save/restore accidentally attached to frameless shared-return
+  // clones before verification and MFI materialization.
+  for (const auto &KV : MFI.getShrinkFrameClones()) {
+    if (AuxGraphNode *N = AuxillaryCFG.getNode(KV.second)) {
+      CSRSave.erase(N);
+      CSRRestore.erase(N);
     }
   }
 
@@ -1924,6 +2462,47 @@ bool ShrinkWrappingImpl::run(MachineFunction &MF) {
   RestoreBlocks.clear();
   setupSaveRestorePoints();
 
+  // Publish maps so mustHoist can see off-Prolog SavePoints.
+  if (!SavePoints.get().empty() && !RestorePoints.get().empty()) {
+    MFI.setSavePoints(SavePoints.get());
+    MFI.setRestorePoints(RestorePoints.get());
+  }
+
+  // If prologue must be hoisted to entry while clones remain, undo clones in
+  // ShrinkWrapping and recompute CSR maps. Never leave clones for PEI to
+  // undo while RestorePoints still reflect the duplicated CFG.
+  if (MachineBasicBlock *SFP = MFI.getProlog();
+      SFP && SFP != Entry && MFI.hasShrinkFrameClones() &&
+      mustHoistShrinkFramePrologToEntry(MF, SFP, *MDT)) {
+    LLVM_DEBUG(
+        dbgs() << "ShrinkWrap: mustHoist with clones — retry shrink-frame "
+                  "without dup before PEI\n");
+    demoteShrinkFrameCToB(MF);
+    RebuildCSRAfterShrinkFrameAbort();
+    if (setupCFG()) {
+      MDT->recalculate(MF);
+      MPDT->recalculate(MF);
+    }
+    for (const auto &KV : MFI.getShrinkFrameClones()) {
+      if (AuxGraphNode *N = AuxillaryCFG.getNode(KV.second)) {
+        CSRSave.erase(N);
+        CSRRestore.erase(N);
+      }
+    }
+    SaveBlocks.clear();
+    RestoreBlocks.clear();
+    SavePoints.clear();
+    RestorePoints.clear();
+    setupSaveRestorePoints();
+    if (!SavePoints.get().empty() && !RestorePoints.get().empty()) {
+      MFI.setSavePoints(SavePoints.get());
+      MFI.setRestorePoints(RestorePoints.get());
+    } else {
+      MFI.clearSavePoints();
+      MFI.clearRestorePoints();
+    }
+  }
+
   // Final enforcement on concrete Save/Restore maps (after edge splits).
   // Guarantees ra/FP cannot remain on a delayed save point (pr51933,
   // consumer-lame scale_bitcount). Do NOT gate on hasCalls(): leaf functions
@@ -1934,6 +2513,15 @@ bool ShrinkWrappingImpl::run(MachineFunction &MF) {
     SmallVector<Register, 4> FrameBound;
     TFI->getFrameBoundCalleeSaves(MF, FrameBound);
     if (!FrameBound.empty()) {
+      // Re-check after setupCFG (same policy as PinFrameBoundCSRs).
+      // Clones incompatible with prologue hoisting were undone above.
+      if (MachineBasicBlock *SFP = MFI.getProlog();
+          SFP && SFP != Entry &&
+          mustHoistShrinkFramePrologToEntry(MF, SFP, *MDT) &&
+          !MFI.hasShrinkFrameClones()) {
+        LLVM_DEBUG(dbgs() << "ShrinkWrap(final): hoist Prolog to Entry\n");
+        MFI.setProlog(Entry);
+      }
       MachineBasicBlock *PinBlock = MFI.getProlog() ? MFI.getProlog() : Entry;
       auto &SP = SavePoints.get();
       auto &RP = RestorePoints.get();
@@ -1975,6 +2563,8 @@ bool ShrinkWrappingImpl::run(MachineFunction &MF) {
         }
         SavePoints.insertReg(Reg, PinBlock, &SaveBlocks);
         for (MachineBasicBlock *RB : ReturnBlocks) {
+          if (!allowCSRRestoreOn(RB))
+            continue;
           if (!MFI.getProlog() || MDT->dominates(MFI.getProlog(), RB))
             RestorePoints.insertReg(Reg, RB, &RestoreBlocks);
         }
@@ -2002,8 +2592,15 @@ bool ShrinkWrappingImpl::run(MachineFunction &MF) {
   LLVM_DEBUG(dbgs() << "RestorePoints:\n");
   LLVM_DEBUG(RestorePoints.dump(TRI));
 
-  if (!ShrinkFrameProlog)
-    MFI.setProlog(nullptr);
+  if (!ShrinkFrameProlog) {
+    // Defensive: never leave shared-return clones without a Prolog.
+    // Only undo clones — do not clear Save/RestorePoints (entry-full CSR maps
+    // may still be valid).
+    if (MFI.hasShrinkFrameClones())
+      undoAllShrinkFrameClones(MF);
+    else
+      MFI.setProlog(nullptr);
+  }
   MFI.setEpilog(nullptr);
   if (!SavePoints.get().empty() && !RestorePoints.get().empty()) {
     MFI.setSavePoints(SavePoints.get());
@@ -2057,7 +2654,7 @@ MachineBasicBlock *ShrinkWrappingImpl::splitEdge(MachineBasicBlock *Pred,
   // TODO: switch
 
   Pred->replaceSuccessor(Succ, NewBB); // Remove old edge
-  NewBB->addSuccessor(Succ);           // Add NewBB → Succ
+  NewBB->addSuccessor(Succ);           // Add NewBB --Succ
 
   for (const MachineBasicBlock::RegisterMaskPair &LI : Succ->liveins())
     NewBB->addLiveIn(LI.PhysReg);
@@ -2098,11 +2695,27 @@ bool ShrinkWrappingImpl::setupCFG() {
 }
 
 void ShrinkWrappingImpl::setupSaveRestorePoints() {
+  // Belt-and-suspenders: never emit CSR save/restore on frameless shared-return
+  // clones. ReturnBlocks still lists clones for choke/exit analysis; restore
+  // on clone returns is inserted by PEI appendShrinkFrameCloneRestorePoints.
+  MachineFrameInfo &MFI = MachineFunc->getFrameInfo();
+  for (const auto &KV : MFI.getShrinkFrameClones()) {
+    MachineBasicBlock *Clone = KV.second;
+    if (AuxGraphNode *N = AuxillaryCFG.getNode(Clone)) {
+      CSRSave.erase(N);
+      CSRRestore.erase(N);
+    }
+  }
+
   for (auto &[Node, Regs] : CSRSave) {
+    if (!Node->MatchMBB || MFI.isShrinkFrameClone(Node->MatchMBB))
+      continue;
     for (Register Reg : Regs)
       SavePoints.insertReg(Reg, Node->MatchMBB, &SaveBlocks);
   }
   for (auto &[Node, Regs] : CSRRestore) {
+    if (!Node->MatchMBB || !allowCSRRestoreOn(Node->MatchMBB))
+      continue;
     for (Register Reg : Regs)
       RestorePoints.insertReg(Reg, Node->MatchMBB, &RestoreBlocks);
   }
@@ -2149,7 +2762,8 @@ ShrinkWrappingPass::run(MachineFunction &MF,
 bool ShrinkWrappingImpl::isShrinkWrappingEnabled(const MachineFunction &MF) {
   const TargetFrameLowering *TFI = MF.getSubtarget().getFrameLowering();
 
-  // Data-flow shrink-wrapping requires the target to opt in.
+  // Data-flow shrink-wrapping requires the target to opt in (RISC-V:
+  // -riscv-shrink-wrapping-dataflow).
   if (!TFI->enableCSRSaveRestorePointsSplit())
     return false;
 
