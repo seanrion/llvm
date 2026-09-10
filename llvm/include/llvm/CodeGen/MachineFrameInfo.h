@@ -344,9 +344,19 @@ private:
   /// stack objects like arguments so we can't treat them as immutable.
   bool HasTailCall = false;
 
-  /// Not empty, if shrink-wrapping found a better place for the prologue.
+  /// Not null, if shrink-wrapping found a better place for the prologue
+  /// (stack allocation). Distinct from SavePoints when CSR save/restore
+  /// points are split from prolog/epilog.
+  MachineBasicBlock *Prolog = nullptr;
+  /// Not null, if shrink-wrapping found a better place for the epilogue
+  /// (stack deallocation).
+  MachineBasicBlock *Epilog = nullptr;
+
+  /// Not empty, if shrink-wrapping found better place(s) for saving CSRs.
+  /// With enableCSRSaveRestorePointsSplit, each entry lists the CSRs saved
+  /// in that block. Otherwise a single entry is used (legacy shrink-wrap).
   SaveRestorePoints SavePoints;
-  /// Not empty, if shrink-wrapping found a better place for the epilogue.
+  /// Not empty, if shrink-wrapping found better place(s) for restoring CSRs.
   SaveRestorePoints RestorePoints;
 
   /// Size of the UnsafeStack Frame
@@ -867,6 +877,36 @@ public:
 
   void setCalleeSavedInfoValid(bool v) { CSIValid = v; }
 
+  /// Returns callee saved info for \p MBB as a save point (empty if none).
+  std::vector<CalleeSavedInfo> getSaveCSInfo(MachineBasicBlock *MBB) const {
+    return SavePoints.lookup(MBB);
+  }
+
+  /// Returns callee saved info for \p MBB as a restore point (empty if none).
+  std::vector<CalleeSavedInfo> getRestoreCSInfo(MachineBasicBlock *MBB) const {
+    return RestorePoints.lookup(MBB);
+  }
+
+  MachineBasicBlock *findSpilledIn(const CalleeSavedInfo &Match) const {
+    for (const auto &[BB, CSIV] : SavePoints) {
+      for (const CalleeSavedInfo &CSI : CSIV) {
+        if (CSI.getReg() == Match.getReg())
+          return BB;
+      }
+    }
+    return nullptr;
+  }
+
+  MachineBasicBlock *findRestoredIn(const CalleeSavedInfo &Match) const {
+    for (const auto &[BB, CSIV] : RestorePoints) {
+      for (const CalleeSavedInfo &CSI : CSIV) {
+        if (CSI.getReg() == Match.getReg())
+          return BB;
+      }
+    }
+    return nullptr;
+  }
+
   const SaveRestorePoints &getRestorePoints() const { return RestorePoints; }
 
   const SaveRestorePoints &getSavePoints() const { return SavePoints; }
@@ -878,6 +918,11 @@ public:
   void setRestorePoints(SaveRestorePoints NewRestorePoints) {
     RestorePoints = std::move(NewRestorePoints);
   }
+
+  MachineBasicBlock *getProlog() const { return Prolog; }
+  void setProlog(MachineBasicBlock *BB) { Prolog = BB; }
+  MachineBasicBlock *getEpilog() const { return Epilog; }
+  void setEpilog(MachineBasicBlock *BB) { Epilog = BB; }
 
   void clearSavePoints() { SavePoints.clear(); }
   void clearRestorePoints() { RestorePoints.clear(); }

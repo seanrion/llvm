@@ -24,6 +24,7 @@
 #include "llvm/CodeGen/RegisterScavenging.h"
 #include "llvm/IR/DiagnosticInfo.h"
 #include "llvm/MC/MCDwarf.h"
+#include "llvm/Support/CommandLine.h"
 #include "llvm/Support/LEB128.h"
 
 #include <algorithm>
@@ -32,6 +33,11 @@
 #define DEBUG_TYPE "riscv-frame"
 
 using namespace llvm;
+
+static cl::opt<bool> RISCVShrinkWrappingDataflow(
+    "riscv-shrink-wrapping-dataflow", cl::init(false), cl::Hidden,
+    cl::desc("Enable data-flow based multi-point CSR shrink-wrapping for "
+             "RISC-V (excludes ra/fp from splitting)"));
 
 static Align getABIStackAlignment(RISCVABI::ABI ABI) {
   if (ABI == RISCVABI::ABI_ILP32E)
@@ -2556,6 +2562,10 @@ bool RISCVFrameLowering::enableShrinkWrapping(const MachineFunction &MF) const {
     return false;
 
   return true;
+}
+
+bool RISCVFrameLowering::enableCSRSaveRestorePointsSplit() const {
+  return RISCVShrinkWrappingDataflow;
 }
 
 bool RISCVFrameLowering::canUseAsPrologue(const MachineBasicBlock &MBB) const {

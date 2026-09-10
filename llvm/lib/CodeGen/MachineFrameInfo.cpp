@@ -247,6 +247,15 @@ void MachineFrameInfo::print(const MachineFunction &MF, raw_ostream &OS) const{
   }
   OS << "save/restore points:\n";
 
+  if (Prolog)
+    OS << "prolog: " << printMBBReference(*Prolog) << "\n";
+  else
+    OS << "prolog: <default>\n";
+  if (Epilog)
+    OS << "epilog: " << printMBBReference(*Epilog) << "\n";
+  else
+    OS << "epilog: <default>\n";
+
   if (!SavePoints.empty()) {
     OS << "save points:\n";
 
