@@ -14,7 +14,9 @@
 
 #include "RISCVInstrInfo.h"
 #include "RISCVSubtarget.h"
-#include "llvm/CodeGen/MachineFrameInfo.h"
+#include "llvm/CodeGen/MachineDominators.h"
+#include "llvm/CodeGen/ShrinkFrameUtils.h"
+#include <optional>
 
 using namespace llvm;
 
@@ -39,6 +41,9 @@ private:
   bool runOnBasicBlock(MachineBasicBlock &MBB) const;
 
   const RISCVInstrInfo *RII = nullptr;
+  /// Non-null when shrink-frame is active; used to reject folds that would
+  /// leave a cross-region CFG edge.
+  const MachineDominatorTree *SFDomTree = nullptr;
 };
 } // namespace
 
@@ -70,10 +75,31 @@ bool RISCVLateBranchOpt::runOnBasicBlock(MachineBasicBlock &MBB) const {
   MachineBasicBlock *Folded =
       RISCVInstrInfo::evaluateCondBranch(CC, C0, C1) ? TBB : FBB;
 
+  // Resolve the CFG successor this fold would leave. Prefer an existing CFG
+  // successor over layout order: after block placement, ++MBB may not be the
+  // fallthrough edge analyzeBranch described (FBB == nullptr).
+  MachineBasicBlock *NewSucc = Folded;
+  if (!NewSucc) {
+    for (MachineBasicBlock *Succ : MBB.successors()) {
+      if (Succ != TBB) {
+        NewSucc = Succ;
+        break;
+      }
+    }
+    if (!NewSucc)
+      return false;
+  }
+
+  // Shrink-frame: do not commit a fold that leaves a cross-region edge.
+  if (SFDomTree &&
+      shrinkFrameGuardRejectEdge(*MBB.getParent(), MBB, *NewSucc, *SFDomTree))
+    return false;
+
   // At this point, its legal to optimize.
   RII->removeBranch(MBB);
 
-  // Only need to insert a branch if we're not falling through.
+  // Only need to insert a branch if the taken path is not layout fallthrough.
+  // When Folded is null, the false path already falls through in layout/CFG.
   if (Folded) {
     DebugLoc DL = MBB.findBranchDebugLoc();
     RII->insertBranch(MBB, Folded, nullptr, {}, DL);
@@ -83,13 +109,7 @@ bool RISCVLateBranchOpt::runOnBasicBlock(MachineBasicBlock &MBB) const {
   while (!MBB.succ_empty())
     MBB.removeSuccessor(MBB.succ_end() - 1);
 
-  // If it's a fallthrough, we need to figure out where MBB is going.
-  if (!Folded) {
-    MachineFunction::iterator Fallthrough = ++MBB.getIterator();
-    if (Fallthrough != MBB.getParent()->end())
-      MBB.addSuccessor(&*Fallthrough);
-  } else
-    MBB.addSuccessor(Folded);
+  MBB.addSuccessor(NewSucc);
 
   return true;
 }
@@ -98,15 +118,19 @@ bool RISCVLateBranchOpt::runOnMachineFunction(MachineFunction &Fn) {
   if (skipFunction(Fn.getFunction()))
     return false;
 
-  if (Fn.getFrameInfo().getProlog())
-    return false;
-
   auto &ST = Fn.getSubtarget<RISCVSubtarget>();
   RII = ST.getInstrInfo();
+
+  std::optional<MachineDominatorTree> SFDomTreeStorage;
+  if (hasShrinkFrame(Fn))
+    SFDomTreeStorage.emplace(Fn);
+  SFDomTree = SFDomTreeStorage ? &*SFDomTreeStorage : nullptr;
 
   bool Changed = false;
   for (MachineBasicBlock &MBB : Fn)
     Changed |= runOnBasicBlock(MBB);
+
+  SFDomTree = nullptr;
   return Changed;
 }
 

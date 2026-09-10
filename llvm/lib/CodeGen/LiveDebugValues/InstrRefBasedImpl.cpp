@@ -96,6 +96,7 @@
 #include "llvm/CodeGen/MachineMemOperand.h"
 #include "llvm/CodeGen/MachineOperand.h"
 #include "llvm/CodeGen/PseudoSourceValue.h"
+#include "llvm/CodeGen/ShrinkFrameUtils.h"
 #include "llvm/CodeGen/TargetFrameLowering.h"
 #include "llvm/CodeGen/TargetInstrInfo.h"
 #include "llvm/CodeGen/TargetLowering.h"
@@ -2523,6 +2524,20 @@ bool InstrRefBasedLDV::mlocJoin(
     }
   }
 
+  // Shrink-frame: spill slots are invalid in no-frame blocks. Clear spill
+  // machine-locations so TransferTracker will not emit SP/FP-relative
+  // DBG_VALUEs as live-ins.
+  if (ProtectShrinkFrame && DomTree && !isInFrameRegion(MBB, *DomTree)) {
+    for (auto Location : MTracker->locations()) {
+      if (!MTracker->isSpill(Location.Idx))
+        continue;
+      if (InLocs[Location.Idx.asU64()] == ValueIDNum::EmptyValue)
+        continue;
+      InLocs[Location.Idx.asU64()] = ValueIDNum::EmptyValue;
+      Changed = true;
+    }
+  }
+
   // TODO: Reimplement NumInserted and NumRemoved.
   return Changed;
 }
@@ -3723,6 +3738,7 @@ bool InstrRefBasedLDV::ExtendRanges(MachineFunction &MF,
   TFI = MF.getSubtarget().getFrameLowering();
   TFI->getCalleeSaves(MF, CalleeSavedRegs);
   MFI = &MF.getFrameInfo();
+  ProtectShrinkFrame = hasShrinkFrame(MF);
   LS.scanFunction(MF);
 
   const auto &STI = MF.getSubtarget();

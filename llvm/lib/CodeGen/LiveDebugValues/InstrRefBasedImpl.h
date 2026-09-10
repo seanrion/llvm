@@ -1142,6 +1142,9 @@ public:
 
 private:
   MachineDominatorTree *DomTree;
+  /// When shrink-frame is active, kill spill machine-locations on entry to
+  /// no-frame blocks (see mlocJoin).
+  bool ProtectShrinkFrame = false;
   const TargetRegisterInfo *TRI;
   const MachineRegisterInfo *MRI;
   const TargetInstrInfo *TII;

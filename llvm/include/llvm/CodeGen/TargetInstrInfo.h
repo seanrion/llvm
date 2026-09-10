@@ -2269,9 +2269,7 @@ public:
   /// illegal.
   virtual SmallVector<
       std::pair<MachineBasicBlock::iterator, MachineBasicBlock::iterator>>
-  getOutlinableRanges(MachineBasicBlock &MBB, unsigned &Flags) const {
-    return {std::make_pair(MBB.begin(), MBB.end())};
-  }
+  getOutlinableRanges(MachineBasicBlock &MBB, unsigned &Flags) const;
 
   /// Insert a custom frame for outlined functions.
   virtual void buildOutlinedFrame(MachineBasicBlock &MBB, MachineFunction &MF,

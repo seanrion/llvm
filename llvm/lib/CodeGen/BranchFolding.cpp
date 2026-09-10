@@ -40,6 +40,7 @@
 #include "llvm/CodeGen/MachinePostDominators.h"
 #include "llvm/CodeGen/MachineRegisterInfo.h"
 #include "llvm/CodeGen/MachineSizeOpts.h"
+#include "llvm/CodeGen/ShrinkFrameUtils.h"
 #include "llvm/CodeGen/TargetInstrInfo.h"
 #include "llvm/CodeGen/TargetOpcodes.h"
 #include "llvm/CodeGen/TargetPassConfig.h"
@@ -75,6 +76,12 @@ STATISTIC(NumBranchOpts, "Number of branches optimized");
 STATISTIC(NumTailMerge , "Number of block tails merged");
 STATISTIC(NumHoist     , "Number of times common instructions are hoisted");
 STATISTIC(NumTailCalls,  "Number of tail calls optimized");
+STATISTIC(NumTailMergeBlockedByFrameBoundary,
+          "Number of tail merges blocked by shrink-frame region boundary");
+STATISTIC(NumHoistBlockedByFrameBoundary,
+          "Number of hoists blocked by shrink-frame region boundary");
+STATISTIC(NumBranchOptsBlockedByFrameBoundary,
+          "Number of branch opts blocked by shrink-frame region boundary");
 
 static cl::opt<cl::boolOrDefault>
     FlagEnableTailMerge("enable-tail-merge",
@@ -173,10 +180,6 @@ PreservedAnalyses BranchFolderPass::run(MachineFunction &MF,
 
 bool BranchFolderLegacy::runOnMachineFunction(MachineFunction &MF) {
   if (skipFunction(MF.getFunction()))
-    return false;
-
-  // Shrink-frame: skip to avoid merging across frame/no-frame boundary.
-  if (MF.getFrameInfo().getProlog())
     return false;
 
   TargetPassConfig *PassConfig = &getAnalysis<TargetPassConfig>();
@@ -279,8 +282,18 @@ bool BranchFolder::OptimizeFunction(MachineFunction &MF,
   // Recalculate EH scope membership.
   EHScopeMembership = getEHScopeMembership(MF);
 
+  // Shrink-frame: build a DT once per outer iteration and reject CFG rewrites
+  // that cross the frame/no-frame boundary. Same-side merges do not require a
+  // DT update after each transform.
+  std::optional<MachineDominatorTree> SFDomTreeStorage;
+  if (hasShrinkFrame(MF))
+    SFDomTreeStorage.emplace(MF);
+  SFDomTree = SFDomTreeStorage ? &*SFDomTreeStorage : nullptr;
+
   bool MadeChangeThisIteration = true;
   while (MadeChangeThisIteration) {
+    if (SFDomTree)
+      SFDomTree->recalculate(MF);
     MadeChangeThisIteration    = TailMergeBlocks(MF);
     // No need to clean up if tail merging does not change anything after the
     // block placement.
@@ -290,6 +303,8 @@ bool BranchFolder::OptimizeFunction(MachineFunction &MF,
       MadeChangeThisIteration |= HoistCommonCode(MF);
     MadeChange |= MadeChangeThisIteration;
   }
+
+  SFDomTree = nullptr;
 
   // See if any jump tables have become dead as the code generator
   // did its thing.
@@ -535,6 +550,10 @@ MachineBasicBlock *BranchFolder::SplitMBBAt(MachineBasicBlock &CurMBB,
 
   // NewMBB inherits CurMBB's block frequency.
   MBBFreqInfo.setBlockFreq(NewMBB, MBBFreqInfo.getBlockFreq(&CurMBB));
+
+  // Keep shrink-frame DT in sync for later same-iteration TailMerge checks.
+  if (SFDomTree)
+    SFDomTree->addNewBlock(NewMBB, &CurMBB);
 
   if (UpdateLiveIns)
     computeAndAddLiveIns(LiveRegs, *NewMBB);
@@ -824,9 +843,22 @@ bool BranchFolder::CreateCommonTailOnlyBlock(MachineBasicBlock *&PredBB,
                                              MachineBasicBlock *SuccBB,
                                              unsigned maxCommonTailLength,
                                              unsigned &commonTailIndex) {
-  commonTailIndex = 0;
+  // Jumping to the start of Prolog re-executes FrameSetup. After
+  // keepLegalSameTails the preferred Dest is SameTails[0], but this routine may
+  // re-pick PredBB — skip a whole-block Prolog so it cannot become the merge
+  // destination.
+  MachineFunction &MF = *SameTails.front().getBlock()->getParent();
+  MachineBasicBlock *Prolog = SFDomTree ? getShrinkFrameProlog(MF) : nullptr;
+  auto CannotSplitAsDest = [&](unsigned Idx) {
+    return Prolog && SameTails[Idx].getBlock() == Prolog &&
+           SameTails[Idx].tailIsWholeBlock();
+  };
+
+  commonTailIndex = SameTails.size();
   unsigned TimeEstimate = ~0U;
   for (unsigned i = 0, e = SameTails.size(); i != e; ++i) {
+    if (CannotSplitAsDest(i))
+      continue;
     // Use PredBB if possible; that doesn't require a new branch.
     if (SameTails[i].getBlock() == PredBB) {
       commonTailIndex = i;
@@ -840,6 +872,11 @@ bool BranchFolder::CreateCommonTailOnlyBlock(MachineBasicBlock *&PredBB,
       TimeEstimate = t;
       commonTailIndex = i;
     }
+  }
+  if (commonTailIndex == SameTails.size()) {
+    ++NumTailMergeBlockedByFrameBoundary;
+    LLVM_DEBUG(dbgs() << "... no legal shrink-frame split dest!");
+    return false;
   }
 
   MachineBasicBlock::iterator BBI =
@@ -994,6 +1031,40 @@ void BranchFolder::mergeCommonTails(unsigned commonTailIndex) {
   }
 }
 
+bool BranchFolder::keepLegalSameTails(MachineFunction &MF, unsigned &DestIdx) {
+  if (!SFDomTree)
+    return true;
+
+  assert(DestIdx < SameTails.size() && "DestIdx out of range");
+  MachineBasicBlock *Dest = SameTails[DestIdx].getBlock();
+  const bool DestWholeProlog =
+      Dest == getShrinkFrameProlog(MF) && SameTails[DestIdx].tailIsWholeBlock();
+
+  std::vector<SameTailElt> Kept;
+  Kept.push_back(SameTails[DestIdx]);
+  unsigned Blocked = 0;
+  for (unsigned i = 0, e = SameTails.size(); i != e; ++i) {
+    if (i == DestIdx)
+      continue;
+    MachineBasicBlock *Src = SameTails[i].getBlock();
+    if (DestWholeProlog ||
+        shrinkFrameGuardRejectTailMerge(MF, *Src, *Dest, *Dest, *SFDomTree) ||
+        shrinkFrameGuardRejectEdge(MF, *Src, *Dest, *SFDomTree)) {
+      ++Blocked;
+      continue;
+    }
+    Kept.push_back(SameTails[i]);
+  }
+  if (Kept.size() < 2) {
+    NumTailMergeBlockedByFrameBoundary += Blocked ? Blocked : 1;
+    return false;
+  }
+  NumTailMergeBlockedByFrameBoundary += Blocked;
+  SameTails = std::move(Kept);
+  DestIdx = 0;
+  return true;
+}
+
 // See if any of the blocks in MergePotentials (which all have SuccBB as a
 // successor, or all have no successor if it is null) can be tail-merged.
 // If there is a successor, any blocks in MergePotentials that are not
@@ -1088,11 +1159,64 @@ bool BranchFolder::TryTailMergeBlocks(MachineBasicBlock *SuccBB,
       }
     }
 
-    if (commonTailIndex == SameTails.size() ||
-        (SameTails[commonTailIndex].getBlock() == PredBB &&
-         !SameTails[commonTailIndex].tailIsWholeBlock())) {
-      // None of the blocks consist entirely of the common tail.
-      // Split a block so that one does.
+    MachineFunction &MF = *SameTails.front().getBlock()->getParent();
+    if (SFDomTree) {
+      auto CannotJumpTo = [&](unsigned Idx) {
+        MachineBasicBlock *B = SameTails[Idx].getBlock();
+        return (B == EntryBB || B->isEHPad()) &&
+               SameTails[Idx].tailIsWholeBlock();
+      };
+      auto LegalSources = [&](unsigned DestIdx) -> unsigned {
+        if (CannotJumpTo(DestIdx))
+          return 0;
+        MachineBasicBlock *Dest = SameTails[DestIdx].getBlock();
+        if (Dest == getShrinkFrameProlog(MF) &&
+            SameTails[DestIdx].tailIsWholeBlock())
+          return 0;
+        unsigned N = 0;
+        for (unsigned i = 0, e = SameTails.size(); i != e; ++i) {
+          if (i == DestIdx)
+            continue;
+          MachineBasicBlock *Src = SameTails[i].getBlock();
+          if (!shrinkFrameGuardRejectTailMerge(MF, *Src, *Dest, *Dest,
+                                               *SFDomTree) &&
+              !shrinkFrameGuardRejectEdge(MF, *Src, *Dest, *SFDomTree))
+            ++N;
+        }
+        return N;
+      };
+
+      unsigned Best = SameTails.size();
+      unsigned BestN = 0;
+      if (commonTailIndex < SameTails.size())
+        BestN = LegalSources(commonTailIndex);
+      if (BestN >= 1) {
+        Best = commonTailIndex;
+      } else {
+        for (unsigned i = 0, e = SameTails.size(); i != e; ++i) {
+          unsigned N = LegalSources(i);
+          if (N > BestN) {
+            Best = i;
+            BestN = N;
+          }
+        }
+      }
+      if (BestN < 1) {
+        ++NumTailMergeBlockedByFrameBoundary;
+        RemoveBlocksWithHash(CurHash, SuccBB, PredBB, BranchDL);
+        continue;
+      }
+      commonTailIndex = Best;
+      if (!keepLegalSameTails(MF, commonTailIndex)) {
+        RemoveBlocksWithHash(CurHash, SuccBB, PredBB, BranchDL);
+        continue;
+      }
+    }
+
+    bool NeedSplit = commonTailIndex == SameTails.size() ||
+                     !SameTails[commonTailIndex].tailIsWholeBlock();
+    if (NeedSplit) {
+      // Dest is not a common-tail-only block; split so that one is.
       if (!CreateCommonTailOnlyBlock(PredBB, SuccBB,
                                      maxCommonTailLength, commonTailIndex)) {
         RemoveBlocksWithHash(CurHash, SuccBB, PredBB, BranchDL);
@@ -1482,24 +1606,39 @@ ReoptimizeBlock:
       // TODO: Is it ever worth rewriting predecessors which don't already
       // jump to a landing pad, and so can safely jump to the fallthrough?
     } else if (MBB->isSuccessor(&*FallThrough)) {
-      // Rewrite all predecessors of the old block to go to the fallthrough
-      // instead.
-      while (!MBB->pred_empty()) {
-        MachineBasicBlock *Pred = *(MBB->pred_end()-1);
-        Pred->ReplaceUsesOfBlockWith(MBB, &*FallThrough);
+      // Shrink-frame: never delete Prolog. Redirect only predecessors that
+      // would not create an illegal frame-region edge to FallThrough.
+      if (SFDomTree && MBB == getShrinkFrameProlog(MF)) {
+        ++NumBranchOptsBlockedByFrameBoundary;
+        return MadeChange;
       }
-      // Add rest successors of MBB to successors of FallThrough. Those
-      // successors are not directly reachable via MBB, so it should be
-      // landing-pad.
-      for (auto SI = MBB->succ_begin(), SE = MBB->succ_end(); SI != SE; ++SI)
-        if (*SI != &*FallThrough && !FallThrough->isSuccessor(*SI)) {
-          assert((*SI)->isEHPad() && "Bad CFG");
-          FallThrough->copySuccessor(MBB, SI);
+
+      SmallVector<MachineBasicBlock *, 8> Rewritable;
+      for (MachineBasicBlock *Pred : MBB->predecessors()) {
+        if (SFDomTree &&
+            shrinkFrameGuardRejectEdge(MF, *Pred, *FallThrough, *SFDomTree)) {
+          ++NumBranchOptsBlockedByFrameBoundary;
+          continue;
         }
-      // If MBB was the target of a jump table, update jump tables to go to the
-      // fallthrough instead.
-      if (MachineJumpTableInfo *MJTI = MF.getJumpTableInfo())
-        MJTI->ReplaceMBBInJumpTables(MBB, &*FallThrough);
+        Rewritable.push_back(Pred);
+      }
+      if (Rewritable.empty())
+        return MadeChange;
+
+      for (MachineBasicBlock *Pred : Rewritable)
+        Pred->ReplaceUsesOfBlockWith(MBB, &*FallThrough);
+
+      // Only fold away jump tables / extra EH succs when the block is empty of
+      // remaining CFG uses.
+      if (MBB->pred_empty()) {
+        for (auto SI = MBB->succ_begin(), SE = MBB->succ_end(); SI != SE; ++SI)
+          if (*SI != &*FallThrough && !FallThrough->isSuccessor(*SI)) {
+            assert((*SI)->isEHPad() && "Bad CFG");
+            FallThrough->copySuccessor(MBB, SI);
+          }
+        if (MachineJumpTableInfo *MJTI = MF.getJumpTableInfo())
+          MJTI->ReplaceMBBInJumpTables(MBB, &*FallThrough);
+      }
       MadeChange = true;
     }
     return MadeChange;
@@ -1538,30 +1677,36 @@ ReoptimizeBlock:
     if (PriorCond.empty() && !PriorTBB && MBB->pred_size() == 1 &&
         PrevBB.succ_size() == 1 && PrevBB.isSuccessor(MBB) &&
         !MBB->hasAddressTaken() && !MBB->isEHPad()) {
-      LLVM_DEBUG(dbgs() << "\nMerging into block: " << PrevBB
-                        << "From MBB: " << *MBB);
-      // Remove redundant DBG_VALUEs first.
-      if (!PrevBB.empty()) {
-        MachineBasicBlock::iterator PrevBBIter = PrevBB.end();
-        --PrevBBIter;
-        MachineBasicBlock::iterator MBBIter = MBB->begin();
-        // Check if DBG_VALUE at the end of PrevBB is identical to the
-        // DBG_VALUE at the beginning of MBB.
-        while (PrevBBIter != PrevBB.begin() && MBBIter != MBB->end()
-               && PrevBBIter->isDebugInstr() && MBBIter->isDebugInstr()) {
-          if (!MBBIter->isIdenticalTo(*PrevBBIter))
-            break;
-          MachineInstr &DuplicateDbg = *MBBIter;
-          ++MBBIter; -- PrevBBIter;
-          DuplicateDbg.eraseFromParent();
+      if (SFDomTree &&
+          shrinkFrameGuardRejectBlocks(MF, {&PrevBB, MBB}, *SFDomTree)) {
+        ++NumBranchOptsBlockedByFrameBoundary;
+      } else {
+        LLVM_DEBUG(dbgs() << "\nMerging into block: " << PrevBB
+                          << "From MBB: " << *MBB);
+        // Remove redundant DBG_VALUEs first.
+        if (!PrevBB.empty()) {
+          MachineBasicBlock::iterator PrevBBIter = PrevBB.end();
+          --PrevBBIter;
+          MachineBasicBlock::iterator MBBIter = MBB->begin();
+          // Check if DBG_VALUE at the end of PrevBB is identical to the
+          // DBG_VALUE at the beginning of MBB.
+          while (PrevBBIter != PrevBB.begin() && MBBIter != MBB->end() &&
+                 PrevBBIter->isDebugInstr() && MBBIter->isDebugInstr()) {
+            if (!MBBIter->isIdenticalTo(*PrevBBIter))
+              break;
+            MachineInstr &DuplicateDbg = *MBBIter;
+            ++MBBIter;
+            --PrevBBIter;
+            DuplicateDbg.eraseFromParent();
+          }
         }
+        PrevBB.splice(PrevBB.end(), MBB, MBB->begin(), MBB->end());
+        PrevBB.removeSuccessor(PrevBB.succ_begin());
+        assert(PrevBB.succ_empty());
+        PrevBB.transferSuccessors(MBB);
+        MadeChange = true;
+        return MadeChange;
       }
-      PrevBB.splice(PrevBB.end(), MBB, MBB->begin(), MBB->end());
-      PrevBB.removeSuccessor(PrevBB.succ_begin());
-      assert(PrevBB.succ_empty());
-      PrevBB.transferSuccessors(MBB);
-      MadeChange = true;
-      return MadeChange;
     }
 
     // If the previous branch *only* branches to *this* block (conditional or
@@ -1655,6 +1800,14 @@ ReoptimizeBlock:
         // Only eliminate if MBB == TBB (Taken Basic Block)
         if (PredAnalyzable && !PredCond.empty() && PredTBB == MBB &&
             PredTBB != PredFBB) {
+          // Shrink-frame: do not copy a tail call across the frame boundary,
+          // and never fold out of Prolog (would skip FrameSetup).
+          if (SFDomTree &&
+              (MBB == getShrinkFrameProlog(MF) ||
+               shrinkFrameGuardRejectBlocks(MF, {Pred, MBB}, *SFDomTree))) {
+            ++NumBranchOptsBlockedByFrameBoundary;
+            continue;
+          }
           // The predecessor has a conditional branch to this block which
           // consists of only a tail call. Try to fold the tail call into the
           // conditional branch.
@@ -1724,6 +1877,14 @@ ReoptimizeBlock:
       // falls through into MBB and we can't understand the prior block's branch
       // condition.
       if (MBB->empty()) {
+        // Shrink-frame: never delete Prolog. Forward only predecessors that
+        // can legally target CurTBB.
+        if (SFDomTree && MBB == getShrinkFrameProlog(MF)) {
+          ++NumBranchOptsBlockedByFrameBoundary;
+          TII->insertBranch(*MBB, CurTBB, nullptr, CurCond, Dl);
+          return MadeChange;
+        }
+
         bool PredHasNoFallThrough = !PrevBB.canFallThrough();
         if (PredHasNoFallThrough || !PriorUnAnalyzable ||
             !PrevBB.isSuccessor(MBB)) {
@@ -1754,6 +1915,10 @@ ReoptimizeBlock:
               // If this block has an uncond branch to itself, leave it.
               ++PI;
               HasBranchToSelf = true;
+            } else if (SFDomTree && shrinkFrameGuardRejectEdge(
+                                        MF, *PMBB, *CurTBB, *SFDomTree)) {
+              ++NumBranchOptsBlockedByFrameBoundary;
+              ++PI;
             } else {
               DidChange = true;
               PMBB->ReplaceUsesOfBlockWith(MBB, CurTBB);
@@ -1786,12 +1951,14 @@ ReoptimizeBlock:
           }
 
           // Change any jumptables to go to the new MBB.
-          if (MachineJumpTableInfo *MJTI = MF.getJumpTableInfo())
-            MJTI->ReplaceMBBInJumpTables(MBB, CurTBB);
+          if (MBB->pred_empty() || (MBB->pred_size() == 1 && HasBranchToSelf))
+            if (MachineJumpTableInfo *MJTI = MF.getJumpTableInfo())
+              MJTI->ReplaceMBBInJumpTables(MBB, CurTBB);
           if (DidChange) {
             ++NumBranchOpts;
             MadeChange = true;
-            if (!HasBranchToSelf) return MadeChange;
+            if (!HasBranchToSelf && MBB->pred_empty())
+              return MadeChange;
           }
         }
       }
@@ -2057,6 +2224,13 @@ bool BranchFolder::HoistCommonCodeInSuccs(MachineBasicBlock *MBB) {
   if (TBB->pred_size() > 1 || FBB->pred_size() > 1)
     return false;
 
+  MachineFunction &MF = *MBB->getParent();
+  if (SFDomTree &&
+      shrinkFrameGuardRejectBlocks(MF, {MBB, TBB, FBB}, *SFDomTree)) {
+    ++NumHoistBlockedByFrameBoundary;
+    return false;
+  }
+
   // Find a suitable position to hoist the common instructions to. Also figure
   // out which registers are used or defined by instructions from the insertion
   // point to the end of the block.
@@ -2072,7 +2246,6 @@ bool BranchFolder::HoistCommonCodeInSuccs(MachineBasicBlock *MBB) {
   MachineBasicBlock::iterator FIB = FBB->begin();
   MachineBasicBlock::iterator TIE = TBB->end();
   MachineBasicBlock::iterator FIE = FBB->end();
-  MachineFunction &MF = *TBB->getParent();
   while (TIB != TIE && FIB != FIE) {
     // Skip dbg_value instructions. These do not count.
     TIB = skipDebugInstructionsForward(TIB, TIE, false);
@@ -2182,6 +2355,21 @@ bool BranchFolder::HoistCommonCodeInSuccs(MachineBasicBlock *MBB) {
 
   if (!HasDups)
     return false;
+
+  if (SFDomTree) {
+    bool HoistingFrameRelated = false;
+    for (MachineBasicBlock::iterator I = TBB->begin(); I != TIB; ++I) {
+      if (isFrameRelatedForGuard(*I, MF)) {
+        HoistingFrameRelated = true;
+        break;
+      }
+    }
+    if (shrinkFrameGuardRejectHoist(MF, *MBB, HoistingFrameRelated,
+                                    *SFDomTree)) {
+      ++NumHoistBlockedByFrameBoundary;
+      return false;
+    }
+  }
 
   // Hoist the instructions from [T.begin, TIB) and then delete [F.begin, FIB).
   // If we're hoisting from a single block then just splice. Else step through

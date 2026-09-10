@@ -20,6 +20,7 @@ namespace llvm {
 
 class BasicBlock;
 class MachineBranchProbabilityInfo;
+class MachineDominatorTree;
 class MachineFunction;
 class MachineLoopInfo;
 class MachineRegisterInfo;
@@ -135,10 +136,19 @@ class TargetRegisterInfo;
     MachineLoopInfo *MLI = nullptr;
     LivePhysRegs LiveRegs;
 
+    /// Dominator tree for shrink-frame region guards. Null when the function
+    /// has no Prolog.
+    MachineDominatorTree *SFDomTree = nullptr;
+
   private:
     MBFIWrapper &MBBFreqInfo;
     const MachineBranchProbabilityInfo &MBPI;
     ProfileSummaryInfo *PSI;
+
+    /// Keep DestIdx and every SameTails source that may legally TailMerge into
+    /// it under shrink-frame rules. Compacts SameTails and sets DestIdx to 0.
+    /// Returns false if fewer than two blocks remain.
+    bool keepLegalSameTails(MachineFunction &MF, unsigned &DestIdx);
 
     bool TailMergeBlocks(MachineFunction &MF);
     bool TryTailMergeBlocks(MachineBasicBlock* SuccBB,

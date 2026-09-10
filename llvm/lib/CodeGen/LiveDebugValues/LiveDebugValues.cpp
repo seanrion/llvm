@@ -14,7 +14,9 @@
 #include "llvm/CodeGen/MachineFunction.h"
 #include "llvm/CodeGen/MachineFunctionPass.h"
 #include "llvm/CodeGen/Passes.h"
+#include "llvm/CodeGen/ShrinkFrameUtils.h"
 #include "llvm/CodeGen/TargetPassConfig.h"
+#include "llvm/IR/DebugInfoMetadata.h"
 #include "llvm/InitializePasses.h"
 #include "llvm/Pass.h"
 #include "llvm/PassRegistry.h"
@@ -128,9 +130,6 @@ void LiveDebugValuesPass::printPipeline(
 }
 
 bool LiveDebugValuesLegacy::runOnMachineFunction(MachineFunction &MF) {
-  if (MF.getFrameInfo().getProlog())
-    return false;
-
   auto *TPC = &getAnalysis<TargetPassConfig>();
   return LiveDebugValues().run(
       MF, TPC->getTM<TargetMachine>().Options.ShouldEmitDebugEntryValues());
@@ -145,11 +144,18 @@ bool LiveDebugValues::run(MachineFunction &MF,
   LDVImpl *TheImpl = &*VarLocImpl;
 
   MachineDominatorTree *DomTree = nullptr;
-  if (InstrRefBased) {
+  // InstrRef always needs a DomTree. Shrink-frame + real debug info also needs
+  // one so VarLoc can kill frame-invalid locations on no-frame joins.
+  const bool ShrinkFrameNeedsDT =
+      hasShrinkFrame(MF) && MF.getFunction().getSubprogram() &&
+      MF.getFunction().getSubprogram()->getUnit()->getEmissionKind() !=
+          DICompileUnit::NoDebug;
+  if (InstrRefBased || ShrinkFrameNeedsDT) {
     DomTree = &MDT;
     MDT.recalculate(MF);
-    TheImpl = &*InstrRefImpl;
   }
+  if (InstrRefBased)
+    TheImpl = &*InstrRefImpl;
 
   return TheImpl->ExtendRanges(MF, DomTree, ShouldEmitDebugEntryValues,
                                InputBBLimit, InputDbgValueLimit);

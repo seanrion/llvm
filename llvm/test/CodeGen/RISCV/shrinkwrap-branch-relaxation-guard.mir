@@ -1,0 +1,53 @@
+# RUN: llc -mtriple=riscv64 -run-pass=branch-relaxation -verify-machineinstrs \
+# RUN:     -riscv-shrink-wrapping-dataflow=true %s -o - | FileCheck %s
+#
+# With shrink-frame, BranchRelaxation must still run (no whole-function skip).
+# A conditional branch past a large framed block is relaxed to inverted Bcc + J.
+# This path must not introduce spill slots / FI (scavenge FI is only for
+# extreme indirect long jumps when both ends are in-frame).
+
+--- |
+  define void @relax_cond_with_shrink_frame(i64 %x) {
+    ret void
+  }
+...
+---
+name:            relax_cond_with_shrink_frame
+tracksRegLiveness: true
+frameInfo:
+  stackSize:       16
+  adjustsStack:    true
+  hasCalls:        true
+  prolog:          '%bb.1'
+body:             |
+  bb.0:
+    liveins: $x10
+    successors: %bb.1, %bb.2
+    ; Distance to bb.2 includes bb.1's .space (> ±4KiB B-type range).
+    BEQ $x10, $x0, %bb.2
+    PseudoBR %bb.1
+
+  bb.1:
+    liveins: $x10
+    $x2 = frame-setup ADDI $x2, -16
+    INLINEASM &".space 8192", 1 /* sideeffect attdialect */
+    $x2 = frame-destroy ADDI $x2, 16
+    PseudoRET
+
+  bb.2:
+    PseudoRET
+
+...
+
+# CHECK-LABEL: name: relax_cond_with_shrink_frame
+# Inverted condition falls through / targets near block; far dest uses PseudoBR.
+# CHECK: BNE $x10, $x0, %bb.1
+# CHECK: PseudoBR %bb.2
+# Frame sequence in the large block must remain intact.
+# CHECK: $x2 = frame-setup ADDI $x2, -16
+# CHECK: INLINEASM &".space 8192"
+# CHECK: $x2 = frame-destroy ADDI $x2, 16
+# Conditional relaxation must not create stack spills.
+# CHECK-NOT: %stack.
+# CHECK-NOT: SD {{.*}}$x2
+# CHECK-NOT: LD {{.*}}$x2

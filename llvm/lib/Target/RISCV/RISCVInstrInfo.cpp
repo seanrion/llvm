@@ -25,10 +25,12 @@
 #include "llvm/CodeGen/LiveIntervals.h"
 #include "llvm/CodeGen/LiveVariables.h"
 #include "llvm/CodeGen/MachineCombinerPattern.h"
+#include "llvm/CodeGen/MachineDominators.h"
 #include "llvm/CodeGen/MachineInstrBuilder.h"
 #include "llvm/CodeGen/MachineRegisterInfo.h"
 #include "llvm/CodeGen/MachineTraceMetrics.h"
 #include "llvm/CodeGen/RegisterScavenging.h"
+#include "llvm/CodeGen/ShrinkFrameUtils.h"
 #include "llvm/CodeGen/StackMaps.h"
 #include "llvm/IR/DebugInfoMetadata.h"
 #include "llvm/IR/Module.h"
@@ -1710,6 +1712,21 @@ void RISCVInstrInfo::insertIndirectBranch(MachineBasicBlock &MBB,
     RS->setRegUsed(TmpGPR);
   else {
     // The case when there is no scavenged register needs special handling.
+    // Spill to the branch-relaxation scratch FI. Under shrink-frame, that FI
+    // is only valid in framed regions (store near the jump site, restore near
+    // DestBB). Empty relaxation trampoline blocks inherit the predecessor's
+    // region; check that predecessor when MBB has a single pred.
+    if (hasShrinkFrame(*MF)) {
+      MachineDominatorTree DT;
+      DT.recalculate(*MF);
+      const MachineBasicBlock *StoreRegionBB = &MBB;
+      if (MBB.pred_size() == 1)
+        StoreRegionBB = *MBB.pred_begin();
+      if (!isInFrameRegion(*StoreRegionBB, DT) || !isInFrameRegion(DestBB, DT))
+        report_fatal_error(
+            "cannot use branch-relaxation scratch frame index outside "
+            "shrink-frame framed region");
+    }
 
     // Pick s11(or s1 for rve) because it doesn't make a difference.
     TmpGPR = STI.hasStdExtE() ? RISCV::X9 : RISCV::X27;

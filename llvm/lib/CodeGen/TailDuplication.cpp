@@ -83,9 +83,6 @@ bool TailDuplicateBaseLegacy::runOnMachineFunction(MachineFunction &MF) {
   if (skipFunction(MF.getFunction()))
     return false;
 
-  if (MF.getFrameInfo().getProlog())
-    return false;
-
   auto MBPI = &getAnalysis<MachineBranchProbabilityInfoWrapperPass>().getMBPI();
   auto *PSI = &getAnalysis<ProfileSummaryInfoWrapperPass>().getPSI();
   auto *MBFI = (PSI && PSI->hasProfileSummary()) ?

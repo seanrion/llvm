@@ -1,0 +1,276 @@
+# RUN: llc -mtriple=riscv64 -run-pass=machine-outliner -verify-machineinstrs \
+# RUN:     -riscv-shrink-wrapping-dataflow=true %s -o - | FileCheck %s
+#
+# Shrink-frame MachineOutliner (C+D):
+# - Only map in-frame MBBs; no-frame duplicates stay inline.
+# - Only the in-block framed-SP phase is outlinable (after FrameSetup,
+#   before FrameDestroy). Pre-setup / post-destroy sequences stay inline.
+# - FrameSetup / FrameDestroy stay in the parent.
+# - Outlined MF has no getProlog() (self-contained jr t0 / call).
+#
+# Sequences use ADDI from $x0 so physreg liveness stays valid under
+# tracksRegLiveness (read-modify ADDI would need every src as livein).
+
+--- |
+  define void @outline_from_framed(i64 %x) #0 {
+    ret void
+  }
+
+  define void @outline_from_framed_2(i64 %x) #0 {
+    ret void
+  }
+
+  define void @noframe_dups_stay_inline(i64 %x) #0 {
+    ret void
+  }
+
+  define void @presetup_postdestroy_stay_inline(i64 %x) #0 {
+    ret void
+  }
+
+  define void @presetup_postdestroy_stay_inline_2(i64 %x) #0 {
+    ret void
+  }
+
+  attributes #0 = { minsize }
+...
+---
+name:            outline_from_framed
+tracksRegLiveness: true
+frameInfo:
+  stackSize:       16
+  adjustsStack:    true
+  hasCalls:        true
+  prolog:          '%bb.1'
+body:             |
+  bb.0 (%ir-block.0):
+    liveins: $x10
+    successors: %bb.1, %bb.2
+    BEQ $x10, $x0, %bb.2
+    PseudoBR %bb.1
+
+  bb.1:
+    liveins: $x10
+    $x2 = frame-setup ADDI $x2, -16
+    ; Long enough identical body for beneficial outlining (>= ~6 x ADDI).
+    $x10 = ADDI $x0, 1
+    $x11 = ADDI $x0, 2
+    $x12 = ADDI $x0, 3
+    $x13 = ADDI $x0, 4
+    $x14 = ADDI $x0, 5
+    $x15 = ADDI $x0, 6
+    $x16 = ADDI $x0, 7
+    $x2 = frame-destroy ADDI $x2, 16
+    PseudoRET
+
+  bb.2:
+    ; Same sequence in no-frame early exit: must not be mapped / outlined.
+    $x10 = ADDI $x0, 1
+    $x11 = ADDI $x0, 2
+    $x12 = ADDI $x0, 3
+    $x13 = ADDI $x0, 4
+    $x14 = ADDI $x0, 5
+    $x15 = ADDI $x0, 6
+    $x16 = ADDI $x0, 7
+    PseudoRET
+
+...
+---
+name:            outline_from_framed_2
+tracksRegLiveness: true
+frameInfo:
+  stackSize:       16
+  adjustsStack:    true
+  hasCalls:        true
+  prolog:          '%bb.1'
+body:             |
+  bb.0 (%ir-block.0):
+    liveins: $x10
+    successors: %bb.1
+    PseudoBR %bb.1
+
+  bb.1:
+    liveins: $x10
+    $x2 = frame-setup ADDI $x2, -16
+    $x10 = ADDI $x0, 1
+    $x11 = ADDI $x0, 2
+    $x12 = ADDI $x0, 3
+    $x13 = ADDI $x0, 4
+    $x14 = ADDI $x0, 5
+    $x15 = ADDI $x0, 6
+    $x16 = ADDI $x0, 7
+    $x2 = frame-destroy ADDI $x2, 16
+    PseudoRET
+
+...
+---
+name:            noframe_dups_stay_inline
+tracksRegLiveness: true
+frameInfo:
+  stackSize:       16
+  adjustsStack:    true
+  hasCalls:        true
+  prolog:          '%bb.2'
+body:             |
+  bb.0 (%ir-block.0):
+    liveins: $x10
+    successors: %bb.1, %bb.2
+    ; Two no-frame copies of a long sequence; must stay inline.
+    $x10 = ADDI $x0, 11
+    $x11 = ADDI $x0, 12
+    $x12 = ADDI $x0, 13
+    $x13 = ADDI $x0, 14
+    $x14 = ADDI $x0, 15
+    $x15 = ADDI $x0, 16
+    $x16 = ADDI $x0, 17
+    BEQ $x10, $x0, %bb.1
+    PseudoBR %bb.2
+
+  bb.1:
+    $x10 = ADDI $x0, 11
+    $x11 = ADDI $x0, 12
+    $x12 = ADDI $x0, 13
+    $x13 = ADDI $x0, 14
+    $x14 = ADDI $x0, 15
+    $x15 = ADDI $x0, 16
+    $x16 = ADDI $x0, 17
+    PseudoRET
+
+  bb.2:
+    liveins: $x10
+    $x2 = frame-setup ADDI $x2, -16
+    $x10 = ADDI $x0, 99
+    $x2 = frame-destroy ADDI $x2, 16
+    PseudoRET
+
+...
+---
+# Artificial: duplicated sequences before FrameSetup and after FrameDestroy.
+# Prolog must not be the entry block (verifier). Pre-setup lives on PrologBB.
+# Even across two functions they must stay inline (SP not framed there).
+name:            presetup_postdestroy_stay_inline
+tracksRegLiveness: true
+frameInfo:
+  stackSize:       16
+  adjustsStack:    true
+  hasCalls:        true
+  prolog:          '%bb.1'
+body:             |
+  bb.0 (%ir-block.0):
+    liveins: $x10
+    successors: %bb.1
+    PseudoBR %bb.1
+
+  bb.1:
+    liveins: $x10
+    ; Pre-setup (unframed SP on PrologBB).
+    $x10 = ADDI $x0, 21
+    $x11 = ADDI $x0, 22
+    $x12 = ADDI $x0, 23
+    $x13 = ADDI $x0, 24
+    $x14 = ADDI $x0, 25
+    $x15 = ADDI $x0, 26
+    $x16 = ADDI $x0, 27
+    $x2 = frame-setup ADDI $x2, -16
+    $x10 = ADDI $x0, 41
+    $x2 = frame-destroy ADDI $x2, 16
+    ; Post-destroy (SP restored).
+    $x10 = ADDI $x0, 31
+    $x11 = ADDI $x0, 32
+    $x12 = ADDI $x0, 33
+    $x13 = ADDI $x0, 34
+    $x14 = ADDI $x0, 35
+    $x15 = ADDI $x0, 36
+    $x16 = ADDI $x0, 37
+    PseudoRET
+
+...
+---
+name:            presetup_postdestroy_stay_inline_2
+tracksRegLiveness: true
+frameInfo:
+  stackSize:       16
+  adjustsStack:    true
+  hasCalls:        true
+  prolog:          '%bb.1'
+body:             |
+  bb.0 (%ir-block.0):
+    liveins: $x10
+    successors: %bb.1
+    PseudoBR %bb.1
+
+  bb.1:
+    liveins: $x10
+    $x10 = ADDI $x0, 21
+    $x11 = ADDI $x0, 22
+    $x12 = ADDI $x0, 23
+    $x13 = ADDI $x0, 24
+    $x14 = ADDI $x0, 25
+    $x15 = ADDI $x0, 26
+    $x16 = ADDI $x0, 27
+    $x2 = frame-setup ADDI $x2, -16
+    $x10 = ADDI $x0, 42
+    $x2 = frame-destroy ADDI $x2, 16
+    $x10 = ADDI $x0, 31
+    $x11 = ADDI $x0, 32
+    $x12 = ADDI $x0, 33
+    $x13 = ADDI $x0, 34
+    $x14 = ADDI $x0, 35
+    $x15 = ADDI $x0, 36
+    $x16 = ADDI $x0, 37
+    PseudoRET
+
+...
+
+# In-frame bodies from the first two functions are outlined together.
+# CHECK-LABEL: name: outline_from_framed
+# Frame setup/destroy stay in the parent; body becomes a call.
+# CHECK: $x2 = frame-setup ADDI $x2, -16
+# CHECK: PseudoCALLReg
+# CHECK: $x2 = frame-destroy ADDI $x2, 16
+# No-frame early exit keeps the sequence inline (not a call).
+# CHECK: bb.2
+# CHECK: $x10 = ADDI $x0, 1
+# CHECK: $x16 = ADDI $x0, 7
+# CHECK-NEXT: PseudoRET
+
+# CHECK-LABEL: name: outline_from_framed_2
+# CHECK: $x2 = frame-setup ADDI $x2, -16
+# CHECK: PseudoCALLReg
+# CHECK: $x2 = frame-destroy ADDI $x2, 16
+
+# CHECK-LABEL: name: noframe_dups_stay_inline
+# CHECK: $x10 = ADDI $x0, 11
+# CHECK: $x16 = ADDI $x0, 17
+# CHECK: $x10 = ADDI $x0, 11
+# CHECK: $x16 = ADDI $x0, 17
+# CHECK: $x2 = frame-setup ADDI $x2, -16
+# CHECK-NOT: PseudoCALLReg
+
+# Pre-setup and post-destroy duplicates must not become calls.
+# CHECK-LABEL: name: presetup_postdestroy_stay_inline
+# CHECK: $x10 = ADDI $x0, 21
+# CHECK: $x16 = ADDI $x0, 27
+# CHECK: $x2 = frame-setup ADDI $x2, -16
+# CHECK: $x10 = ADDI $x0, 41
+# CHECK: $x2 = frame-destroy ADDI $x2, 16
+# CHECK: $x10 = ADDI $x0, 31
+# CHECK: $x16 = ADDI $x0, 37
+# CHECK-NOT: PseudoCALLReg
+
+# CHECK-LABEL: name: presetup_postdestroy_stay_inline_2
+# CHECK: $x10 = ADDI $x0, 21
+# CHECK: $x16 = ADDI $x0, 27
+# CHECK: $x2 = frame-setup ADDI $x2, -16
+# CHECK: $x10 = ADDI $x0, 42
+# CHECK: $x2 = frame-destroy ADDI $x2, 16
+# CHECK: $x10 = ADDI $x0, 31
+# CHECK: $x16 = ADDI $x0, 37
+# CHECK-NOT: PseudoCALLReg
+
+# Outlined helper is self-contained (empty prolog / no shrink-frame PrologBB).
+# CHECK: name: OUTLINED_FUNCTION_{{[0-9]+}}
+# CHECK: prolog: ''
+# CHECK: $x10 = ADDI $x0, 1
+# CHECK: $x16 = ADDI $x0, 7
+# CHECK: JALR
