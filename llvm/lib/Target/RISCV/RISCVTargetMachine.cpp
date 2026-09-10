@@ -99,6 +99,15 @@ static cl::opt<bool>
                            cl::desc("Enable the loop data prefetch pass"),
                            cl::init(true));
 
+extern cl::opt<bool> RISCVShrinkWrappingDataflow;
+
+/// When data-flow shrink-wrapping is on, Frameless RA runs by default.
+/// Use this to opt out without turning off dataflow itself.
+cl::opt<bool> DisableRISCVFramelessRA(
+    "disable-riscv-frameless-ra", cl::init(false), cl::Hidden,
+    cl::desc("Disable frameless-path RA hints (on by default with "
+             "-riscv-shrink-wrapping-dataflow)"));
+
 static cl::opt<bool> DisableVectorMaskMutation(
     "riscv-disable-vector-mask-mutation",
     cl::desc("Disable the vector mask scheduling mutation"), cl::init(false),
@@ -158,6 +167,7 @@ extern "C" LLVM_ABI LLVM_EXTERNAL_VISIBILITY void LLVMInitializeRISCVTarget() {
   initializeRISCVRedundantCopyEliminationPass(*PR);
   initializeRISCVAsmPrinterPass(*PR);
   initializeRISCVPromoteConstantPass(*PR);
+  initializeRISCVFramelessRAAnalysisPass(*PR);
 }
 
 static Reloc::Model getEffectiveRelocModel(const Triple &TT,
@@ -477,6 +487,13 @@ bool RISCVPassConfig::addRegAssignAndRewriteOptimized() {
   if (TM->getOptLevel() != CodeGenOptLevel::None &&
       EnableRISCVDeadRegisterElimination)
     addPass(createRISCVDeadRegisterDefinitionsPass());
+  // Frameless RA follows dataflow: on with -riscv-shrink-wrapping-dataflow
+  // unless -disable-riscv-frameless-ra. Skip LIS when unused so default
+  // (dataflow off) GPR regalloc pipeline stays unchanged.
+  if (RISCVShrinkWrappingDataflow && !DisableRISCVFramelessRA) {
+    addPass(&LiveIntervalsID);
+    addPass(createRISCVFramelessRAAnalysisPass());
+  }
   return TargetPassConfig::addRegAssignAndRewriteOptimized();
 }
 

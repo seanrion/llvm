@@ -141,6 +141,24 @@ LLVM_ABI bool isLegalOffPrologCSRSavePoint(const MachineFunction &MF,
                                            ArrayRef<MCRegister> Regs,
                                            const MachineDominatorTree &DT);
 
+/// True if \p MBB needs a stack frame (non-tail call, FI, SP/FP modify, etc.).
+/// Matches ShrinkWrapping::blockNeedsFrame.
+LLVM_ABI bool blockNeedsFrame(const MachineFunction &MF,
+                              const MachineBasicBlock &MBB);
+
+/// Shared bail for Frameless RA with shrink-wrapping (naked, EH, sanitizer, …).
+/// Does not check FramelessExists/ColdExists (caller computes those).
+LLVM_ABI bool shouldSkipFramelessRA(const MachineFunction &MF);
+
+/// Blocks reachable from entry without passing a NeedsFrame block (except
+/// entry).
+LLVM_ABI void
+computeFramelessRegionBlocks(const MachineFunction &MF,
+                             SmallVectorImpl<MachineBasicBlock *> &Out);
+
+LLVM_ABI bool framelessRegionExists(const MachineFunction &MF);
+LLVM_ABI bool coldPathExists(const MachineFunction &MF);
+
 } // namespace llvm
 
 #endif

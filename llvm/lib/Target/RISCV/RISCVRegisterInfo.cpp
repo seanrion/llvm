@@ -13,6 +13,7 @@
 #include "RISCVRegisterInfo.h"
 #include "RISCV.h"
 #include "RISCVFrameLowering.h"
+#include "RISCVMachineFunctionInfo.h"
 #include "RISCVSubtarget.h"
 #include "llvm/ADT/SmallSet.h"
 #include "llvm/BinaryFormat/Dwarf.h"
@@ -22,6 +23,7 @@
 #include "llvm/CodeGen/RegisterScavenging.h"
 #include "llvm/CodeGen/TargetFrameLowering.h"
 #include "llvm/CodeGen/TargetInstrInfo.h"
+#include "llvm/CodeGen/VirtRegMap.h"
 #include "llvm/IR/DebugInfoMetadata.h"
 #include "llvm/Support/ErrorHandling.h"
 
@@ -1049,6 +1051,62 @@ float RISCVRegisterInfo::getSpillWeightScaleFactor(
   return getRegClassWeight(RC).RegWeight;
 }
 
+/// Prefer metadata on the pre-split original. Region-split clones often lack
+/// MRI hints; do not copy them via LiveRangeEdit DidClone (that resets Greedy
+/// ExtraInfo stage to RS_Assign and can loop). Follow VRM instead.
+static Register framelessMetaReg(Register VirtReg,
+                                 const MachineRegisterInfo &MRI,
+                                 const VirtRegMap *VRM) {
+  if (!VirtReg.isVirtual())
+    return Register();
+  if (MRI.getRegAllocationHint(VirtReg).first == RISCVRI::FramelessCallerSaved)
+    return VirtReg;
+  if (!VRM)
+    return Register();
+  Register Orig = VRM->getOriginal(VirtReg);
+  if (Orig != VirtReg && Orig.isVirtual() &&
+      MRI.getRegAllocationHint(Orig).first == RISCVRI::FramelessCallerSaved)
+    return Orig;
+  return Register();
+}
+
+static unsigned framelessCostOf(const MachineFunction &MF, Register MetaReg) {
+  if (!MetaReg)
+    return 0;
+  return MF.getInfo<RISCVMachineFunctionInfo>()->getFramelessRACost(MetaReg);
+}
+
+static bool framelessHardHintOf(const MachineFunction &MF, Register MetaReg) {
+  if (!MetaReg)
+    return false;
+  return MF.getInfo<RISCVMachineFunctionInfo>()->hasFramelessRAHardHint(
+      MetaReg);
+}
+
+unsigned RISCVRegisterInfo::getExtraCSRFirstUseCostForVReg(
+    Register VirtReg, const MachineFunction &MF) const {
+  if (!VirtReg.isVirtual())
+    return 0;
+  return framelessCostOf(MF, VirtReg);
+}
+
+void RISCVRegisterInfo::propagateRegAllocSplitMetadata(
+    Register OldVReg, Register NewVReg, MachineFunction &MF) const {
+  // Coalesce / DidClone only. Region-split products use framelessMetaReg() at
+  // hint time.
+  if (!OldVReg.isVirtual() || !NewVReg.isVirtual())
+    return;
+  MachineRegisterInfo *MRI = &MF.getRegInfo();
+  if (MRI->getRegAllocationHint(OldVReg).first != RISCVRI::FramelessCallerSaved)
+    return;
+  MRI->setRegAllocationHint(NewVReg, RISCVRI::FramelessCallerSaved, Register());
+  auto *RVFI = MF.getInfo<RISCVMachineFunctionInfo>();
+  if (unsigned Cost = framelessCostOf(MF, OldVReg))
+    RVFI->setFramelessRACost(NewVReg, Cost);
+  if (RVFI->hasFramelessRAHardHint(OldVReg))
+    RVFI->setFramelessRAHardHint(NewVReg);
+}
+
 // Add two address hints to improve chances of being able to use a compressed
 // instruction.
 bool RISCVRegisterInfo::getRegAllocationHints(
@@ -1062,6 +1120,10 @@ bool RISCVRegisterInfo::getRegAllocationHints(
   std::pair<unsigned, Register> Hint = MRI->getRegAllocationHint(VirtReg);
   unsigned HintType = Hint.first;
   Register Partner = Hint.second;
+  Register FramelessReg = framelessMetaReg(VirtReg, *MRI, VRM);
+  if (HintType != RISCVRI::RegPairEven && HintType != RISCVRI::RegPairOdd &&
+      FramelessReg)
+    HintType = RISCVRI::FramelessCallerSaved;
 
   MCRegister TargetReg;
   if (HintType == RISCVRI::RegPairEven || HintType == RISCVRI::RegPairOdd) {
@@ -1098,11 +1160,40 @@ bool RISCVRegisterInfo::getRegAllocationHints(
     }
   }
 
+  SmallVector<MCPhysReg, 16> FramelessHints;
+  if (HintType == RISCVRI::FramelessCallerSaved) {
+    for (MCPhysReg PhysReg : Order) {
+      if (!RISCV::GPRRegClass.contains(PhysReg))
+        continue;
+      unsigned Enc = getEncodingValue(PhysReg);
+      if (!RISCVRI::isCallerSavedGPREncoding(Enc) || MRI->isReserved(PhysReg))
+        continue;
+      if (!is_contained(Hints, PhysReg))
+        FramelessHints.push_back(PhysReg);
+    }
+  }
+
+  // Restrict allocation order to caller-saved GPRs for entry finish/end loads.
+  // Soft CSR cost alone still picks a free callee-saved when the LI crosses
+  // cold calls.
+  if (HintType == RISCVRI::FramelessCallerSaved && !FramelessHints.empty() &&
+      framelessHardHintOf(MF, FramelessReg)) {
+    Hints.assign(FramelessHints.begin(), FramelessHints.end());
+    return true;
+  }
+
   bool BaseImplRetVal = TargetRegisterInfo::getRegAllocationHints(
       VirtReg, Order, Hints, MF, VRM, Matrix);
 
-  if (!VRM || DisableRegAllocHints)
+  auto prependFramelessHints = [&]() {
+    if (!FramelessHints.empty())
+      Hints.insert(Hints.begin(), FramelessHints.begin(), FramelessHints.end());
+  };
+
+  if (!VRM || DisableRegAllocHints) {
+    prependFramelessHints();
     return BaseImplRetVal;
+  }
 
   // Add any two address hints after any copy hints.
   SmallSet<Register, 4> TwoAddrHints;
@@ -1246,6 +1337,9 @@ bool RISCVRegisterInfo::getRegAllocationHints(
     if (TwoAddrHints.count(OrderReg))
       Hints.push_back(OrderReg);
 
+  // Prefer caller-saved registers before default CSR preference in Greedy.
+  prependFramelessHints();
+
   return BaseImplRetVal;
 }
 
@@ -1275,6 +1369,9 @@ void RISCVRegisterInfo::updateRegAllocHint(Register Reg, Register NewReg,
       if (NewReg.isVirtual())
         MRI->setRegAllocationHint(NewReg, Hint.first, Partner);
     }
+  } else if (Hint.first == RISCVRI::FramelessCallerSaved &&
+             NewReg.isVirtual()) {
+    propagateRegAllocSplitMetadata(Reg, NewReg, MF);
   }
 }
 

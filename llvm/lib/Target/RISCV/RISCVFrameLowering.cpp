@@ -36,7 +36,8 @@
 
 using namespace llvm;
 
-static cl::opt<bool> RISCVShrinkWrappingDataflow(
+// Non-static: RISCVTargetMachine.cpp externs this for Frameless RA gating.
+cl::opt<bool> RISCVShrinkWrappingDataflow(
     "riscv-shrink-wrapping-dataflow", cl::init(false), cl::Hidden,
     cl::desc("Enable data-flow based multi-point CSR shrink-wrapping for "
              "RISC-V (excludes ra/fp from splitting)"));

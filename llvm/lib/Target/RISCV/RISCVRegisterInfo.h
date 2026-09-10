@@ -42,7 +42,19 @@ enum {
   // Used for Zilsd LD/SD register pairs
   RegPairOdd = 1,
   RegPairEven = 2,
+  // Prefer caller-saved GPRs on frameless paths (shrink-frame).
+  FramelessCallerSaved = 3,
 };
+
+/// Extra CSR-first-use cost for entry finish/end pointer loads. Soft cost alone
+/// is not enough when the live range crosses cold calls; those VRs also get a
+/// hard allocation-order restriction (see hasFramelessRAHardHint).
+static constexpr unsigned EntryFramelessRACost = 1u << 14;
+
+/// a0-a7 (x10-x17) and t0-t2 (x5-x7).
+inline bool isCallerSavedGPREncoding(unsigned Enc) {
+  return (Enc >= 10 && Enc <= 17) || (Enc >= 5 && Enc <= 7);
+}
 
 /// \returns the IsVRegClass for the register class.
 static inline bool isVRegClass(uint8_t TSFlags) {
@@ -74,6 +86,10 @@ struct RISCVRegisterInfo : public RISCVGenRegisterInfo {
     // path instead of using a callee-saved register.
     return 5;
   }
+
+  unsigned
+  getExtraCSRFirstUseCostForVReg(Register VirtReg,
+                                 const MachineFunction &MF) const override;
 
   const MCPhysReg *getCalleeSavedRegs(const MachineFunction *MF) const override;
 
@@ -168,6 +184,9 @@ struct RISCVRegisterInfo : public RISCVGenRegisterInfo {
 
   void updateRegAllocHint(Register Reg, Register NewReg,
                           MachineFunction &MF) const override;
+
+  void propagateRegAllocSplitMetadata(Register OldVReg, Register NewVReg,
+                                      MachineFunction &MF) const override;
 
   Register findVRegWithEncoding(const TargetRegisterClass &RegClass,
                                 uint16_t Encoding) const;

@@ -136,6 +136,9 @@ void initializeRISCVVMV0EliminationPass(PassRegistry &);
 FunctionPass *createRISCVQCRelaxMarkingPass();
 void initializeRISCVQCRelaxMarkingPass(PassRegistry &);
 
+FunctionPass *createRISCVFramelessRAAnalysisPass();
+void initializeRISCVFramelessRAAnalysisPass(PassRegistry &);
+
 void initializeRISCVAsmPrinterPass(PassRegistry &);
 } // namespace llvm
 

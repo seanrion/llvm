@@ -8,6 +8,7 @@
 
 #include "llvm/CodeGen/ShrinkFrameUtils.h"
 #include "llvm/ADT/DepthFirstIterator.h"
+#include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/CodeGen/LivePhysRegs.h"
 #include "llvm/CodeGen/MachineBasicBlock.h"
@@ -22,9 +23,12 @@
 #include "llvm/CodeGen/TargetRegisterInfo.h"
 #include "llvm/CodeGen/TargetSubtargetInfo.h"
 #include "llvm/IR/DebugLoc.h"
+#include "llvm/IR/Function.h"
+#include "llvm/MC/MCAsmInfo.h"
 #include "llvm/MC/MCRegister.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/raw_ostream.h"
+#include "llvm/Target/TargetMachine.h"
 
 #define DEBUG_TYPE "shrink-frame"
 
@@ -315,15 +319,26 @@ bool llvm::mustHoistShrinkFramePrologToEntry(const MachineFunction &MF,
       continue;
     for (const MachineInstr &MI : MBB) {
       for (Register R : FrameBound) {
-        if (R && MI.modifiesRegister(R, TRI))
+        if (R && MI.modifiesRegister(R, TRI)) {
+          LLVM_DEBUG(dbgs()
+                     << "mustHoist check1: frame-bound " << printReg(R, TRI)
+                     << " modified in " << printMBBReference(MBB)
+                     << " (not dominated by Prolog "
+                     << printMBBReference(*Prolog) << ")\n");
           return true;
+        }
       }
     }
   }
 
   for (const auto &[SaveBB, _] : MFI.getSavePoints()) {
-    if (SaveBB != Prolog && !DT.dominates(Prolog, SaveBB))
+    if (SaveBB != Prolog && !DT.dominates(Prolog, SaveBB)) {
+      LLVM_DEBUG(dbgs() << "mustHoist check2: SavePoint "
+                        << printMBBReference(*SaveBB)
+                        << " not dominated by Prolog "
+                        << printMBBReference(*Prolog) << '\n');
       return true;
+    }
   }
 
   for (const MachineBasicBlock &MBB : MF) {
@@ -337,8 +352,11 @@ bool llvm::mustHoistShrinkFramePrologToEntry(const MachineFunction &MF,
       else
         HasFramelessPred = true;
     }
-    if (HasFramedPred && HasFramelessPred)
+    if (HasFramedPred && HasFramelessPred) {
+      LLVM_DEBUG(dbgs() << "mustHoist check3: mixed framed/frameless preds on "
+                        << printMBBReference(MBB) << '\n');
       return true;
+    }
   }
 
   for (const MachineBasicBlock &MBB : MF) {
@@ -346,8 +364,13 @@ bool llvm::mustHoistShrinkFramePrologToEntry(const MachineFunction &MF,
       continue;
     if (!isReachableMBB(Entry, &MBB))
       continue;
-    if (blockMayTouchStackFrame(MBB, TRI, SP))
+    if (blockMayTouchStackFrame(MBB, TRI, SP)) {
+      LLVM_DEBUG(dbgs() << "mustHoist check4: stack/call/FI in "
+                        << printMBBReference(MBB)
+                        << " (reachable, not dominated by Prolog "
+                        << printMBBReference(*Prolog) << ")\n");
       return true;
+    }
   }
 
   return false;
@@ -397,4 +420,123 @@ bool llvm::isLegalOffPrologCSRSavePoint(const MachineFunction &MF,
       return false;
   }
   return true;
+}
+
+bool llvm::blockNeedsFrame(const MachineFunction &MF,
+                           const MachineBasicBlock &MBB) {
+  const TargetInstrInfo *TII = MF.getSubtarget().getInstrInfo();
+  const TargetRegisterInfo *TRI = MF.getSubtarget().getRegisterInfo();
+  Register StackPtr = MF.getSubtarget()
+                          .getTargetLowering()
+                          ->getStackPointerRegisterToSaveRestore();
+  Register FramePtr = TRI->getFrameRegister(MF);
+
+  for (const MachineInstr &MI : MBB) {
+    if (MI.isDebugInstr())
+      continue;
+
+    for (const MachineOperand &MO : MI.operands()) {
+      if (MO.isFI())
+        return true;
+    }
+
+    if (MI.isCall() && !TII->isTailCall(MI))
+      return true;
+
+    if (StackPtr && MI.modifiesRegister(StackPtr, TRI))
+      return true;
+    if (FramePtr && MI.modifiesRegister(FramePtr, TRI))
+      return true;
+
+    if (MI.getOpcode() == TargetOpcode::STATEPOINT ||
+        MI.getOpcode() == TargetOpcode::STACKMAP ||
+        MI.getOpcode() == TargetOpcode::PATCHPOINT)
+      return true;
+  }
+  return false;
+}
+
+bool llvm::shouldSkipFramelessRA(const MachineFunction &MF) {
+  const Function &F = MF.getFunction();
+  const MachineFrameInfo &MFI = MF.getFrameInfo();
+  const TargetFrameLowering *TFI = MF.getSubtarget().getFrameLowering();
+
+  if (F.hasFnAttribute(Attribute::Naked) ||
+      F.hasFnAttribute(Attribute::NoReturn) ||
+      F.hasFnAttribute(Attribute::OptimizeNone) || MFI.hasVarSizedObjects() ||
+      MFI.hasOpaqueSPAdjustment() || F.getCallingConv() == CallingConv::GHC ||
+      MF.hasEHFunclets())
+    return true;
+
+  if (F.hasFnAttribute(Attribute::SanitizeAddress) ||
+      F.hasFnAttribute(Attribute::SanitizeThread) ||
+      F.hasFnAttribute(Attribute::SanitizeMemory) ||
+      F.hasFnAttribute(Attribute::SanitizeType) ||
+      F.hasFnAttribute(Attribute::SanitizeHWAddress))
+    return true;
+
+  if (!TFI->enableShrinkWrapping(MF) || !TFI->enableCSRSaveRestorePointsSplit())
+    return true;
+
+  if (MF.getTarget().getMCAsmInfo().usesWindowsCFI())
+    return true;
+
+  for (const MachineBasicBlock &MBB : MF) {
+    if (MBB.isEHPad() || MBB.isEHFuncletEntry() ||
+        MBB.isInlineAsmBrIndirectTarget())
+      return true;
+  }
+
+  const TargetRegisterInfo *TRI = MF.getSubtarget().getRegisterInfo();
+  if (TRI->hasStackRealignment(MF))
+    return true;
+
+  return false;
+}
+
+void llvm::computeFramelessRegionBlocks(
+    const MachineFunction &MF, SmallVectorImpl<MachineBasicBlock *> &Out) {
+  Out.clear();
+  if (MF.empty())
+    return;
+
+  const MachineBasicBlock *Entry = &MF.front();
+  SmallVector<const MachineBasicBlock *, 8> Worklist;
+  SmallPtrSet<const MachineBasicBlock *, 16> Visited;
+
+  for (const MachineBasicBlock *Succ : Entry->successors()) {
+    if (blockNeedsFrame(MF, *Succ))
+      continue;
+    Worklist.push_back(Succ);
+    Visited.insert(Succ);
+  }
+
+  while (!Worklist.empty()) {
+    const MachineBasicBlock *BB = Worklist.pop_back_val();
+    Out.push_back(const_cast<MachineBasicBlock *>(BB));
+    for (const MachineBasicBlock *Succ : BB->successors()) {
+      if (Visited.count(Succ) || blockNeedsFrame(MF, *Succ))
+        continue;
+      Visited.insert(Succ);
+      Worklist.push_back(Succ);
+    }
+  }
+}
+
+bool llvm::framelessRegionExists(const MachineFunction &MF) {
+  SmallVector<MachineBasicBlock *, 8> FramelessBlocks;
+  computeFramelessRegionBlocks(MF, FramelessBlocks);
+  for (MachineBasicBlock *BB : FramelessBlocks) {
+    if (BB->isReturnBlock())
+      return true;
+  }
+  return false;
+}
+
+bool llvm::coldPathExists(const MachineFunction &MF) {
+  for (const MachineBasicBlock &MBB : MF) {
+    if (blockNeedsFrame(MF, MBB))
+      return true;
+  }
+  return false;
 }

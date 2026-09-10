@@ -1,0 +1,158 @@
+# RUN: llc -mtriple=riscv64 -run-pass=shrink-wrapping -verify-machineinstrs -riscv-shrink-wrapping-dataflow=true %s -o - | FileCheck %s --check-prefixes=CHECK-OK
+# RUN: llc -mtriple=riscv64 -run-pass=shrink-wrapping -verify-machineinstrs -riscv-shrink-wrapping-dataflow=true %s -o - | FileCheck %s --check-prefixes=CHECK-SHARED
+# RUN: llc -mtriple=riscv64 -run-pass=shrink-wrapping -verify-machineinstrs -riscv-shrink-wrapping-dataflow=true %s -o - | FileCheck %s --check-prefixes=CHECK-BLOCKED
+# RUN: llc -mtriple=riscv64 -run-pass=shrink-wrapping -verify-machineinstrs -riscv-shrink-wrapping-dataflow=true -disable-riscv-shrink-frame-dup %s -o - | FileCheck %s --check-prefixes=CHECK-BLOCKED
+#
+# Post-RA unit tests for shrink-wrapping on vector push_back-shaped CFGs.
+# End-to-end RA + asm coverage is in frameless-ra.ll.
+#
+# CFG:
+#   bb.0: load finish/end, compare, branch
+#   bb.1: fast path (store + bump finish)
+#   bb.2: slow path (call)
+#   bb.3: return (separate or shared)
+#
+# Variants:
+#   push_back_like_ok       - finish/end in caller-saved (a2/a3), separate returns
+#   push_back_like_shared   - shared return (needs return-block duplication)
+#   push_back_like_blocked  - finish in s0 at entry blocks delayed Prolog
+
+--- |
+  declare void @grow_slow(ptr, i8)
+
+  define void @push_back_like_ok(ptr %v, i8 %x) {
+    ret void
+  }
+
+  define void @push_back_like_shared(ptr %v, i8 %x) {
+    ret void
+  }
+
+  define void @push_back_like_blocked(ptr %v, i8 %x) {
+    ret void
+  }
+...
+---
+name:            push_back_like_ok
+tracksRegLiveness: true
+body:             |
+  bb.0:
+    liveins: $x10, $x11
+    successors: %bb.2, %bb.1
+
+    ; Hot path uses caller-saved only (frameless-RA outcome).
+    renamable $x12 = LD renamable $x10, 8
+    renamable $x13 = LD renamable $x10, 16
+    BEQ renamable $x12, killed renamable $x13, %bb.2
+    PseudoBR %bb.1
+
+  bb.1:
+    liveins: $x10, $x11, $x12
+    ; Fast path: *finish = byte; ++finish; ret (no frame, no CSR).
+    SB killed renamable $x11, renamable $x12, 0
+    renamable $x12 = ADDI renamable $x12, 1
+    SD killed renamable $x12, renamable $x10, 8
+    PseudoRET
+
+  bb.2:
+    liveins: $x10, $x11
+    ; Slow path only: needs stack frame for call + ra save.
+    ADJCALLSTACKDOWN 0, 0, implicit-def $x2, implicit $x2
+    PseudoCALL target-flags(riscv-call) @grow_slow, implicit-def $x1, implicit $x10, implicit $x11, implicit-def $x10, implicit-def $x11
+    ADJCALLSTACKUP 0, 0, implicit-def $x2, implicit $x2
+    PseudoRET
+
+...
+---
+name:            push_back_like_shared
+tracksRegLiveness: true
+body:             |
+  bb.0:
+    liveins: $x10, $x11
+    successors: %bb.2, %bb.1
+
+    renamable $x12 = LD renamable $x10, 8
+    renamable $x13 = LD renamable $x10, 16
+    BEQ renamable $x12, killed renamable $x13, %bb.2
+    PseudoBR %bb.1
+
+  bb.1:
+    liveins: $x10, $x11, $x12
+    successors: %bb.3
+
+    SB killed renamable $x11, renamable $x12, 0
+    renamable $x12 = ADDI renamable $x12, 1
+    SD killed renamable $x12, renamable $x10, 8
+    PseudoBR %bb.3
+
+  bb.2:
+    liveins: $x10, $x11
+    successors: %bb.3
+
+    ADJCALLSTACKDOWN 0, 0, implicit-def $x2, implicit $x2
+    PseudoCALL target-flags(riscv-call) @grow_slow, implicit-def $x1, implicit $x10, implicit $x11, implicit-def $x10, implicit-def $x11
+    ADJCALLSTACKUP 0, 0, implicit-def $x2, implicit $x2
+    PseudoBR %bb.3
+
+  bb.3:
+    liveins: $x10
+    PseudoRET
+
+...
+---
+name:            push_back_like_blocked
+tracksRegLiveness: true
+body:             |
+  bb.0:
+    liveins: $x10, $x11
+    successors: %bb.2, %bb.1
+
+    ; finish pointer in s0 from the first block on all paths.
+    renamable $x8 = LD renamable $x10, 8
+    renamable $x12 = LD renamable $x10, 16
+    BEQ renamable $x8, killed renamable $x12, %bb.2
+    PseudoBR %bb.1
+
+  bb.1:
+    liveins: $x10, $x11, $x8
+    successors: %bb.3
+
+    SB killed renamable $x11, renamable $x8, 0
+    renamable $x8 = ADDI renamable $x8, 1
+    SD killed renamable $x8, renamable $x10, 8
+    PseudoBR %bb.3
+
+  bb.2:
+    liveins: $x10, $x11, $x8
+    successors: %bb.3
+
+    ADJCALLSTACKDOWN 0, 0, implicit-def $x2, implicit $x2
+    PseudoCALL target-flags(riscv-call) @grow_slow, implicit-def $x1, implicit $x10, implicit $x11, implicit-def $x10, implicit-def $x11
+    ADJCALLSTACKUP 0, 0, implicit-def $x2, implicit $x2
+    PseudoBR %bb.3
+
+  bb.3:
+    liveins: $x10, $x8
+    PseudoRET
+
+...
+
+# CHECK-OK-LABEL: name: push_back_like_ok
+# CHECK-OK-NOT:   prolog: '<default>'
+# CHECK-OK-NOT:   prolog: ''
+# CHECK-OK-NOT:   prolog: {{.*}}bb.0
+# CHECK-OK:       prolog: {{'%bb.[1-9]'}}
+
+# CHECK-SHARED-LABEL: name: push_back_like_shared
+# CHECK-SHARED-NOT:   prolog: '<default>'
+# CHECK-SHARED-NOT:   prolog: ''
+# CHECK-SHARED-NOT:   prolog: {{.*}}bb.0
+# CHECK-SHARED:       prolog: {{'%bb.[1-9]'}}
+# Frameless fast path should target a cloned return when duplication is on.
+# CHECK-SHARED:       PseudoRET
+# CHECK-SHARED:       PseudoRET
+
+# CHECK-BLOCKED-LABEL: name: push_back_like_blocked
+# Entry s0 blocks shrink-frame past bb.0.
+# CHECK-BLOCKED-NOT:  prolog: {{'%bb.2'}}
+# CHECK-BLOCKED:      prolog:

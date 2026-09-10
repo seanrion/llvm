@@ -15,6 +15,7 @@
 
 #include "RISCVSubtarget.h"
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/CodeGen/MIRYamlMapping.h"
 #include "llvm/CodeGen/MachineFrameInfo.h"
 #include "llvm/CodeGen/MachineFunction.h"
@@ -97,6 +98,11 @@ private:
 
   /// Whether the function has cf-protection-branch module flag set.
   bool CFProtectionBranch = false;
+
+  /// Per-vreg CSR-first-use extras and hard allocation-order restrictions from
+  /// Frameless RA Analysis.
+  DenseMap<Register, unsigned> FramelessRACosts;
+  DenseSet<Register> FramelessRAHardHints;
 
 public:
   RISCVMachineFunctionInfo(const Function &F, const RISCVSubtarget *STI);
@@ -241,6 +247,23 @@ public:
   void setDynamicAllocation() { HasDynamicAllocation = true; }
 
   bool hasCFProtectionBranch() const { return CFProtectionBranch; }
+
+  void setFramelessRACost(Register Reg, unsigned Cost) {
+    FramelessRACosts[Reg] = Cost;
+  }
+
+  unsigned getFramelessRACost(Register Reg) const {
+    auto I = FramelessRACosts.find(Reg);
+    return I != FramelessRACosts.end() ? I->second : 0;
+  }
+
+  void setFramelessRAHardHint(Register Reg) {
+    FramelessRAHardHints.insert(Reg);
+  }
+
+  bool hasFramelessRAHardHint(Register Reg) const {
+    return FramelessRAHardHints.contains(Reg);
+  }
 };
 
 } // end namespace llvm

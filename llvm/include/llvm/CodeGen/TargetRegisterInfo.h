@@ -847,6 +847,12 @@ public:
     // Do nothing.
   }
 
+  /// Copy target-specific regalloc metadata from \p OldVReg to \p NewVReg when
+  /// Greedy splits a live range (LiveRangeEdit clone).
+  virtual void propagateRegAllocSplitMetadata(Register OldVReg,
+                                              Register NewVReg,
+                                              MachineFunction &MF) const {}
+
   /// Allow the target to reverse allocation order of local live ranges. This
   /// will generally allocate shorter local live ranges first. For targets with
   /// many registers, this could reduce regalloc compile time by a large
@@ -864,6 +870,15 @@ public:
   virtual unsigned getCSRFirstUseCost() const { return 0; }
   /// FIXME: We should deprecate this usage.
   virtual unsigned getCSRCost() const { return 0; }
+
+  /// Per-vreg extra cost for first use of a callee-saved register in Greedy
+  /// regalloc (added to getCSRFirstUseCost()). Targets use this for hints such
+  /// as frameless-path register preferences without changing the global cost.
+  virtual unsigned
+  getExtraCSRFirstUseCostForVReg(Register /*VirtReg*/,
+                                 const MachineFunction & /*MF*/) const {
+    return 0;
+  }
 
   /// Returns true if the target requires (and can make use of) the register
   /// scavenger.
