@@ -171,6 +171,10 @@ static cl::opt<bool> EnableGlobalMergeFunc(
 // manual override.
 static cl::opt<bool> DisableCFIFixup("disable-cfi-fixup", cl::Hidden,
                                      cl::desc("Disable the CFI fixup pass"));
+static cl::opt<bool> DisableShrinkWrapCFIFixup(
+    "disable-shrink-wrap-cfi-fixup", cl::Hidden,
+    cl::desc("Disable remember/restore CFI fixup for multi-point "
+             "shrink-wrapping"));
 // Enable or disable FastISel. Both options are needed, because
 // FastISel is enabled by default with -fast, and we wish to be
 // able to enable or disable fast-isel independently from -O0.
@@ -1323,6 +1327,11 @@ void TargetPassConfig::addMachinePasses() {
 
   if (!DisableCFIFixup && TM->Options.EnableCFIFixup)
     addPass(createCFIFixupLegacy());
+
+  // GCC-like remember/restore for data-flow multi-point CSR CFI. Self-gated on
+  // enableCSRSaveRestorePointsSplit(); finds prologue in the entry block only.
+  if (!DisableShrinkWrapCFIFixup)
+    addPass(createShrinkWrapCFIFixup());
 
   PM->add(createStackFrameLayoutAnalysisPass());
 

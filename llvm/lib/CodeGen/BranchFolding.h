@@ -151,6 +151,11 @@ class TargetRegisterInfo;
     void replaceTailWithBranchTo(MachineBasicBlock::iterator OldInst,
                                  MachineBasicBlock &NewDest);
 
+    /// Before splitting or replacing a common tail starting at \p TailStart,
+    /// move FrameDestroy CFI restores that belong with CSR reloads left in the
+    /// block prefix out of the common-tail region. May advance \p TailStart.
+    void tryFixupCFI(MachineBasicBlock::iterator &TailStart);
+
     /// Given a machine basic block and an iterator into it, split the MBB so
     /// that the part before the iterator falls into the part starting at the
     /// iterator.  This returns the new MBB.

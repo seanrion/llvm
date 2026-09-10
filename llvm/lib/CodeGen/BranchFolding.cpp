@@ -63,6 +63,7 @@
 #include <cstddef>
 #include <iterator>
 #include <numeric>
+#include <optional>
 
 using namespace llvm;
 
@@ -425,6 +426,46 @@ static unsigned ComputeCommonTailLength(MachineBasicBlock *MBB1,
   return TailLen;
 }
 
+void BranchFolder::tryFixupCFI(MachineBasicBlock::iterator &TailStart) {
+  MachineBasicBlock *MBB = TailStart->getParent();
+  SmallSet<unsigned, 16> Restores;
+  for (MachineInstr &MI : make_range(MBB->begin(), TailStart)) {
+    if (std::optional<unsigned> Id = TII->isReloadOfCSR(&MI))
+      Restores.insert(*Id);
+    if (std::optional<unsigned> Id = TII->isCFIRestoreOfCSR(&MI)) {
+      auto RestoredId = find_if(Restores, [&](unsigned Id2) {
+        return TRI->regsOverlap(*Id, Id2);
+      });
+      assert(RestoredId != Restores.end() &&
+             "Must've seen reload of register before CFI restore.");
+      Restores.erase(*RestoredId);
+    }
+  }
+  if (Restores.empty())
+    return;
+
+  // Walk the common-tail region and keep CSR CFI restores with the prefix that
+  // still holds the matching reloads. Advance TailStart past any such CFIs that
+  // sit at the current split point so SplitMBBAt / ReplaceTailWithBranchTo do
+  // not pull them into the shared tail.
+  MachineBasicBlock::iterator InsertPos = TailStart;
+  for (MachineBasicBlock::iterator MI = TailStart, E = MBB->end(); MI != E;) {
+    MachineBasicBlock::iterator Next = std::next(MI);
+    std::optional<unsigned> Id = TII->isCFIRestoreOfCSR(&*MI);
+    if (Id && any_of(Restores, [&](unsigned Reg2) {
+          return TRI->regsOverlap(*Id, Reg2);
+        })) {
+      if (MI == InsertPos) {
+        InsertPos = Next;
+        TailStart = Next;
+      } else {
+        MBB->splice(InsertPos, MBB, MI);
+      }
+    }
+    MI = Next;
+  }
+}
+
 void BranchFolder::replaceTailWithBranchTo(MachineBasicBlock::iterator OldInst,
                                            MachineBasicBlock &NewDest) {
   if (UpdateLiveIns) {
@@ -455,6 +496,7 @@ void BranchFolder::replaceTailWithBranchTo(MachineBasicBlock::iterator OldInst,
     }
   }
 
+  tryFixupCFI(OldInst);
   TII->ReplaceTailWithBranchTo(OldInst, &NewDest);
   ++NumTailMerge;
 }
@@ -807,6 +849,7 @@ bool BranchFolder::CreateCommonTailOnlyBlock(MachineBasicBlock *&PredBB,
   // SuccBB is an inner loop, the common tail is still part of the inner loop.
   const BasicBlock *BB = (SuccBB && MBB->succ_size() == 1) ?
     SuccBB->getBasicBlock() : MBB->getBasicBlock();
+  tryFixupCFI(BBI);
   MachineBasicBlock *newMBB = SplitMBBAt(*MBB, BBI, BB);
   if (!newMBB) {
     LLVM_DEBUG(dbgs() << "... failed!");

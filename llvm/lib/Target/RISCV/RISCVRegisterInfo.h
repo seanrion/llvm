@@ -100,9 +100,16 @@ struct RISCVRegisterInfo : public RISCVGenRegisterInfo {
                  StackOffset Offset, MachineInstr::MIFlag Flag,
                  MaybeAlign RequiredAlign) const;
 
+  bool eliminateFrameIndexInMI(MachineInstr &MI, int SPAdj,
+                               unsigned FIOperandNum,
+                               RegScavenger *RS = nullptr) const;
+
   bool eliminateFrameIndex(MachineBasicBlock::iterator MI, int SPAdj,
                            unsigned FIOperandNum,
                            RegScavenger *RS = nullptr) const override;
+
+  bool isCSIFrameIndex(MachineFunction *MF, int FrameIndex) const override;
+  int64_t getCSIFrameOffset(MachineFunction *MF) const override;
 
   bool requiresVirtualBaseRegisters(const MachineFunction &MF) const override;
 

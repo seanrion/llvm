@@ -36,6 +36,7 @@
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <utility>
 #include <vector>
 
@@ -167,6 +168,14 @@ public:
   /// Returns true if MI is an instruction we are unable to reason about
   /// (like a call or something with unmodeled side effects).
   virtual bool isGlobalMemoryObject(const MachineInstr *MI) const;
+
+  /// If \p MI is a FrameDestroy CFI restore of a callee-saved register, return
+  /// that physical register id; otherwise nullopt.
+  virtual std::optional<unsigned> isCFIRestoreOfCSR(const MachineInstr *MI) const;
+
+  /// If \p MI is a FrameDestroy reload of a callee-saved register, return that
+  /// physical register id; otherwise nullopt.
+  virtual std::optional<unsigned> isReloadOfCSR(const MachineInstr *MI) const;
 
   /// Return true if the instruction is trivially rematerializable, meaning it
   /// has no side effects and requires no operands that aren't always available.

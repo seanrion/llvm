@@ -31,6 +31,7 @@
 #include "llvm/IR/DataLayout.h"
 #include "llvm/IR/DebugInfoMetadata.h"
 #include "llvm/MC/MCAsmInfo.h"
+#include "llvm/MC/MCDwarf.h"
 #include "llvm/MC/MCInstrItineraries.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/ErrorHandling.h"
@@ -2231,4 +2232,34 @@ bool TargetInstrInfo::isMBBSafeToOutlineFrom(MachineBasicBlock &MBB,
 bool TargetInstrInfo::isGlobalMemoryObject(const MachineInstr *MI) const {
   return MI->isCall() || MI->hasUnmodeledSideEffects() ||
          (MI->hasOrderedMemoryRef() && !MI->isDereferenceableInvariantLoad());
+}
+
+std::optional<unsigned>
+TargetInstrInfo::isCFIRestoreOfCSR(const MachineInstr *MI) const {
+  if (!MI->isCFIInstruction() || !MI->getFlag(MachineInstr::FrameDestroy))
+    return std::nullopt;
+  const MachineFunction *MF = MI->getParent()->getParent();
+  const std::vector<MCCFIInstruction> &CIs = MF->getFrameInstructions();
+  const MachineOperand &MO = MI->getOperand(0);
+  MCCFIInstruction CI = CIs[MO.getCFIIndex()];
+  if (CI.getOperation() != MCCFIInstruction::OpRestore)
+    return std::nullopt;
+  std::optional<MCRegister> Reg = TRI.getLLVMRegNum(CI.getRegister(), false);
+  if (!Reg || !TRI.isCalleeSavedPhysReg(*Reg, *MF))
+    return std::nullopt;
+  return Reg->id();
+}
+
+std::optional<unsigned>
+TargetInstrInfo::isReloadOfCSR(const MachineInstr *MI) const {
+  if (!MI->mayLoad() || !MI->getFlag(MachineInstr::FrameDestroy))
+    return std::nullopt;
+  const MachineOperand &MO = MI->getOperand(0);
+  if (!MO.isReg())
+    return std::nullopt;
+  Register Reg = MO.getReg();
+  const MachineFunction *MF = MI->getParent()->getParent();
+  if (!Reg.isPhysical() || !TRI.isCalleeSavedPhysReg(Reg, *MF))
+    return std::nullopt;
+  return Reg.id();
 }

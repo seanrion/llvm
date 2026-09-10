@@ -72,6 +72,22 @@ public:
   bool enableShrinkWrapping(const MachineFunction &MF) const override;
   bool enableCSRSaveRestorePointsSplit() const override;
 
+  /// Prefer ShrinkWrapCFIFixup when multi-point CSR CFI is enabled: the
+  /// stock CFIFixup pass mistakes delayed spill FrameSetup CFI for the
+  /// real prologue.
+  bool enableCFIFixup(const MachineFunction &MF) const override;
+
+  void getFrameBoundCalleeSaves(const MachineFunction &MF,
+                                 SmallVectorImpl<Register> &Regs) const override;
+
+  /// CSR spills not handled by push/pop or save-restore libcalls.
+  SmallVector<CalleeSavedInfo, 8>
+  getUnmanagedCSI(const MachineFunction &MF,
+                  ArrayRef<CalleeSavedInfo> CSI,
+                  bool ReverseOrder = false) const;
+
+  void emitPostFrameLayoutCFI(MachineFunction &MF) const override;
+
   bool isSupportedStackID(TargetStackID::Value ID) const override;
   TargetStackID::Value getStackIDForScalableVectors() const override;
 

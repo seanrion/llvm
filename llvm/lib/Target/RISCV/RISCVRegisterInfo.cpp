@@ -12,6 +12,7 @@
 
 #include "RISCVRegisterInfo.h"
 #include "RISCV.h"
+#include "RISCVFrameLowering.h"
 #include "RISCVSubtarget.h"
 #include "llvm/ADT/SmallSet.h"
 #include "llvm/BinaryFormat/Dwarf.h"
@@ -584,12 +585,33 @@ static unsigned getXqciloWideOpcode(unsigned Opc) {
   }
 }
 
-bool RISCVRegisterInfo::eliminateFrameIndex(MachineBasicBlock::iterator II,
-                                            int SPAdj, unsigned FIOperandNum,
-                                            RegScavenger *RS) const {
-  assert(SPAdj == 0 && "Unexpected non-zero SPAdj value");
+int64_t RISCVRegisterInfo::getCSIFrameOffset(MachineFunction *MF) const {
+  uint64_t FirstSPAdjustAmount =
+      getFrameLowering(*MF)->getFirstSPAdjustAmount(*MF);
+  if (FirstSPAdjustAmount)
+    return getFrameLowering(*MF)->getStackSizeWithRVVPadding(*MF) -
+           FirstSPAdjustAmount;
+  return 0;
+}
 
-  MachineInstr &MI = *II;
+bool RISCVRegisterInfo::isCSIFrameIndex(MachineFunction *MF,
+                                        int FrameIndex) const {
+  const MachineFrameInfo &MFI = MF->getFrameInfo();
+  const auto &CSI = getFrameLowering(*MF)->getUnmanagedCSI(
+      *MF, MFI.getCalleeSavedInfo());
+  if (!CSI.empty()) {
+    int MinCSFI = CSI.front().getFrameIdx();
+    int MaxCSFI = CSI.back().getFrameIdx();
+    if (FrameIndex >= MinCSFI && FrameIndex <= MaxCSFI)
+      return true;
+  }
+  return false;
+}
+
+bool RISCVRegisterInfo::eliminateFrameIndexInMI(MachineInstr &MI, int SPAdj,
+                                                unsigned FIOperandNum,
+                                                RegScavenger *RS) const {
+  MachineBasicBlock::iterator II = getBundleStart(MI.getIterator());
   MachineFunction &MF = *MI.getParent()->getParent();
   MachineRegisterInfo &MRI = MF.getRegInfo();
   const RISCVSubtarget &ST = MF.getSubtarget<RISCVSubtarget>();
@@ -601,6 +623,12 @@ bool RISCVRegisterInfo::eliminateFrameIndex(MachineBasicBlock::iterator II,
   Register FrameReg;
   StackOffset Offset =
       getFrameLowering(MF)->getFrameIndexReference(MF, FrameIndex, FrameReg);
+  // Historically RISC-V ignored SPAdj (and asserted it was 0). Under data-flow
+  // shrink-wrapping the full frame is still allocated at entry; PEI may pass a
+  // non-zero CSI SPA for delayed spills when FirstSPAdjustAmount splits the
+  // initial addi sp (large frames).
+  if (getFrameLowering(MF)->enableCSRSaveRestorePointsSplit())
+    Offset += StackOffset::getFixed(SPAdj);
   bool IsRVVSpill = RISCV::isRVVSpill(MI);
   if (!IsRVVSpill)
     Offset += StackOffset::getFixed(MI.getOperand(FIOperandNum + 1).getImm());
@@ -722,6 +750,46 @@ bool RISCVRegisterInfo::eliminateFrameIndex(MachineBasicBlock::iterator II,
     return true;
   }
 
+  return false;
+}
+
+bool RISCVRegisterInfo::eliminateFrameIndex(MachineBasicBlock::iterator II,
+                                            int SPAdj, unsigned FIOperandNum,
+                                            RegScavenger *RS) const {
+  // Non-zero SPAdj: delayed CSR spills under data-flow shrink-wrapping when
+  // FirstSPAdjustAmount is non-zero (not a separate "split SP" frame policy).
+  MachineInstr &MI = *II;
+  MachineBasicBlock &MBB = *MI.getParent();
+  if (!MI.isBundle())
+    return eliminateFrameIndexInMI(MI, SPAdj, FIOperandNum, RS);
+
+  int BundleFI = MI.getOperand(FIOperandNum).getIndex();
+  MachineBasicBlock::instr_iterator MII = MI.getIterator();
+  MachineBasicBlock::instr_iterator MIB = ++getBundleStart(MII);
+  MachineBasicBlock::instr_iterator MIE = getBundleEnd(MII);
+  for (MachineBasicBlock::instr_iterator InsideBundleIter = MIB;
+       InsideBundleIter != MIE; InsideBundleIter++) {
+    MachineInstr &MI = *InsideBundleIter;
+    for (const auto &[Idx, Op] : enumerate(MI.operands())) {
+      if (!Op.isFI())
+        continue;
+      int InstrFI = Op.getIndex();
+      if (InstrFI != BundleFI)
+        continue;
+      eliminateFrameIndexInMI(MI, SPAdj, Idx, RS);
+    }
+  }
+  // TODO: try to do this more efficiently?
+  for (MachineBasicBlock::instr_iterator InsideBundleIter = MIB;
+       InsideBundleIter != MIE; InsideBundleIter++) {
+    InsideBundleIter->unbundleFromPred();
+    for (MachineOperand &MO : InsideBundleIter->operands()) {
+      if (MO.isReg() && MO.isInternalRead())
+        MO.setIsInternalRead(false);
+    }
+  }
+  MI.eraseFromParent();
+  finalizeBundle(MBB, MIB, MIE);
   return false;
 }
 

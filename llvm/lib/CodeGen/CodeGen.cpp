@@ -29,6 +29,7 @@ void llvm::initializeCodeGen(PassRegistry &Registry) {
   initializeBreakFalseDepsLegacyPass(Registry);
   initializeCFGuardLongjmpPass(Registry);
   initializeCFIFixupLegacyPass(Registry);
+  initializeShrinkWrapCFIFixupPass(Registry);
   initializeCFIInstrInserterPass(Registry);
   initializeCheckDebugMachineModuleLegacyPass(Registry);
   initializeCodeGenPrepareLegacyPassPass(Registry);

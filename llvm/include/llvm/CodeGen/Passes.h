@@ -575,6 +575,10 @@ LLVM_ABI FunctionPass *createIndirectBrExpandPass();
 /// Creates CFI Fixup pass. \see CFIFixup.cpp
 LLVM_ABI FunctionPass *createCFIFixupLegacy();
 
+/// Inserts .cfi_remember_state/.cfi_restore_state for multi-point
+/// shrink-wrapping after block layout. \see ShrinkWrapCFIFixup.cpp
+LLVM_ABI FunctionPass *createShrinkWrapCFIFixup();
+
 /// Creates CFI Instruction Inserter pass. \see CFIInstrInserter.cpp
 LLVM_ABI FunctionPass *createCFIInstrInserter();
 

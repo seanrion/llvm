@@ -1007,6 +1007,17 @@ public:
                                    int SPAdj, unsigned FIOperandNum,
                                    RegScavenger *RS = nullptr) const = 0;
 
+  /// True if \p FrameIndex is a CSR spill slot that may be referenced from a
+  /// delayed spill/restore block under data-flow shrink-wrapping (full frame
+  /// still allocated at entry).
+  virtual bool isCSIFrameIndex(MachineFunction *MF, int FrameIndex) const {
+    return false;
+  }
+
+  /// Extra SP adjustment when eliminating CSR frame indices after a partial
+  /// FirstSPAdjustAmount addi (large frames), not a separate "split SP" policy.
+  virtual int64_t getCSIFrameOffset(MachineFunction *MF) const { return 0; }
+
   /// Return the assembly name for \p Reg.
   virtual StringRef getRegAsmName(MCRegister Reg) const {
     // FIXME: We are assuming that the assembly name is equal to the TableGen
