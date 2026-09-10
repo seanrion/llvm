@@ -29,6 +29,7 @@
 #include "llvm/CodeGen/MachineBlockFrequencyInfo.h"
 #include "llvm/CodeGen/MachineBranchProbabilityInfo.h"
 #include "llvm/CodeGen/MachineDominators.h"
+#include "llvm/CodeGen/MachineFrameInfo.h"
 #include "llvm/CodeGen/MachineFunction.h"
 #include "llvm/CodeGen/MachineFunctionPass.h"
 #include "llvm/CodeGen/MachineInstr.h"
@@ -172,6 +173,10 @@ PreservedAnalyses BranchFolderPass::run(MachineFunction &MF,
 
 bool BranchFolderLegacy::runOnMachineFunction(MachineFunction &MF) {
   if (skipFunction(MF.getFunction()))
+    return false;
+
+  // Shrink-frame: skip to avoid merging across frame/no-frame boundary.
+  if (MF.getFrameInfo().getProlog())
     return false;
 
   TargetPassConfig *PassConfig = &getAnalysis<TargetPassConfig>();

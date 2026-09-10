@@ -17,6 +17,7 @@
 #include "llvm/CodeGen/LazyMachineBlockFrequencyInfo.h"
 #include "llvm/CodeGen/MBFIWrapper.h"
 #include "llvm/CodeGen/MachineBranchProbabilityInfo.h"
+#include "llvm/CodeGen/MachineFrameInfo.h"
 #include "llvm/CodeGen/MachineFunction.h"
 #include "llvm/CodeGen/MachineFunctionPass.h"
 #include "llvm/CodeGen/MachinePassManager.h"
@@ -80,6 +81,9 @@ INITIALIZE_PASS(EarlyTailDuplicateLegacy, "early-tailduplication",
 
 bool TailDuplicateBaseLegacy::runOnMachineFunction(MachineFunction &MF) {
   if (skipFunction(MF.getFunction()))
+    return false;
+
+  if (MF.getFrameInfo().getProlog())
     return false;
 
   auto MBPI = &getAnalysis<MachineBranchProbabilityInfoWrapperPass>().getMBPI();

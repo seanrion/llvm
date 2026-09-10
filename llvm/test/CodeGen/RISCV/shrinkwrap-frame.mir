@@ -1,0 +1,48 @@
+# RUN: llc -mtriple=riscv64 -run-pass=shrink-wrapping -riscv-shrink-wrapping-dataflow=true %s -o - | FileCheck %s --check-prefixes=CHECK-SF
+# RUN: llc -mtriple=riscv64 -run-pass=shrink-wrapping -riscv-shrink-wrapping-dataflow=true -disable-shrink-frame=true %s -o - | FileCheck %s --check-prefixes=CHECK-OFF
+#
+# Test that shrink-frame moves the stack frame Prolog from entry to a later
+# block when early-exit paths do not require a frame.
+#
+# CFG:
+#   bb.0 (entry) -- early exit via bb.1 (no frame needed)
+#              \--- bb.2 (has call, needs frame)
+
+--- |
+  declare void @extern_func(i64)
+
+  define void @early_exit_no_frame(i64 %x) {
+    ret void
+  }
+...
+---
+name:            early_exit_no_frame
+tracksRegLiveness: true
+body:             |
+  bb.0:
+    liveins: $x10
+    successors: %bb.1, %bb.2
+
+    BNE $x10, $x0, %bb.2
+    PseudoBR %bb.1
+
+  bb.1:
+    liveins: $x10
+    $x10 = ADDI $x0, 42
+    PseudoRET implicit $x10
+
+  bb.2:
+    liveins: $x10
+    ADJCALLSTACKDOWN 0, 0, implicit-def $x2, implicit $x2
+    $x10 = ADDI $x10, 1
+    PseudoCALL target-flags(riscv-call) @extern_func, implicit-def $x1, implicit $x10, implicit-def $x10
+    ADJCALLSTACKUP 0, 0, implicit-def $x2, implicit $x2
+    PseudoRET implicit $x10
+
+...
+
+# CHECK-SF-LABEL: name: early_exit_no_frame
+# CHECK-SF:       prolog: '%bb.2'
+
+# CHECK-OFF-LABEL: name: early_exit_no_frame
+# CHECK-OFF-NOT:   prolog: '%bb.

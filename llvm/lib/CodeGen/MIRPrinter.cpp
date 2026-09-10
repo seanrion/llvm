@@ -382,6 +382,12 @@ static void convertMFI(ModuleSlotTracker &MST, yaml::MachineFrameInfo &YamlMFI,
   YamlMFI.HasTailCall = MFI.hasTailCall();
   YamlMFI.IsCalleeSavedInfoValid = MFI.isCalleeSavedInfoValid();
   YamlMFI.LocalFrameSize = MFI.getLocalFrameSize();
+  if (MFI.getProlog()) {
+    SmallString<16> PrologStr;
+    raw_svector_ostream PrologOS(PrologStr);
+    PrologOS << printMBBReference(*MFI.getProlog());
+    YamlMFI.Prolog = yaml::StringValue(PrologOS.str().str());
+  }
   if (!MFI.getSavePoints().empty())
     convertSRPoints(MST, YamlMFI.SavePoints, MFI.getSavePoints(), TRI);
   if (!MFI.getRestorePoints().empty())

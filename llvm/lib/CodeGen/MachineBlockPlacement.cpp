@@ -39,6 +39,7 @@
 #include "llvm/CodeGen/MachineBasicBlock.h"
 #include "llvm/CodeGen/MachineBlockFrequencyInfo.h"
 #include "llvm/CodeGen/MachineBranchProbabilityInfo.h"
+#include "llvm/CodeGen/MachineFrameInfo.h"
 #include "llvm/CodeGen/MachineFunction.h"
 #include "llvm/CodeGen/MachineFunctionPass.h"
 #include "llvm/CodeGen/MachineLoopInfo.h"
@@ -62,8 +63,8 @@
 #include "llvm/Support/Compiler.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/raw_ostream.h"
-#include "llvm/Target/TargetMachine.h"
 #include "llvm/Target/RISCV/RISCVBTBBranchRelaxation.h"
+#include "llvm/Target/TargetMachine.h"
 #include "llvm/Transforms/Utils/CodeLayout.h"
 #include <algorithm>
 #include <cassert>
@@ -643,6 +644,9 @@ public:
 
   bool runOnMachineFunction(MachineFunction &MF) override {
     if (skipFunction(MF.getFunction()))
+      return false;
+
+    if (MF.getFrameInfo().getProlog())
       return false;
 
     auto *MBPI =

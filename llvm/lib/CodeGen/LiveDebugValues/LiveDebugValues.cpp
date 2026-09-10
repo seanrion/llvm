@@ -10,6 +10,7 @@
 
 #include "llvm/CodeGen/LiveDebugValuesPass.h"
 #include "llvm/CodeGen/MachineDominators.h"
+#include "llvm/CodeGen/MachineFrameInfo.h"
 #include "llvm/CodeGen/MachineFunction.h"
 #include "llvm/CodeGen/MachineFunctionPass.h"
 #include "llvm/CodeGen/Passes.h"
@@ -127,6 +128,9 @@ void LiveDebugValuesPass::printPipeline(
 }
 
 bool LiveDebugValuesLegacy::runOnMachineFunction(MachineFunction &MF) {
+  if (MF.getFrameInfo().getProlog())
+    return false;
+
   auto *TPC = &getAnalysis<TargetPassConfig>();
   return LiveDebugValues().run(
       MF, TPC->getTM<TargetMachine>().Options.ShouldEmitDebugEntryValues());

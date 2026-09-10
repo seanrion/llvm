@@ -15,6 +15,7 @@
 
 #include "RISCVInstrInfo.h"
 #include "RISCVSubtarget.h"
+#include "llvm/CodeGen/MachineFrameInfo.h"
 
 using namespace llvm;
 
@@ -475,6 +476,9 @@ bool RISCVMoveMerge::mergeMovePairs(MachineBasicBlock &MBB) {
 
 bool RISCVMoveMerge::runOnMachineFunction(MachineFunction &Fn) {
   if (skipFunction(Fn.getFunction()))
+    return false;
+
+  if (Fn.getFrameInfo().getProlog())
     return false;
 
   ST = &Fn.getSubtarget<RISCVSubtarget>();

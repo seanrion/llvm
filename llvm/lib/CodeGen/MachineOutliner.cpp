@@ -65,6 +65,7 @@
 #include "llvm/Analysis/ProfileSummaryInfo.h"
 #include "llvm/CGData/CodeGenDataReader.h"
 #include "llvm/CodeGen/LivePhysRegs.h"
+#include "llvm/CodeGen/MachineFrameInfo.h"
 #include "llvm/CodeGen/MachineInstrBundle.h"
 #include "llvm/CodeGen/MachineModuleInfo.h"
 #include "llvm/CodeGen/MachineOptimizationRemarkEmitter.h"
@@ -1259,6 +1260,13 @@ void MachineOutliner::populateMapper(InstructionMapper &Mapper, Module &M) {
     // Function.
     if (!MF) {
       LLVM_DEBUG(dbgs() << "SKIP: Function does not have a MachineFunction\n");
+      continue;
+    }
+
+    // Skip functions with shrink-frame active to avoid outlining across
+    // frame/no-frame boundaries.
+    if (MF->getFrameInfo().getProlog()) {
+      LLVM_DEBUG(dbgs() << "SKIP: Function has shrink-frame Prolog\n");
       continue;
     }
 

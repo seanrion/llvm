@@ -13,6 +13,7 @@
 
 #include "RISCVInstrInfo.h"
 #include "RISCVMachineFunctionInfo.h"
+#include "llvm/CodeGen/MachineFrameInfo.h"
 #include "llvm/CodeGen/MachineInstr.h"
 
 using namespace llvm;
@@ -131,6 +132,9 @@ bool RISCVPushPopOpt::adjustRetVal(MachineBasicBlock::iterator &MBBI) {
 
 bool RISCVPushPopOpt::runOnMachineFunction(MachineFunction &Fn) {
   if (skipFunction(Fn.getFunction()))
+    return false;
+
+  if (Fn.getFrameInfo().getProlog())
     return false;
 
   // If Zcmp extension is not supported, abort.

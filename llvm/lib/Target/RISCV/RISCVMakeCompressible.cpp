@@ -67,6 +67,7 @@
 
 #include "RISCV.h"
 #include "RISCVSubtarget.h"
+#include "llvm/CodeGen/MachineFrameInfo.h"
 #include "llvm/CodeGen/Passes.h"
 #include "llvm/CodeGen/RegisterScavenging.h"
 #include "llvm/MC/TargetRegistry.h"
@@ -471,6 +472,9 @@ static void updateOperands(MachineInstr &MI, RegImmPair OldRegImm,
 bool RISCVMakeCompressibleOpt::runOnMachineFunction(MachineFunction &Fn) {
   // This is a size optimization.
   if (skipFunction(Fn.getFunction()) || !Fn.getFunction().hasOptSize())
+    return false;
+
+  if (Fn.getFrameInfo().getProlog())
     return false;
 
   const RISCVSubtarget &STI = Fn.getSubtarget<RISCVSubtarget>();

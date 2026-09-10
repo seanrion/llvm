@@ -1,0 +1,33 @@
+# RUN: not --crash llc -mtriple=riscv64 -run-pass=branch-folder -verify-machineinstrs \
+# RUN:     -riscv-shrink-wrapping-dataflow=true %s -o %t 2>&1 | FileCheck %s
+#
+# RestoreSPFromFP is an epilogue pattern even though the offset is negative:
+#   addi sp, s0, -N   (FrameDestroy)
+
+---
+name:            bad_restore_sp_from_fp_exit
+tracksRegLiveness: true
+frameInfo:
+  stackSize:       32
+  adjustsStack:    true
+  hasCalls:        true
+  prolog:          '%bb.2'
+body:             |
+  bb.0:
+    successors: %bb.1, %bb.2
+    BNE $x10, $x0, %bb.1
+    PseudoBR %bb.2
+
+  bb.1:
+    $x2 = frame-destroy ADDI $x8, -32
+    PseudoRET implicit $x10
+
+  bb.2:
+    $x2 = frame-setup ADDI $x2, -32
+    $x8 = ADDI $x2, 32
+    PseudoRET implicit $x10
+
+...
+
+# CHECK: *** Bad machine code: Shrink-frame: exit block outside frame region contains frame restore/epilogue pattern ***
+# CHECK: instruction: $x2 = frame-destroy ADDI $x8, -32

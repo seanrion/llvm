@@ -431,6 +431,30 @@ void PEIImpl::calculatePrologEpilogBlocks(MachineFunction &MF) {
   const TargetFrameLowering *TFI = MF.getSubtarget().getFrameLowering();
   const MachineFrameInfo &MFI = MF.getFrameInfo();
 
+  // If shrink-frame has placed a Prolog, honor it regardless of split mode.
+  if (MFI.getProlog()) {
+    PrologBlocks.push_back(MFI.getProlog());
+    // Epilog = return blocks dominated by Prolog. Use a local domtree.
+    MachineDominatorTree DT(MF);
+    for (MachineBasicBlock &MBB : MF) {
+      if (MBB.isReturnBlock() && DT.dominates(MFI.getProlog(), &MBB))
+        EpilogBlocks.push_back(&MBB);
+    }
+    // Belt-and-suspenders: framed path with no dominated return would emit
+    // addi/sd ra and then ret without ld (infinite loop at post-call). Clear
+    // shrink-frame rather than generating that code.
+    if (EpilogBlocks.empty()) {
+      LLVM_DEBUG(dbgs() << "PEI: shrink-frame Prolog "
+                        << printMBBReference(*MFI.getProlog())
+                        << " dominates no return — ignoring Prolog\n");
+      PrologBlocks.clear();
+      MF.getFrameInfo().setProlog(nullptr);
+      // Fall through to non-shrink-frame placement below.
+    } else {
+      return;
+    }
+  }
+
   // Data-flow CSR split (GCC-like separate shrink-wrapping): always allocate
   // and free the full frame at entry / returns. Only CSR save/restore points
   // may be multi-point; never shrink addi sp onto a cold path or loop latch.
@@ -806,24 +830,19 @@ static bool blockHasNoReturnCall(const MachineBasicBlock &MBB) {
 /// Collect return/epilog blocks reachable from \p Start without walking past
 /// a noreturn call. Used so restores are not placed on early exits that never
 /// executed the corresponding CSR save.
-static void collectReachableEpilogs(
-    MachineBasicBlock *Start, ArrayRef<MachineBasicBlock *> EpilogBlocks,
-    SmallPtrSetImpl<MachineBasicBlock *> &Out) {
-  SmallPtrSet<MachineBasicBlock *, 8> EpilogSet(EpilogBlocks.begin(),
-                                                EpilogBlocks.end());
-  SmallVector<MachineBasicBlock *, 16> Work;
-  SmallPtrSet<MachineBasicBlock *, 16> Visited;
-  Work.push_back(Start);
-  Visited.insert(Start);
-  while (!Work.empty()) {
-    MachineBasicBlock *BB = Work.pop_back_val();
-    if (EpilogSet.contains(BB) && !blockHasNoReturnCall(*BB))
-      Out.insert(BB);
-    if (blockHasNoReturnCall(*BB))
+/// Collect epilog blocks that are dominated by \p SaveBB.
+/// Dominance (not mere reachability) is required: a return reachable from a
+/// save via the slow path may also be reachable from an early-exit that never
+/// saved (Sphere::intersect / ray).
+static void collectDominatedEpilogs(MachineBasicBlock *SaveBB,
+                                    ArrayRef<MachineBasicBlock *> EpilogBlocks,
+                                    const MachineDominatorTree &DT,
+                                    SmallPtrSetImpl<MachineBasicBlock *> &Out) {
+  for (MachineBasicBlock *EB : EpilogBlocks) {
+    if (blockHasNoReturnCall(*EB))
       continue;
-    for (MachineBasicBlock *Succ : BB->successors())
-      if (Visited.insert(Succ).second)
-        Work.push_back(Succ);
+    if (DT.dominates(SaveBB, EB))
+      Out.insert(EB);
   }
 }
 
@@ -839,7 +858,7 @@ static void mergeCSIUnique(std::vector<CalleeSavedInfo> &DST,
   });
 }
 
-/// Move RestorePoints off noreturn-tainted blocks onto epilogs reachable from
+/// Move RestorePoints off noreturn-tainted blocks onto epilogs dominated by
 /// the CSR's save points only (not every return — that broke SIBsim4/PENNANT).
 static void rehomeNoreturnRestorePoints(MachineFrameInfo &MFI,
                                         MBBVector &EpilogBlocks) {
@@ -875,6 +894,8 @@ static void rehomeNoreturnRestorePoints(MachineFrameInfo &MFI,
   if (!Changed)
     return;
 
+  MachineFunction &MF = *EpilogBlocks.front()->getParent();
+  MachineDominatorTree DT(MF);
   for (auto &[Reg, CSList] : ClearedByReg) {
     SmallPtrSet<MachineBasicBlock *, 8> Targets;
     bool AnySave = false;
@@ -884,7 +905,7 @@ static void rehomeNoreturnRestorePoints(MachineFrameInfo &MFI,
           }))
         continue;
       AnySave = true;
-      collectReachableEpilogs(SaveBB, EpilogBlocks, Targets);
+      collectDominatedEpilogs(SaveBB, EpilogBlocks, DT, Targets);
     }
     if (!AnySave) {
       for (MachineBasicBlock *EB : EpilogBlocks)
@@ -930,8 +951,8 @@ static void insertCSRRestores(MachineBasicBlock &RestoreBlock,
 /// Fill per-BB CalleeSavedInfo vectors for multi-point save/restore maps.
 /// Registers listed in SavePoints/RestorePoints are resolved against
 /// \p RegToInfo. Any CSR missing from those lists is spilled/restored in
-/// the prolog/epilog blocks instead — for restores, only epilogs reachable
-/// from a save of that CSR (avoid early-exit ld without a prior sd).
+/// the prolog/epilog blocks instead — for restores, only epilogs dominated
+/// by a save of that CSR (avoid early-exit ld without a prior sd).
 static void fillCSInfoPerBB(MachineFrameInfo &MFI,
                             DenseMap<MCRegister, CalleeSavedInfo *> &RegToInfo,
                             MBBVector &PrologEpilogBlocks, bool IsSave) {
@@ -939,12 +960,45 @@ static void fillCSInfoPerBB(MachineFrameInfo &MFI,
   const SaveRestorePoints &SRPoints =
       IsSave ? MFI.getSavePoints() : MFI.getRestorePoints();
   SaveRestorePoints Inner;
+
+  MachineDominatorTree DT;
+  if (!IsSave && !PrologEpilogBlocks.empty())
+    DT.recalculate(*PrologEpilogBlocks.front()->getParent());
+
   for (const auto &[BB, Regs] : SRPoints) {
     std::vector<CalleeSavedInfo> CSIV;
     for (const CalleeSavedInfo &Reg : Regs) {
       auto It = RegToInfo.find(Reg.getReg());
       if (It == RegToInfo.end())
         continue;
+      // Drop restores on returns not dominated by any save of this CSR.
+      // Never drop frame-bound CSRs (ra/FP): they are pinned to the frame
+      // prolog and must be restored on returns (GCC separate policy / pr51933).
+      if (!IsSave && BB->isReturnBlock()) {
+        bool DominatedBySave = false;
+        unsigned NumSaves = 0;
+        for (const auto &[SaveBB, SaveRegs] : MFI.getSavePoints()) {
+          if (!any_of(SaveRegs, [&](const CalleeSavedInfo &S) {
+                return S.getReg() == Reg.getReg();
+              }))
+            continue;
+          ++NumSaves;
+          if (DT.dominates(SaveBB, BB)) {
+            DominatedBySave = true;
+            break;
+          }
+        }
+        if (!DominatedBySave && NumSaves == 1) {
+          SmallVector<Register, 4> FrameBound;
+          BB->getParent()
+              ->getSubtarget()
+              .getFrameLowering()
+              ->getFrameBoundCalleeSaves(*BB->getParent(), FrameBound);
+          if (!any_of(FrameBound,
+                      [&](Register R) { return R.id() == Reg.getReg(); }))
+            continue;
+        }
+      }
       CSIV.push_back(*It->second);
       AssignedRegs.insert(Reg.getReg());
     }
@@ -952,7 +1006,8 @@ static void fillCSInfoPerBB(MachineFrameInfo &MFI,
     sort(CSIV, [](const CalleeSavedInfo &Lhs, const CalleeSavedInfo &Rhs) {
       return Lhs.getFrameIdx() < Rhs.getFrameIdx();
     });
-    Inner.try_emplace(BB, std::move(CSIV));
+    if (!CSIV.empty())
+      Inner.try_emplace(BB, std::move(CSIV));
   }
 
   // Spill/restore any CSR not assigned to a split point in prolog/epilog.
@@ -965,8 +1020,10 @@ static void fillCSInfoPerBB(MachineFrameInfo &MFI,
       if (IsSave) {
         Targets.assign(PrologEpilogBlocks.begin(), PrologEpilogBlocks.end());
       } else {
-        // Path-sensitive: only epilogs reachable from a save of this CSR.
-        SmallPtrSet<MachineBasicBlock *, 8> Reachable;
+        // Path-sensitive: only epilogs dominated by a save of this CSR.
+        // Do not rehome onto the save block when Dominated is empty — that
+        // restores too early if the CSR is live in successors.
+        SmallPtrSet<MachineBasicBlock *, 8> Dominated;
         bool AnySave = false;
         for (const auto &[SaveBB, SaveRegs] : MFI.getSavePoints()) {
           if (!any_of(SaveRegs, [&](const CalleeSavedInfo &S) {
@@ -974,12 +1031,12 @@ static void fillCSInfoPerBB(MachineFrameInfo &MFI,
               }))
             continue;
           AnySave = true;
-          collectReachableEpilogs(SaveBB, PrologEpilogBlocks, Reachable);
+          collectDominatedEpilogs(SaveBB, PrologEpilogBlocks, DT, Dominated);
         }
         if (!AnySave)
           Targets.assign(PrologEpilogBlocks.begin(), PrologEpilogBlocks.end());
         else
-          Targets.assign(Reachable.begin(), Reachable.end());
+          Targets.assign(Dominated.begin(), Dominated.end());
       }
 
       for (MachineBasicBlock *BB : Targets) {
@@ -1832,6 +1889,26 @@ void PEIImpl::replaceFrameIndicesBackward(MachineFunction &MF) {
 /// register references and actual offsets.
 void PEIImpl::replaceFrameIndices(MachineFunction &MF) {
   const TargetFrameLowering &TFI = *MF.getSubtarget().getFrameLowering();
+  const MachineFrameInfo &MFI = MF.getFrameInfo();
+
+#ifndef NDEBUG
+  // When shrink-frame is active, verify no FI in blocks outside the frame
+  // region.
+  if (MachineBasicBlock *Prolog = MFI.getProlog()) {
+    MachineDominatorTree DomTree(MF);
+    for (auto &MBB : MF) {
+      if (DomTree.dominates(Prolog, &MBB))
+        continue;
+      for (auto &MI : MBB) {
+        if (MI.isDebugInstr())
+          continue;
+        for (const MachineOperand &MO : MI.operands())
+          assert(!MO.isFI() &&
+                 "Frame index in block not dominated by shrink-frame Prolog");
+      }
+    }
+  }
+#endif
 
   for (auto &MBB : MF) {
     int SPAdj = TFI.alignSPAdjust(MBB.getCallFrameSize());

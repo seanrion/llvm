@@ -53,6 +53,7 @@
 #include "llvm/CodeGen/PseudoSourceValue.h"
 #include "llvm/CodeGen/RegisterBank.h"
 #include "llvm/CodeGen/RegisterBankInfo.h"
+#include "llvm/CodeGen/ShrinkFrameUtils.h"
 #include "llvm/CodeGen/SlotIndexes.h"
 #include "llvm/CodeGen/StackMaps.h"
 #include "llvm/CodeGen/TargetFrameLowering.h"
@@ -3518,6 +3519,82 @@ verifyConvergenceControl(const MachineFunction &MF, MachineDominatorTree &DT,
 }
 
 void MachineVerifier::visitMachineFunctionAfter() {
+  // Verify shrink-frame invariants when Prolog is set.
+  if (MachineBasicBlock *Prolog = MF->getFrameInfo().getProlog()) {
+    if (Prolog == &MF->front())
+      report("Shrink-frame Prolog must not be the entry block", MF);
+
+    bool Found = false;
+    for (const MachineBasicBlock &MBB : *MF) {
+      if (&MBB == Prolog) {
+        Found = true;
+        break;
+      }
+    }
+    if (!Found)
+      report("Shrink-frame Prolog block not found in function", MF);
+
+    // No-frame blocks (not dominated by Prolog) must not contain frame indices.
+    if (Found) {
+      MachineDominatorTree SFDomTree(*const_cast<MachineFunction *>(MF));
+      for (const MachineBasicBlock &MBB : *MF) {
+        const bool InFrame = SFDomTree.dominates(Prolog, &MBB);
+
+        if (!InFrame) {
+          for (const MachineInstr &MI : MBB) {
+            if (MI.isDebugInstr())
+              continue;
+            for (const MachineOperand &MO : MI.operands()) {
+              if (MO.isFI()) {
+                report("Shrink-frame: frame index used in block not dominated "
+                       "by Prolog",
+                       &MI);
+                break;
+              }
+            }
+          }
+
+          for (const MachineBasicBlock *Succ : MBB.successors()) {
+            if (Succ == Prolog)
+              continue;
+            if (blockHasEpiloguePattern(*Succ, *MF))
+              report("Shrink-frame: no-frame block branches to epilogue "
+                     "pattern block",
+                     &MBB);
+          }
+        }
+
+        if (MBB.isReturnBlock() && !InFrame) {
+          for (const MachineInstr &MI : MBB) {
+            if (MI.isDebugInstr())
+              continue;
+            if (MF->getSubtarget()
+                    .getFrameLowering()
+                    ->isShrinkFrameEpiloguePattern(MI, *MF)) {
+              report("Shrink-frame: exit block outside frame region contains "
+                     "frame restore/epilogue pattern",
+                     &MI);
+              break;
+            }
+          }
+        }
+
+        if (!InFrame) {
+          for (const MachineBasicBlock *Succ : MBB.successors()) {
+            if (!isInFrameRegion(*Succ, SFDomTree))
+              continue;
+            if (Succ == Prolog)
+              continue;
+            report("Shrink-frame: illegal frame-region edge (only no-frame -> "
+                   "Prolog may enter the frame region)",
+                   &MBB);
+            break;
+          }
+        }
+      }
+    }
+  }
+
   auto FailureCB = [this](const Twine &Message) {
     report(Message.str().c_str(), MF);
   };
